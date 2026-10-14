@@ -278,7 +278,7 @@ sha256sum data/sample-dev.itch data/tests/sample-mini.itch
 |---|---|---|
 | 2026-08-30 | 1.0 | Initial baseline. Corrections C1–C5 applied to original NEXUS-FEED-01 text. Frozen on review sign-off. Sample hashes: `sample-dev.itch: e34c17b4ed6c3c5ab47a64159af00cade44328b92cfc2b35c674d7ee92971953`, `sample-mini.itch: 5e347abbaa69f12226a6506e875f51633af690b3fc890d9d20a7213fe73275c9`. |
 | 2026-08-30 | 1.1 | C6 added; Appendix A expected bytes corrected to `00 0c 53 .. 4f 00 27`. Freeze reaffirmed at v1.1. |
-| 2026-08-30 | 1.2 | C7 added: ITCH 5.0 Stock Directory is 'R' (0x52, 39B); 'H' (0x48, 25B) is Stock Trading Action. Freeze reaffirmed at v1.2. |
+| 2026-08-30 | 1.2 | C7 added; ITCH 5.0 Stock Directory is 'R' (0x52, 39B); 'H' (0x48, 25B) is Stock Trading Action. Freeze reaffirmed at v1.2. |
 | 2026-08-30 | 1.3 | C8 added: Golden hash folds (len_u16_le, msg_bytes) only, dropping seq. Freeze reaffirmed at v1.3. |
 | 2026-08-30 | 1.4 | G8 release: PR-3 stage-2 zero-allocation fully discharged; AM-4 latest-wins register, AM-5 vt-grace clock clamp, ADR-0006/0007 recorded. |
 | 2026-08-30 | 1.5 | C9/C10/C11 from primary-source read. C1 lineage closed. Freeze reaffirmed at v1.5. |
