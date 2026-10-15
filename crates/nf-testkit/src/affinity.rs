@@ -527,41 +527,31 @@ pub fn fabric_placement(workers: usize) -> (Option<usize>, Option<usize>, Vec<us
         Ok("distinct") => fabric_placement_distinct(workers),
         Ok("scalars_stacked") => fabric_placement_scalars_stacked(workers),
         _ => {
-            // R16d: THE DEFAULT FLIP for the 2-physical-core SMT draws
-            // (the 8573C/8370C/9V45 4-vCPU shape). The R8 default stacked BOTH
-            // workers on one physical core's hyperthreads, capping their
-            // combined fold at the kbench `2cpu_smt` ceiling (~32.8 GB/s)
-            // while the `2cpu_distinct` pool (~61 GB/s) sat unused — and
-            // the R11 `distinct` experiment proved the system main-bound
-            // (workers folded +15% more spans, sustained flat). R16b's
-            // array-driven submission (rxdesc) removes the main-side wall;
-            // with it, workers on DISTINCT physical cores is the correct
-            // default.
+            // R16d: THE DEFAULT for the 2-physical-core SMT draws (the
+            // 8573C/8370C/9V45 4-vCPU shape): workers on DISTINCT physical
+            // cores; the scalar threads (main, RX) take the leftover SMT
+            // siblings — main on cpu1, RX on cpu3, each scalar sharing a
+            // physical core with exactly one worker.
             //
-            // R25b: THE SECOND FLIP — scalars STACKED. The R16d "distinct"
-            // layout gave each scalar thread its own SMT sibling (main on
-            // cpu1, RX on cpu3), which means the RX ingest thread runs on
-            // the EXACT sibling of worker 1 (cpu2): the RX's publication
-            // loop (28% busy steady-state, prod_ms telemetry) steals
-            // issue slots AND L1/L2 from the faster worker, and the
-            // 2.05B sustained draw (run 38683262938, rx_actual_cpu=3)
-            // pinned worker 1 lagging worker 0 across the whole window.
-            // The Run 500+ diagnosis ("the hyperthread trap"): stack BOTH
-            // scalars on ONE sibling (main+rx on cpu1, worker 0's side) —
-            // the two scalar threads timeshare a single logical cpu
-            // (their combined demand ~118% of one hyperthread, so the
-            // stack costs the scalars a little scheduling, never the
-            // workers), and worker 1's sibling goes IDLE: a full physical
-            // core for the worker that was sharing. `HFT_FABRIC_PLACE=
-            // distinct` is the rollback (CI arm 11z); `siblings` stays
-            // the R8 shape. Every other shape (≥3 workers, non-SMT hosts,
-            // ≥4 physical cores) keeps the R8/R16d default — the flip is
-            // exactly the 2-worker 2-core SMT case the 2B+ target runs on.
+            // R25b POSTMORTEM (the fleet refuted the stack — run 38702884119,
+            // 29 target-silicon shards, paired same-shard deltas): the
+            // scalars_stacked experiment (main+rx BOTH on cpu1, worker 1's
+            // sibling idle) measured **−32.5% median** (min −35.6%, max
+            // −29.2%, ALL shards negative). The system is MAIN-BOUND, not
+            // worker-SMT-bound: stacking main (~90% busy) + rx (~28%)
+            // timeshares one logical cpu at ~118% combined demand — main
+            // loses ~a quarter of its own throughput, and the RX sits in
+            // main's critical loop (next_batch), compounding the stall.
+            // The RX's SMT residency on cpu3 costs worker 1 ~10-15% of ONE
+            // worker — the cheaper theft by far. `HFT_FABRIC_PLACE=
+            // scalars_stacked` stays armed as the counterfactual instrument
+            // (CI arm 11smt); the Run-500+ diagnosis's hyperthread-trap
+            // hypothesis is priced and REJECTED on this fleet.
             let n_phys = physical_core_count();
             let order = cpu_order();
             let smt = !order.is_empty() && order.len() > n_phys.max(1);
             if workers == 2 && n_phys == 2 && smt {
-                fabric_placement_scalars_stacked(workers)
+                fabric_placement_distinct(workers)
             } else {
                 fabric_placement_siblings(workers)
             }
@@ -569,14 +559,19 @@ pub fn fabric_placement(workers: usize) -> (Option<usize>, Option<usize>, Vec<us
     }
 }
 
-/// R25b: workers on DISTINCT physical cores; main AND rx STACKED on the
-/// leftover SMT sibling (cpu1 on the 4-vCPU draws: sibling pairs 0-1/2-3,
-/// workers (0, 2)). Worker 1's sibling (cpu3) goes idle — a full physical
-/// core for the worker that previously shared with the RX ingest thread.
-/// The scalar stack costs only the scalars (they timeshare one logical
-/// cpu; combined steady demand main ~90% + rx ~28% ≈ 118% of a
-/// hyperthread — the overhang queues, it never steals physical-core
-/// issue ports the way two SEPARATE active hyperthreads do).
+/// R25b (REFUTED — kept as the counterfactual instrument): workers on
+/// DISTINCT physical cores; main AND rx STACKED on the leftover SMT
+/// sibling (cpu1 on the 4-vCPU draws: sibling pairs 0-1/2-3, workers
+/// (0, 2)). The hypothesis — the RX ingest thread on worker 1's sibling
+/// (cpu3) robs the worker, so stacking the scalars frees a full physical
+/// core — priced at **−32.5% median** across 29 target-silicon shards
+/// (run 38702884119, paired same-shard): the stack timeshares main
+/// (~90% busy) + rx (~28%) on one logical cpu, throttling the MAIN core
+/// (the system's binding constraint) by ~a quarter, and the RX in main's
+/// critical loop compounds the stall. NEVER the default; armed only via
+/// `HFT_FABRIC_PLACE=scalars_stacked` (CI arm 11smt) so the fleet can
+/// re-price it on future silicon (e.g. ≥3 physical cores, where the
+/// tradeoff shape differs).
 fn fabric_placement_scalars_stacked(workers: usize) -> (Option<usize>, Option<usize>, Vec<usize>) {
     let order = cpu_order(); // distinct-physical representatives FIRST
     if order.is_empty() {
@@ -694,12 +689,11 @@ mod fabric_placement_tests {
     #[test]
     fn t_fabric_placement_no_worker_on_main_sibling_when_possible() {
         let (main, rx, workers) = fabric_placement(2);
-        // R25b: on the 2-worker 2-core SMT shape the scalar threads
-        // STACK (rx == main by design — the RX leaves worker 1's
-        // sibling; see `fabric_placement_scalars_stacked`). The
-        // invariant that still matters on EVERY shape: no worker
-        // pinned on the main thread's own cpu when the topology has
-        // room for separation.
+        // R25b: the stacked experiment (rx == main) is REFUTED and
+        // never the default (see `fabric_placement_scalars_stacked`);
+        // the default distinct layout keeps rx off main's cpu. The
+        // invariant that matters on EVERY shape: no worker pinned on
+        // the main thread's own cpu when the topology has room.
         let _ = rx;
         if let Some(m) = main {
             for w in &workers {

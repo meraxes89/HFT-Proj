@@ -423,16 +423,16 @@ grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_compoff.txt
 grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_compoff.txt
 grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_compoff.txt | head -1
 
-echo "=== 11smt. R25b: Scalars-Stacked Placement ROLLBACK (attribution) ==="
-# THE R25b FLIP: the default placement for the 2-worker 2-core SMT
-# shape is now scalars_stacked (main+rx BOTH on cpu1, worker 1's
-# sibling idle — the RX ingest thread no longer shares issue ports
-# and L1/L2 with the worker on cpu2; run 38683262938 pinned the theft:
-# rx_actual_cpu=3, worker 1 lagging all window). THIS arm is the
-# rollback: the R16d "distinct" layout (main 1, rx 3) verbatim.
-# Same-draw delta 11ab - 11smt = the SMT-interference theft the
-# Run 500+ diagnosis priced.
-HFT_RXDESC=1 HFT_FABRIC_PLACE=distinct cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_smtback.txt
+echo "=== 11smt. R25b: Scalars-Stacked Placement ARMED (the refuted lever, counterfactual) ==="
+# THE R25b EXPERIMENT (run 38702884119 verdict: REFUTED, -32.5% median
+# across 29 target-silicon shards, ALL negative — the system is
+# MAIN-bound: stacking main (~90% busy) + rx (~28%) on one logical cpu
+# throttles the binding main core; the RX's residency on worker 1's
+# sibling costs ~10-15% of one worker — the cheaper theft). The default
+# placement stays the R16d distinct layout; THIS arm keeps the stacked
+# shape priceable on every draw (the counterfactual instrument — the
+# tradeoff shape differs on >=3-physical-core silicon).
+HFT_RXDESC=1 HFT_FABRIC_PLACE=scalars_stacked cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_smtstack.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_smtback.txt
 grep -q "allocs=0" /tmp/bench_smtback.txt
 grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_smtback.txt

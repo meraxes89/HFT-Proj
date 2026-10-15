@@ -40,11 +40,13 @@ micro-optimization**:
    where it previously spent k × 5 serial cycles plus k ring reads.
    Result-ring traffic collapses ~46× (per-lane records per pass:
    ~3,951 → ~85).
-2. **R25b — the scalars-stacked SMT flip:** the default placement for
-   the 2-worker 2-core SMT shape moves the RX ingest thread OFF
-   worker 1's hyperthread (main+rx stacked on cpu1; worker 1's
-   sibling idle — a full physical core for the worker that was
-   sharing).
+2. **R25b — the hyperthread hypothesis, priced and refuted:** the
+   scalars-stacked placement (main+rx on one sibling, worker 1's
+   sibling idle) measured **−32.5% median across 29 target-silicon
+   shards** — the system is main-bound; the default reverted to the
+   R16d distinct layout, with the stack kept as a counterfactual
+   arm. The composite fold itself measured **+2.36% median
+   (27/29 shards positive)** — kept as the default.
 
 ## 2. The Culprit, Precisely
 
@@ -174,31 +176,51 @@ before.)
 fold verbatim under the new law (CI arm **11comp**; the law itself is
 not a knob — bit-parity is its gate, the composite is the perf shape).
 
-## 4. R25b — The Hyperthread Trap
+## 4. R25b — The Hyperthread Hypothesis, Priced and Refuted
 
 Run 38683262938's DIAG: `rx_actual_cpu=3`. The R16d "distinct"
-placement put the RX ingest thread on cpu3 — the SMT sibling of
-worker 1 (cpu2). The RX's publication loop (28% busy steady-state,
-prod_ms=1394/5000ms) steals issue slots and L1/L2 from the worker
-that was measurably lagging (worker[1] batches 696k vs worker[0]
-552k with equal work — the lag shows in the frontier-wait skew).
+placement puts the RX ingest thread on cpu3 — the SMT sibling of
+worker 1 (cpu2). The Run 500+ diagnosis ("the hyperthread trap")
+held that the RX's publication loop (28% busy) robs worker 1 of issue
+ports and L1/L2 — and that stacking BOTH scalars on cpu1 (worker 0's
+sibling) would free a full physical core for worker 1.
 
-The fix: `fabric_placement_scalars_stacked` — workers (0,2), main AND
-rx BOTH pinned to cpu1 (they timeshare one logical cpu; combined
-steady demand ~118% of a hyperthread, so the stack costs the scalars
-a little scheduling and never the workers), and cpu3 goes idle: **a
-full physical core for worker 1**. Rollback: `HFT_FABRIC_PLACE=
-distinct` (CI arm **11smt**). The full "zero-thread ingest" (folding
-the RX producer's work into the workers' own window advance, no RX
-thread at all) is the follow-up track (R25c) — this flip is the
-placement-only first step, priced by the fleet before the refactor.
+`fabric_placement_scalars_stacked` implemented exactly that (workers
+(0,2); main+rx timesharing cpu1; cpu3 idle). The fleet priced it
+(run 38702884119, 29 target-silicon shards, paired same-shard deltas
+against the distinct layout):
 
-## 5. What This Should Buy (the fleet will price it)
+```
+stacked vs distinct: median −32.5%   min −35.6%   max −29.2%   (29/29 negative)
+composite vs per-span: median +2.36% min −0.3%   max +4.9%    (27/29 positive)
+```
 
-At the armed 2.05B rate the consumer's fold budget was
-`fold_ms=262` of drain time plus the flow-control spins that wait on
-it, and the res-ring MESI bounce was ~9.6M lines/s between two
-physical cores. Post-composite:
+**The hypothesis is rejected — decisively.** The system is
+MAIN-BOUND, not worker-SMT-bound: main (~90% busy) timeshared with
+the RX (~28%) on one logical cpu runs at ~118% combined demand —
+main loses roughly a quarter of its own throughput, and the RX sits
+inside main's critical loop (`next_batch`), compounding every stall.
+Meanwhile the RX's SMT residency on cpu3 costs worker 1 an estimated
+10–15% of ONE worker — the far cheaper theft. The default placement
+reverted to the R16d distinct layout; `scalars_stacked` stays armed
+as the counterfactual instrument (`HFT_FABRIC_PLACE=scalars_stacked`,
+CI arm **11smt**) because the tradeoff shape differs on ≥3-physical-
+core silicon, where a future fleet may re-price it.
+
+The honest residue of the diagnosis: the consumer-side fold WAS a
+real cost (the composite's +2.36% is its removal), but it was ~6% of
+the main core's time (fold_ms=262 of work_ms=4126 in the baseline
+DIAG) — a supporting actor, not the strangler. The binding
+constraint is the main core's SUBMISSION path
+(`ingest_entries_ladder` + the per-span array check-and-fix + tag
+sidecar writes: work_ms=4.1s of the 5s window) — that is where the
+next 2B→3.5B must come from (R25c below).
+
+## 5. What the Fleet Priced (run 38702884119, 29 target-silicon shards)
+
+The composite's paired same-shard attribution (11ab vs 11comp):
+**+2.36% median** (min −0.3%, max +4.9%, 27/29 positive). The
+consumer-side structural wins, measured and prospective:
 
 * **Consumer per-span work → ~0**: two dependent ops + cursor math
   per ≤64 spans (≈0.03 cycles/span at the 4.7B target rate — the
