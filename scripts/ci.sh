@@ -460,6 +460,65 @@ grep -q "allocs=0" /tmp/bench_bs_off.txt
 grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_bs_off.txt
 grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_bs_off.txt | head -1
 
+echo "=== 11g. R26: Worker 8-Span Vertical Group ROLLBACK (attribution) ==="
+# THE R26 SHIP (docs/41): the workers ran at ~52 GB/s each against the
+# 151 GB/s single-core kernel peak — ~2/3 of the walk's cycles were the
+# per-span record-walk tax (the AoS tag fetch's 3-word copy where 1
+# word suffices, the per-span flag branch, the per-span LOCK RMW on
+# affine_hits, the spray's dead walk over all-tagged spans). R26: the
+# SoA sidecar (tagvals 8 B/span — one 64 B line per 8 spans) + the
+# vertical 8-span group (one 64 B arr load, one 64 B values load, the
+# counter RMW batched 8x) + the spray auto-mute in the all-tagged
+# steady regime. THIS arm is the rollback: the pre-R26 per-span walk
+# verbatim (HFT_WORKER_GROUP=0's semantics on the armed rxdesc
+# stack). Same-draw delta 11ab - 11g = the worker-side group's
+# contribution (the t_r26_worker_group_parity differential pins the
+# tuples bit-exact and the fix counts identical).
+HFT_RXDESC=1 HFT_WORKER_GROUP=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_wg_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_wg_off.txt
+grep -q "allocs=0" /tmp/bench_wg_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_wg_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_wg_off.txt | head -1
+
+echo "=== 11t. R27: Zero-Reset Toroidal Pass ROLLBACK (attribution) ==="
+# THE R27 SHIP (docs/41): reset_ms=833.8ms across 37,244 passes (17% of
+# wall) was the pass boundary's bulk warm copies (the arr row + the tag
+# sidecar, ~320 KB per window). R27: the steady epoch — a window that
+# verifies fix-free at the expected span count PROVES the array slot's
+# content is window-invariant, so the next window reuses the slot with
+# ZERO copies (the record ring keeps rotating with the epoch-tagged
+# aslot field; divergence disarms to the rotating regime; toroidal
+# fixes carry the per-fix lagging-reader guard). THIS arm is the
+# rollback: the rotate-and-copy window open verbatim
+# (HFT_TOROIDAL=0's semantics). Same-draw delta 11ab - 11t = the
+# toroidal elision's contribution (the t_r27_toroidal_multipass_parity
+# differential pins the tuples bit-exact in both regimes).
+HFT_RXDESC=1 HFT_TOROIDAL=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_tor_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_tor_off.txt
+grep -q "allocs=0" /tmp/bench_tor_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_tor_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_tor_off.txt | head -1
+
+echo "=== 11p. R28: Fused Packed Ladder-Commit ROLLBACK (attribution) ==="
+# THE R28 SHIP (docs/41): the main core's ~48c/span included the
+# SpanRec materialization tax (the 48 B struct store at discovery, the
+# L1D reload, the per-span (off, len) arithmetic into expect[], the
+# 512-bit load inside check_arr8). R28: the steady ladder packs each
+# span's (off, len, count) into ONE 64-bit word at discovery
+# (batch-relative) and the commit's expected words emerge from ONE
+# vector AND+ADD+OR per 8 spans fused into the compare
+# (check_arr8_packed — the count field masked, the flag OR'd, the
+# batch-constant delta added). THIS arm is the rollback: the SpanRec
+# emission verbatim (HFT_PACKED_EMISSION=0's semantics). Same-draw
+# delta 11ab - 11p = the fused commit's contribution (the
+# t_r28_packed_ladder_commit_parity differential pins the tuples
+# bit-exact and the fix counts identical).
+HFT_RXDESC=1 HFT_PACKED_EMISSION=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_pk_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_pk_off.txt
+grep -q "allocs=0" /tmp/bench_pk_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_pk_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_pk_off.txt | head -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
