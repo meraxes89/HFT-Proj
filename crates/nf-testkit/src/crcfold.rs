@@ -4377,6 +4377,18 @@ mod tests {
             let want = span_crc32c_8lane(&body[..len]);
             let got = span_crc32c_8lane_from_tags(&tag.lanes, len);
             assert_eq!(got, want, "r23c lanes diverged at len={len}");
+            // (1b) R24 Track 2: the packed sidecar's VALUE word == the
+            // same golden value (the worker loads word 2 verbatim — the
+            // pack law is the hot path's value law).
+            let packed = nf_transport::rxdesc::affine_tag_pack(&tag, got);
+            assert_eq!(packed.len(), nf_transport::rxdesc::RX_AFFINE_TAG_WORDS);
+            assert_eq!(packed[2], want, "r24 pack value word at len={len}");
+            assert_eq!(packed[0] as u32, tag.prefix_crc, "r24 pack prefix at len={len}");
+            assert_eq!((packed[0] >> 32) as u32, tag.cum_crc, "r24 pack cum at len={len}");
+            assert_eq!(packed[1] as u32, tag.raw_crc, "r24 pack raw at len={len}");
+            let view = nf_transport::rxdesc::affine_tag_unpack(&packed);
+            assert_eq!(view.value, want, "r24 unpack value at len={len}");
+            assert_eq!(view.raw_crc, tag.raw_crc, "r24 unpack raw at len={len}");
             // (2) The raw triple vs the direct scans.
             let h = len / 2;
             let prefix = crc_scan(0, &t, &body[..h]);

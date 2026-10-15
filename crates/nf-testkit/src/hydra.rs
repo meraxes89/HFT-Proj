@@ -674,7 +674,10 @@ fn affine_tag_eval(
     stats: &WorkerStats,
 ) -> u64 {
     let t: [u64; RX_AFFINE_TAG_WORDS] = rx.get_affine_tag(slot, idx);
+    #[cfg(debug_assertions)]
     let len = ((w >> 32) & 0xFFFF) as usize;
+    #[cfg(not(debug_assertions))]
+    let _ = w;
     // THE SCALAR AFFINE LAW (Engineer 2's kernel, ~1.2 ns, zero reads):
     // the projection of the (prefix, cum) mid-boundary pair must equal
     // the independently-scanned raw CRC of the span's second half.
@@ -694,16 +697,16 @@ fn affine_tag_eval(
         }
     }
     stats.affine_hits.fetch_add(1, Ordering::Relaxed);
-    // R24 (Run 500+ Track 1): the VPCLMULQDQ polynomial-hash combine — the
-    // 9-multiply FNV-1a-64 serial chain (27 cycles of IMUL latency) is
-    // retired. t[2..5] are the 8 lane registers packed as 4 contiguous
-    // u64 words: ONE 256-bit load, TWO VPCLMULQDQ (four INDEPENDENT
-    // carry-less products), the VPTERNLOGQ tree-XOR + the length product,
-    // and a single Barrett-style folding reduction mod the irreducible
-    // spanhash modulus — ~4 clmul-class uops, no serial dependency.
+    // R24 (Run 500+ Track 2): the golden value rides the sidecar as word 2
+    // — precomputed ONCE at tag-build time (the packer's SPANHASH-64
+    // combine over the body's 8 lane registers + the length, executed on
+    // the UNTIMED cold path / RX ledger fill). The hot path's evaluation
+    // is a single 8-byte load: ZERO combine work in the worker — the
+    // 9-mul FNV chain and its VPCLMULQDQ successor both left the loop.
     // Bit-identical to the payload path's `span_crc32c_8lane` (the
-    // differential pins both sides); ZERO payload reads, ZERO fallbacks.
-    crate::polyhash::spanhash64(&[t[2], t[3], t[4], t[5]], len as u32)
+    // differential pins the pack law); ZERO payload reads, ZERO
+    // fallbacks, the 24-byte sidecar halves the per-span tag traffic.
+    t[2]
 }
 
 /// Worker main loop: pure function evaluation + chunk-granular SPSC ring
@@ -2908,7 +2911,7 @@ impl<'a> HydraSpanSink<'a> {
         }
     }
 
-    /// R23c: resolve one span's affine tag — the RX producer's ledger
+    /// R23c/R24: resolve one span's affine tag — the RX producer's ledger
     /// first (the monotone pointer cursor, O(1) amortized; the pointer +
     /// length match proves the row is THIS body), the direct body scan as
     /// the fallback (divergent schedules, ledger-less runs — the
@@ -2917,6 +2920,11 @@ impl<'a> HydraSpanSink<'a> {
     /// pins the kernel against the reference). COLD PATH (the word
     /// mismatch path) — `#[inline(never)]` keeps its body-scan branch
     /// out of the steady loop's µop-cache window (the R9d discipline).
+    ///
+    /// R24 (Track 2): the packer folds the 8 lane registers into the
+    /// golden VALUE word here (the SPANHASH-64 combine — one clmul-class
+    /// evaluation per COLD fill, never in a measured window; the sidecar
+    /// ships the value, the worker loads it).
     #[inline(never)]
     fn rx_affine_tag_for(&mut self, body: &[u8]) -> [u64; RX_AFFINE_TAG_WORDS] {
         if let Some(st) = &self.rx {
@@ -2926,15 +2934,22 @@ impl<'a> HydraSpanSink<'a> {
                 body.len() as u32,
             ) {
                 self.rx_affine_cursor = cur;
-                return affine_tag_pack(&AffineTagCore {
-                    prefix_crc: e.prefix_crc,
-                    cum_crc: e.cum_crc,
-                    raw_crc: e.raw_crc,
-                    lanes: e.lanes,
-                });
+                let value =
+                    crate::crcfold::span_crc32c_8lane_from_tags(&e.lanes, e.body_len as usize);
+                return affine_tag_pack(
+                    &AffineTagCore {
+                        prefix_crc: e.prefix_crc,
+                        cum_crc: e.cum_crc,
+                        raw_crc: e.raw_crc,
+                        lanes: e.lanes,
+                    },
+                    value,
+                );
             }
         }
-        affine_tag_pack(&affine_frame_tag(body))
+        let core = affine_frame_tag(body);
+        let value = crate::crcfold::span_crc32c_8lane_from_tags(&core.lanes, body.len());
+        affine_tag_pack(&core, value)
     }
 
     /// The chunk-open cold path (runs once per CHUNK spans): pick the lane,

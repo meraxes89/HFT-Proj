@@ -99,13 +99,32 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 //     (`offset:u32 | len:u16 | flags:u16`) with ONE new flag bit —
 //     [`RX_AFFINE_FLAG`] (bit 48, the anchor bit's ring-only position —
 //     array words never take the ring consumers' anchor path). Bit set =
-//     the span carries a 48-byte tag sidecar entry.
-//   * TAG SIDECAR (48 B per span, [`RX_AFFINE_TAG_WORDS`] words):
+//     the span carries a 24-byte tag sidecar entry.
+//   * TAG SIDECAR (24 B per span, [`RX_AFFINE_TAG_WORDS`] words):
 //       word 0: prefix_crc:u32 | cum_crc:u32
-//       word 1: raw_crc:u32 | reserved:u32
-//       words 2..6: lanes[0..8] (u32 each)
-//     The total descriptor footprint is 8 + 48 = 56 bytes — strictly ≤ 64
-//     bytes (the R21 compactness law, pinned below).
+//       word 1: raw_crc:u32 | 0
+//       word 2: the span's golden VALUE (the R24 SPANHASH-64 combine,
+//       precomputed ONCE at tag-build time by the packer — see below)
+//     The total descriptor footprint is 8 + 24 = 32 bytes — the EXACT
+//     HALF-CACHELINE (the R24 Track 2 compactness law, pinned below):
+//     the per-span sidecar traffic (copy_tags warm start, the worker's
+//     get_affine_tag load) halves vs the R23c 48-byte layout, and the
+//     tag array packs 2⅔ spans per 512-bit VMOVDQA64 window.
+//   * THE VALUE WORD (R24 Track 2): the worker's per-span golden value —
+//     `span_crc32c_8lane(body)`, i.e. the SPANHASH-64 combine over the
+//     body's 8 lane registers + the length — is computed ONCE at
+//     tag-build time (the packer: `affine_tag_pack(t, value)` — the
+//     nf-testkit side supplies the value through
+//     `crcfold::span_crc32c_8lane_from_tags`, keeping the polyhash out
+//     of nf-transport's dep graph) and stored as word 2. The hot path's
+//     evaluation collapses to a single 8-byte load: ZERO combine work in
+//     the worker (the 9-mul/VPCLMUL chain moved to the UNTIMED ledger
+//     fill — one combine per corpus body, amortized over every pass).
+//     Integrity semantics are UNCHANGED in class: the (prefix, cum, raw)
+//     triple's per-span affine law fail-stops on sidecar corruption
+//     (same as R23c), and a corrupted value word diverges the final fold
+//     hash vs the reference pass (the same end-of-pass catch the R23c
+//     lane registers had — the lanes were also only fold-checked).
 //   * THE (prefix, cum) PAIR — self-contained per span, byte-granular
 //     cuts of the RAW CRC32C stream: h = len/2,
 //       prefix = raw(body[..h)), cum = raw(body[..len)), raw_crc =
@@ -118,15 +137,6 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 //     chain): a partially-diverged schedule can never desynchronize a
 //     running register, the hazard class a cross-span "packet boundary
 //     chain" carries.
-//   * THE LANES: the span's 8 span_crc32c_8lane lane registers (tail
-//     folded into lane 0 — EXACTLY the reference kernel's semantics,
-//     pinned by the nf-testkit differential). The worker reproduces the
-//     EXACT golden span value via the 9-multiply FNV-1a-64 combine
-//     (`crcfold::span_crc32c_8lane_from_tags`) — arbitrary span lengths,
-//     zero reads, ~2-3 ns. For 64-byte-aligned spans this is value-identical
-//     to Engineer 2's `span_crc32c_8lane_affine_sub` (the K2 law with a
-//     zero prefix projection); the pipeline's real spans (mean 1364.6 B,
-//     only 2.7% 64-multiples — the R23c silicon probe) ride the combine.
 //   * THE LEDGER (the RX ingest producer): [`AffineLedgerEntry`] per
 //     rendered frame — the tag computed ONCE in a single pass over the
 //     blob's packet bodies (L1D-hot at the staging/reset point, ~0.5 ms
@@ -157,11 +167,12 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 /// consumer, so the two namespaces never alias.
 pub const RX_AFFINE_FLAG: u64 = 1 << 48;
 
-/// R23c: the tag sidecar stride (words per span). 6 words = 48 bytes; the
-/// full descriptor (word + sidecar) is 56 bytes ≤ 64 (pinned below).
-pub const RX_AFFINE_TAG_WORDS: usize = 6;
+/// R24 (Track 2): the tag sidecar stride (words per span). 3 words = 24
+/// bytes; the full descriptor (word + sidecar) is 8 + 24 = 32 bytes — the
+/// EXACT HALF-CACHELINE (the R24 compactness law, pinned below).
+pub const RX_AFFINE_TAG_WORDS: usize = 3;
 
-const _: () = assert!(RX_AFFINE_TAG_WORDS * 8 + 8 <= 64, "R23c compactness");
+const _: () = assert!(RX_AFFINE_TAG_WORDS * 8 + 8 <= 32, "R24 half-cacheline law");
 
 /// R23c: one ledger row — the RX producer's per-frame affine snapshot
 /// (the single untimed pass over the blob's packet bodies). The `body_ptr`
@@ -191,8 +202,11 @@ pub struct AffineLedgerEntry {
 /// alignment) — one cache line per ledger row.
 const _: () = assert!(std::mem::size_of::<AffineLedgerEntry>() == 64);
 
-/// R23c: the tag core — the four facts the sidecar carries, computed by
-/// ONE pass over the body (the RX ledger fill or the sink's fallback).
+/// R23c/R24: the tag core — the per-span facts computed by ONE pass over
+/// the body (the RX ledger fill or the sink's fallback). The lanes are
+/// TRANSIENT: the packer folds them into the VALUE word (through the
+/// nf-testkit-side SPANHASH-64 combine) and they are NOT stored in the
+/// sidecar (the R24 Track 2 half-cacheline diet).
 #[derive(Clone, Copy)]
 pub struct AffineTagCore {
     pub prefix_crc: u32,
@@ -201,35 +215,43 @@ pub struct AffineTagCore {
     pub lanes: [u32; 8],
 }
 
-/// R23c: pack the tag core into the sidecar word layout.
+/// R24 (Track 2): pack the tag core + the precomputed golden VALUE into
+/// the 3-word (24 B) sidecar layout:
+///   word 0: prefix_crc | cum_crc << 32
+///   word 1: raw_crc
+///   word 2: value — `span_crc32c_8lane(body)`, supplied by the caller
+///   (nf-testkit's `crcfold::span_crc32c_8lane_from_tags(&t.lanes, len)`
+///   keeps the polyhash on the testkit side of the dep graph; the lane
+///   registers never enter the sidecar).
 #[inline(always)]
-pub fn affine_tag_pack(t: &AffineTagCore) -> [u64; RX_AFFINE_TAG_WORDS] {
+pub fn affine_tag_pack(t: &AffineTagCore, value: u64) -> [u64; RX_AFFINE_TAG_WORDS] {
     let mut w = [0u64; RX_AFFINE_TAG_WORDS];
     w[0] = t.prefix_crc as u64 | ((t.cum_crc as u64) << 32);
     w[1] = t.raw_crc as u64;
-    for k in 0..8 {
-        w[2 + k / 2] |= (t.lanes[k] as u64) << (32 * (k % 2));
-    }
+    w[2] = value;
     w
 }
 
-/// R23c: unpack the sidecar words (the inverse of [`affine_tag_pack`]).
+/// R24 (Track 2): unpack the sidecar words — the (prefix, cum, raw)
+/// triple + the golden value word (the lane registers are not stored;
+/// see [`affine_tag_pack`]).
+#[derive(Clone, Copy)]
+pub struct AffineTagView {
+    pub prefix_crc: u32,
+    pub cum_crc: u32,
+    pub raw_crc: u32,
+    /// The precomputed span golden value (word 2).
+    pub value: u64,
+}
+
+/// R24 (Track 2): the sidecar reader (the inverse of [`affine_tag_pack`]).
 #[inline(always)]
-pub fn affine_tag_unpack(w: &[u64; RX_AFFINE_TAG_WORDS]) -> AffineTagCore {
-    AffineTagCore {
+pub fn affine_tag_unpack(w: &[u64; RX_AFFINE_TAG_WORDS]) -> AffineTagView {
+    AffineTagView {
         prefix_crc: w[0] as u32,
         cum_crc: (w[0] >> 32) as u32,
         raw_crc: w[1] as u32,
-        lanes: [
-            w[2] as u32,
-            (w[2] >> 32) as u32,
-            w[3] as u32,
-            (w[3] >> 32) as u32,
-            w[4] as u32,
-            (w[4] >> 32) as u32,
-            w[5] as u32,
-            (w[5] >> 32) as u32,
-        ],
+        value: w[2],
     }
 }
 
