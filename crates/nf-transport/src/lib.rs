@@ -1,3 +1,4 @@
+pub mod moldvec;
 pub mod render;
 pub mod pipeline;
 pub mod replay;
