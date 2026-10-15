@@ -304,7 +304,12 @@ fn run_hydra_burst(
     // measured a degenerative spiral (starved worker spins stealing issue
     // slots from the critical main thread: 14M msg/s). Sizing: 2 workers
     // on <= 2-physical hosts, 3 otherwise.
-    let n_phys = nf_testkit::affinity::physical_core_count();
+    // ARM64 track: on heterogeneous (big.LITTLE) hosts the PERFORMANCE
+    // cluster sizes the fabric (the fold workers' silicon — 2 on the
+    // Helio G99's A76 pair, exactly the directive's cores 6-7; overflow
+    // lanes would land on the A55 efficiency cluster); homogeneous hosts
+    // keep the standing physical-core law (perf == physical there).
+    let n_phys = nf_testkit::affinity::perf_core_count();
     // R8 phase-6: on 2-physical-core SMT runners, a third worker joins the
     // RX's hyperthread (fabric_placement appends it to the pool) — the
     // work-assist contains its straggler risk, and the machine's second
@@ -491,7 +496,10 @@ fn run_hydra_sustained_5s(
     // core's issue slots (main's work share fell 88% -> 67%) and the
     // assist cannot repay it. Two dedicated workers remain the default;
     // fabric_placement still extends the pool for explicit experiments.
-    let n_phys = nf_testkit::affinity::physical_core_count();
+    // ARM64 track: the PERFORMANCE cluster sizes the fabric on
+    // heterogeneous hosts (perf == physical on homogeneous ones — the
+    // standing law, byte-identical behavior there).
+    let n_phys = nf_testkit::affinity::perf_core_count();
     let mut workers = if n_phys >= 4 {
         3
     } else {

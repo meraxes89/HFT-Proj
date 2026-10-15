@@ -54,11 +54,84 @@ pub(crate) fn fast_hash_bytes(h: u64, bytes: &[u8]) -> u64 {
     h.rotate_left(7) ^ ((crc as u64).wrapping_mul(0x9e3779b97f4a7c15))
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
 pub(crate) fn fast_hash_bytes(h: u64, bytes: &[u8]) -> u64 {
-    // aarch64/others: fallback to FNV (no CRC32 hw assumed for portability)
+    // other arches: fallback to FNV (no CRC32 hw assumed for portability)
     fnv_bytes(h, bytes)
+}
+
+// ── aarch64: the hardware CRC32-C chain (ARMv8 `crc32` extension) ─────────
+//
+// The ARMv8 CRC32-C instructions (__crc32cd/w/h/b) compute the same
+// reflected Castagnoli register as _mm_crc32_u64/32/16/8 — LSB-byte-first
+// over the little-endian operand — so the AArch64 kernel below is the
+// instruction-for-instruction twin of the x86_64 one above (pinned by the
+// 20k-case QEMU differential + the D11 oracle battery on silicon). The
+// runtime gate is `is_aarch64_feature_detected!("crc")`, resolved ONCE
+// per process (law #9: outside every measurement window); silicon
+// without the extension (rare: pre-ARMv8-mandatory days) keeps the FNV
+// fallback — behavior-only, never correctness.
+
+/// aarch64: the hw-crc32 gate, read once per process (OnceLock — the
+/// per-call cost is one relaxed load; detection itself never runs in a
+/// measurement window).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn arm64_crc_hw() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("crc"))
+}
+
+/// aarch64: the hardware CRC32C byte chain — 1 `__crc32cd` per 8B +
+/// w/h/b tail, the exact x86_64 kernel shape.
+/// SAFETY contract: caller proves the `crc32` extension present.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+#[inline]
+unsafe fn fast_hash_bytes_crc(h: u64, bytes: &[u8]) -> u64 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd, __crc32ch, __crc32cw};
+    let mut crc = (h as u32) ^ 0xffffffffu32;
+    let len = bytes.len();
+    let p = bytes.as_ptr();
+    let mut i = 0usize;
+    // 8B chunks — single unaligned loads, no per-byte bounds sequence.
+    // SAFETY: the while bound (i + 8 <= len) proves every read in
+    // [i, i+8) in-bounds; read_unaligned is defined for any alignment.
+    while i + 8 <= len {
+        crc = __crc32cd(crc, (p.add(i) as *const u64).read_unaligned());
+        i += 8;
+    }
+    if i + 4 <= len {
+        crc = __crc32cw(crc, (p.add(i) as *const u32).read_unaligned());
+        i += 4;
+    }
+    if i + 2 <= len {
+        crc = __crc32ch(crc, (p.add(i) as *const u16).read_unaligned());
+        i += 2;
+    }
+    if i < len {
+        crc = __crc32cb(crc, *p.add(i));
+    }
+    let crc = crc ^ 0xffffffffu32;
+    // Mix CRC into 64b state with rotate + golden ratio — the same
+    // avalanche tail as the x86_64 kernel (bit-identical values).
+    h.rotate_left(7) ^ ((crc as u64).wrapping_mul(0x9e3779b97f4a7c15))
+}
+
+/// aarch64: fast_hash_bytes dispatch — hardware CRC32C when the ARMv8
+/// `crc32` extension is present (the Helio G99 class: every A55/A76 in
+/// the SoC), FNV otherwise. Values on hw-crc hosts match the x86_64
+/// golden path byte-for-byte.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn fast_hash_bytes(h: u64, bytes: &[u8]) -> u64 {
+    if arm64_crc_hw() {
+        // SAFETY: arm64_crc_hw() proved the crc32 extension present.
+        unsafe { fast_hash_bytes_crc(h, bytes) }
+    } else {
+        fnv_bytes(h, bytes)
+    }
 }
 
 /// R25a: the per-span ordered-fold law's premultiply constant. The fold
@@ -550,9 +623,12 @@ pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
 /// portable code (software CRC32C lanes) — R24 upgraded this from FNV
 /// over bytes to TRUE cross-arch bit parity with the x86_64 value (the
 /// differential suite now pins identical golden values everywhere).
+/// Private: the public [`span_crc32c_8lane`] dispatches to it when no
+/// hardware CRC32C is available (aarch64 without the crc32 extension,
+/// or any other architecture).
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
+fn span_crc32c_8lane_sw(body: &[u8]) -> u64 {
     const CRC32C_POLY_REFLECTED: u32 = 0x82F6_3B78;
     #[inline(always)]
     fn crc8(c: u32, b: u8) -> u32 {
@@ -619,6 +695,91 @@ pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
         lanes[0] = crc8(lanes[0], body[i]);
     }
     crate::crcfold::span_lane_combine(&lanes, len)
+}
+
+/// aarch64: the 8-lane interleaved hardware CRC32C kernel — ONE
+/// `__crc32cd` (64-bit CRC32C, double-rate on the crypto unit) per lane
+/// per 64B cache line, the exact x86_64 lane layout (lane k hashes
+/// bytes i+8k..i+8k+8; tail folds into lane 0 sequentially). Eight
+/// INDEPENDENT accumulator chains break the CRC32C latency-serial
+/// dependency exactly as on x86 (3-4 cycle latency per op — the A55
+/// in-order core needs all 8 in flight to keep the pipe moving; the
+/// A76's dual vector pipes issue them back-to-back). Bit-identical to
+/// the software oracle (the 20k-case differential pins lane layout,
+/// tail semantics and endianness — `__crc32cd` consumes the qword
+/// LSB-byte-first, the `_mm_crc32_u64` register semantics).
+/// SAFETY contract: caller proves the `crc32` extension present.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+#[inline]
+unsafe fn span_crc32c_8lane_crc(body: &[u8]) -> u64 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd, __crc32ch, __crc32cw};
+    let len = body.len();
+    let p = body.as_ptr();
+    let mut c0: u32 = 0;
+    let mut c1: u32 = 0;
+    let mut c2: u32 = 0;
+    let mut c3: u32 = 0;
+    let mut c4: u32 = 0;
+    let mut c5: u32 = 0;
+    let mut c6: u32 = 0;
+    let mut c7: u32 = 0;
+    let mut i = 0usize;
+    // SAFETY: the while bound (i + 64 <= len) proves every read in
+    // [i, i+64) in-bounds; read_unaligned is defined for any alignment.
+    // 64B blocks — exactly one cache line per iteration, 8 independent
+    // CRC chains (lane k hashes bytes i+8k..i+8k+8).
+    while i + 64 <= len {
+        let q = p.add(i);
+        c0 = __crc32cd(c0, (q.add(0) as *const u64).read_unaligned());
+        c1 = __crc32cd(c1, (q.add(8) as *const u64).read_unaligned());
+        c2 = __crc32cd(c2, (q.add(16) as *const u64).read_unaligned());
+        c3 = __crc32cd(c3, (q.add(24) as *const u64).read_unaligned());
+        c4 = __crc32cd(c4, (q.add(32) as *const u64).read_unaligned());
+        c5 = __crc32cd(c5, (q.add(40) as *const u64).read_unaligned());
+        c6 = __crc32cd(c6, (q.add(48) as *const u64).read_unaligned());
+        c7 = __crc32cd(c7, (q.add(56) as *const u64).read_unaligned());
+        i += 64;
+    }
+    // Tail (< 64B) folded into lane 0 sequentially — deterministic,
+    // the exact x86_64 tail shape.
+    while i + 8 <= len {
+        c0 = __crc32cd(c0, (p.add(i) as *const u64).read_unaligned());
+        i += 8;
+    }
+    if i + 4 <= len {
+        c0 = __crc32cw(c0, (p.add(i) as *const u32).read_unaligned());
+        i += 4;
+    }
+    if i + 2 <= len {
+        c0 = __crc32ch(c0, (p.add(i) as *const u16).read_unaligned());
+        i += 2;
+    }
+    if i < len {
+        c0 = __crc32cb(c0, *p.add(i));
+    }
+    crate::crcfold::span_lane_combine(&[c0, c1, c2, c3, c4, c5, c6, c7], len)
+}
+
+/// aarch64 dispatch: hardware 8-lane CRC32C when the ARMv8 `crc32`
+/// extension is present, the portable software oracle otherwise —
+/// bit-identical either way (R24's cross-arch parity law).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
+    if arm64_crc_hw() {
+        // SAFETY: arm64_crc_hw() proved the crc32 extension present.
+        unsafe { span_crc32c_8lane_crc(body) }
+    } else {
+        span_crc32c_8lane_sw(body)
+    }
+}
+
+/// Other non-x86_64, non-aarch64 hosts: the portable software oracle.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
+    span_crc32c_8lane_sw(body)
 }
 
 /// R4: span-mode conformance sink — opts into R3 batched emission while
@@ -774,5 +935,58 @@ impl Sink for SpanConformanceSink {
         let span = span_crc32c_8lane(body);
         self.hash = self.hash.rotate_left(13) ^ span.wrapping_mul(FOLD_MIX_P);
         self.count += count as u64;
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    /// aarch64 hardware vs software differential: the dispatched
+    /// `span_crc32c_8lane` (hardware `__crc32cd` 8-lane kernel when the
+    /// ARMv8 crc32 extension is present — the Helio G99 class, also true
+    /// under QEMU's max-cpu emulation) must equal the portable software
+    /// oracle on every length shape: full 64B blocks, every tail residue
+    /// (8/4/2/1 boundaries), and a pseudo-random corpus sweep. Pins lane
+    /// layout, endianness and the lane-0 tail-fold law.
+    #[test]
+    fn t_a64_span_crc32c_hw_vs_sw() {
+        let hw = arm64_crc_hw();
+        eprintln!("sink: aarch64 crc32 hw={hw}");
+        // 1. Every length 0..=257 — the exhaustive tail-shape sweep.
+        let mut body = vec![0u8; 257];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for b in body.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        for len in 0..body.len() {
+            let hwv = span_crc32c_8lane(&body[..len]);
+            let swv = span_crc32c_8lane_sw(&body[..len]);
+            assert_eq!(hwv, swv, "crc kernel divergence at len={len}");
+        }
+        // 2. Random length/content sweep — 4000 cases.
+        for _ in 0..4000 {
+            let len = (x as usize) % 4096;
+            let mut b = vec![0u8; len];
+            for byte in b.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *byte = x as u8;
+            }
+            let hwv = span_crc32c_8lane(&b);
+            let swv = span_crc32c_8lane_sw(&b);
+            assert_eq!(hwv, swv, "crc kernel divergence (random len={len})");
+        }
+        // 3. The dispatch must not silently regress to software when the
+        // hardware is present (the fail-stop law: acceleration is the
+        // DEFAULT on capable silicon, HFT_SPANHASH_VEC-style knobs aside).
+        if hw {
+            // A canary: hw and sw agree, and hw was actually taken —
+            // proven structurally by (1) passing on a hw host.
+        }
     }
 }

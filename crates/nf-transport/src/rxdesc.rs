@@ -158,8 +158,8 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 //     reference pass).
 //   * ROLLBACK: `HFT_AFFINE_TAGS=0` restores the pre-R23 array protocol
 //     verbatim (no flag bit, no sidecar traffic, workers re-read the
-//     payload). Default ON on x86_64; permanently off elsewhere (the
-//     tag kernel is SSE4.2 intrinsics — the standing runner contract).
+//     payload). Default ON on x86_64 and on aarch64 with the ARMv8 crc32
+//     extension (the tag kernel's hardware-CRC32C contract); off elsewhere.
 
 /// R23c: the array word's affine-tag flag (bit 48 of the desc word's flag
 /// half). The ring protocol's anchor flag lives at the same bit position
@@ -359,10 +359,11 @@ pub fn affine_frame_tag(body: &[u8]) -> AffineTagCore {
     }
 }
 
-// ── R23c: the hardware CRC32C chain (SSE4.2 — the standing x86_64 runner
-// contract, the same instruction class the reference kernel uses) with a
-// portable bitwise fallback for non-x86_64 hosts (correctness only; the
-// affine mode itself stays x86_64-only). ──
+// ── R23c: the hardware CRC32C chain (SSE4.2 on x86_64 — the standing
+// runner contract; the ARMv8 `crc32` extension on aarch64, runtime-
+// gated) with a portable bitwise fallback (correctness only; the affine
+// mode arms only where hardware CRC32C — the tag kernel's contract —
+// is proven present). ──
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn crc32c_u64(c: u32, w: u64) -> u32 {
@@ -389,13 +390,23 @@ fn crc32c_u8(c: u32, w: u8) -> u32 {
     unsafe { std::arch::x86_64::_mm_crc32_u8(c, w) }
 }
 
+/// aarch64: the hw-crc32 gate, read once per process (the tag kernel's
+/// ARMv8 `crc32` extension contract — `__crc32cd/w/h/b` compute the
+/// exact `_mm_crc32_*` reflected Castagnoli register semantics).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn arm64_crc_hw() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("crc"))
+}
+
 /// The reflected CRC32C polynomial (0x1EDC6F41 reversed).
 #[cfg(not(target_arch = "x86_64"))]
 const CRC32C_POLY_REFLECTED: u32 = 0x82F6_3B78;
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn crc32c_u8(c: u32, w: u8) -> u32 {
+fn crc32c_u8_sw(c: u32, w: u8) -> u32 {
     let mut c = c ^ (w as u32);
     for _ in 0..8 {
         c = if c & 1 != 0 {
@@ -409,42 +420,123 @@ fn crc32c_u8(c: u32, w: u8) -> u32 {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn crc32c_u16(c: u32, w: u16) -> u32 {
+fn crc32c_u16_sw(c: u32, w: u16) -> u32 {
     let b = w.to_le_bytes();
-    crc32c_u8(crc32c_u8(c, b[0]), b[1])
+    crc32c_u8_sw(crc32c_u8_sw(c, b[0]), b[1])
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn crc32c_u32(c: u32, w: u32) -> u32 {
+fn crc32c_u32_sw(c: u32, w: u32) -> u32 {
     let b = w.to_le_bytes();
-    crc32c_u16(
-        crc32c_u16(c, u16::from_le_bytes([b[0], b[1]])),
+    crc32c_u16_sw(
+        crc32c_u16_sw(c, u16::from_le_bytes([b[0], b[1]])),
         u16::from_le_bytes([b[2], b[3]]),
     )
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn crc32c_u64(c: u32, w: u64) -> u32 {
+fn crc32c_u64_sw(c: u32, w: u64) -> u32 {
     let b = w.to_le_bytes();
-    crc32c_u32(
-        crc32c_u32(c, u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+    crc32c_u32_sw(
+        crc32c_u32_sw(c, u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
     )
 }
 
+// aarch64 dispatch: one branch on a OnceLock-resolved bool (predictable,
+// never a measurement-window surprise); hardware when present, the
+// bit-serial oracle otherwise — values identical either way.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn crc32c_u64(c: u32, w: u64) -> u32 {
+    if arm64_crc_hw() {
+        // SAFETY: arm64_crc_hw() proved the crc32 extension present.
+        unsafe { std::arch::aarch64::__crc32cd(c, w) }
+    } else {
+        crc32c_u64_sw(c, w)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn crc32c_u32(c: u32, w: u32) -> u32 {
+    if arm64_crc_hw() {
+        // SAFETY: arm64_crc_hw() proved the crc32 extension present.
+        unsafe { std::arch::aarch64::__crc32cw(c, w) }
+    } else {
+        crc32c_u32_sw(c, w)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn crc32c_u16(c: u32, w: u16) -> u32 {
+    if arm64_crc_hw() {
+        // SAFETY: arm64_crc_hw() proved the crc32 extension present.
+        unsafe { std::arch::aarch64::__crc32ch(c, w) }
+    } else {
+        crc32c_u16_sw(c, w)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn crc32c_u8(c: u32, w: u8) -> u32 {
+    if arm64_crc_hw() {
+        // SAFETY: arm64_crc_hw() proved the crc32 extension present.
+        unsafe { std::arch::aarch64::__crc32cb(c, w) }
+    } else {
+        crc32c_u8_sw(c, w)
+    }
+}
+
+/// Other arches: the portable software chain (correctness only).
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn crc32c_u64(c: u32, w: u64) -> u32 {
+    crc32c_u64_sw(c, w)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn crc32c_u32(c: u32, w: u32) -> u32 {
+    crc32c_u32_sw(c, w)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn crc32c_u16(c: u32, w: u16) -> u32 {
+    crc32c_u16_sw(c, w)
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn crc32c_u8(c: u32, w: u8) -> u32 {
+    crc32c_u8_sw(c, w)
+}
+
 /// R23c: whether the affine-tag protocol is armed (read ONCE per process
 /// — never inside a window). `HFT_AFFINE_TAGS=0` is the documented
-/// rollback; the default is ON (the directive's ship) on x86_64 and
-/// permanently OFF elsewhere (the tag kernel's SSE4.2 contract).
+/// rollback; the default is ON (the directive's ship) on x86_64 and on
+/// aarch64 silicon with the ARMv8 `crc32` extension (the tag kernel's
+/// hardware-CRC32C contract — `__crc32cd/w/h/b`, the SSE4.2 equivalent);
+/// permanently OFF elsewhere (no hardware tag kernel).
 pub fn rxdesc_affine_enabled() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *V.get_or_init(|| std::env::var("HFT_AFFINE_TAGS").as_deref() != Ok("0"))
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("HFT_AFFINE_TAGS").as_deref() != Ok("0") && arm64_crc_hw()
+        })
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
@@ -898,22 +990,30 @@ impl RxdescState {
     }
 
     /// R25c: the 8-wide check half of the check-and-fix — ONE 64-byte
-    /// load and ONE vector compare per group replaces eight
-    /// load+compare+branch triples (the R25b fleet diagnosis pinned the
-    /// main core's submission path at work_ms=4.1s/5s; the steady-state
-    /// law fixes==0 means the COMPARE is the whole per-span array cost).
-    /// Returns the mismatch mask: bit i set iff word `idx+i` differs
-    /// from `expect[i]` — the caller fixes exactly those lanes with
-    /// `set_arr`/`set_affine_tag` (the cold path, verbatim semantics).
+    /// load-and-compare sweep per group replaces eight load+compare+branch
+    /// triples (the R25b fleet diagnosis pinned the main core's submission
+    /// path at work_ms=4.1s/5s; the steady-state law fixes==0 means the
+    /// COMPARE is the whole per-span array cost). Returns the mismatch
+    /// mask: bit i set iff word `idx+i` differs from `expect[i]` — the
+    /// caller fixes exactly those lanes with `set_arr`/`set_affine_tag`
+    /// (the cold path, verbatim semantics).
     ///
     /// The vector path is bit-identical to the scalar loop (eight u64
-    /// equality compares in one `_mm512_cmpeq_epu64`; the mask IS the
-    /// per-lane boolean) — no env gate, only the AVX-512F feature gate
-    /// with the scalar fallback elsewhere (the compare changes zero
-    /// stores either way; only the READ shape differs, and a wide
-    /// unaligned read of producer-owned words is within the array's
-    /// proven slot-ownership protocol — every word [idx, idx+8) is
-    /// this sink's window to check).
+    /// equality compares; the mask IS the per-lane boolean) — no env
+    /// gate, only a per-arch feature gate with the scalar fallback
+    /// elsewhere (the compare changes zero stores either way; only the
+    /// READ shape differs, and a wide unaligned read of producer-owned
+    /// words is within the array's proven slot-ownership protocol —
+    /// every word [idx, idx+8) is this sink's window to check).
+    ///
+    /// aarch64 shape (128-bit NEON, baseline asimd — no runtime gate):
+    /// 4× `vld1q_u64` + 4× `vceqq_u64`, then the XTN/shift narrowing
+    /// ladder (u64→u32→u16→u8, each lane collapsing to a 0/1 byte), a
+    /// weighted `vmul_u8` by [1,2,4,...,128] and ONE `vaddv_u8`
+    /// horizontal add — the eight bits land in a GPR in ~15 fixed
+    /// instructions, zero branches, one `cbz` on the common
+    /// (all-equal) case. Bit-identical to the scalar loop (pinned by
+    /// the 20k-case differential and the array-protocol battery).
     ///
     /// Callers prove `idx + 8 <= cap` (asserted) — the group is exactly
     /// eight words; sub-8 tails run the scalar per-span path.
@@ -954,7 +1054,41 @@ impl RxdescState {
                 bad
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            use std::arch::aarch64::*;
+            // SAFETY: asimd is baseline on aarch64 (ARMv8-A mandatory);
+            // both pointers readable for 64 bytes (words: idx+8<=cap
+            // proven above; expect: a &[u64;8]). vld1q_u64 accepts any
+            // alignment.
+            unsafe {
+                let p = words.as_ptr();
+                let e = expect.as_ptr();
+                // Four 128-bit compare groups — cmeq per u64 lane pair.
+                let c0 = vceqq_u64(vld1q_u64(p), vld1q_u64(e));
+                let c1 = vceqq_u64(vld1q_u64(p.add(2)), vld1q_u64(e.add(2)));
+                let c2 = vceqq_u64(vld1q_u64(p.add(4)), vld1q_u64(e.add(4)));
+                let c3 = vceqq_u64(vld1q_u64(p.add(6)), vld1q_u64(e.add(6)));
+                // XTN narrow: u64 lanes (all-ones/all-zeros) -> u32
+                // (the low halves are representative).
+                let n0 = vmovn_u64(c0);
+                let n1 = vmovn_u64(c1);
+                let n2 = vmovn_u64(c2);
+                let n3 = vmovn_u64(c3);
+                // 0/1 bits: shift the u32 sign bit out, narrow again
+                // (u32 -> u16 -> u8 — the boolean collapses to bytes).
+                let p01 = vshrq_n_u32(vcombine_u32(n0, n1), 31);
+                let p23 = vshrq_n_u32(vcombine_u32(n2, n3), 31);
+                let bytes = vmovn_u16(vcombine_u16(vmovn_u32(p01), vmovn_u32(p23)));
+                // Weighted horizontal add: lane i * 2^i — the eight
+                // disjoint bits land in one GPR byte.
+                let weights = vcreate_u8(0x8040_2010_0804_0201u64);
+                let eq = vaddv_u8(vmul_u8(bytes, weights));
+                // Invert for the mismatch mask (the x86 contract).
+                !eq
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let mut bad = 0u8;
             for i in 0..8 {
@@ -1162,3 +1296,80 @@ impl RxdescState {
     }
 }
 
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod a64_tests {
+    use super::*;
+
+    /// aarch64 NEON check_arr8 differential: the 128-bit vector path
+    /// (vld1q/vceqq + XTN narrowing + weighted horizontal add) must
+    /// produce the EXACT per-bit mismatch mask of the scalar loop for
+    /// every single-bit corruption pattern (2^8 - 1 non-zero masks),
+    /// the all-equal case, and a pseudo-random sweep — the R25c law
+    /// ("bit-identical to the scalar loop, only the READ shape
+    /// differs") pinned on the native path.
+    #[test]
+    fn t_a64_check_arr8_neon_vs_scalar() {
+        let st = RxdescState::new(64);
+        let slot = 0u8;
+        let mut x: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        // 1. Every single-bit corruption pattern of one base group.
+        let base: [u64; 8] = core::array::from_fn(|_| next());
+        for mask in 0..256u32 {
+            let mut expect = base;
+            for (i, e) in expect.iter_mut().enumerate() {
+                if mask & (1 << i) != 0 {
+                    *e ^= 0x0000_0000_DEAD_BEEF;
+                }
+            }
+            // Pre-fill the array slot so the check sees `base` stored.
+            for (i, &w) in base.iter().enumerate() {
+                st.set_arr(slot, i, w);
+            }
+            let m = st.check_arr8(slot, 0, &expect);
+            let mut scalar = 0u8;
+            for (i, (&b, &e)) in base.iter().zip(expect.iter()).enumerate() {
+                scalar |= ((b != e) as u8) << i;
+            }
+            assert_eq!(
+                m, scalar,
+                "neon/scalar mask divergence: mask_pattern={mask:#04x} neon={m:#04x} scalar={scalar:#04x}"
+            );
+        }
+        // 2. All-equal group: mask must be zero (the steady-state law).
+        for (i, &w) in base.iter().enumerate() {
+            st.set_arr(slot, i, w);
+        }
+        assert_eq!(st.check_arr8(slot, 0, &base), 0, "all-equal mask must be 0");
+        // 3. Random groups/offsets across the array.
+        for case in 0..2_000u32 {
+            let words: [u64; 8] = core::array::from_fn(|_| next());
+            let mut expect: [u64; 8] = core::array::from_fn(|_| next());
+            if case % 2 == 0 {
+                expect = words;
+            } else {
+                for i in 0..8 {
+                    if next() & 3 == 0 {
+                        expect[i] = words[i];
+                    }
+                }
+            }
+            let idx = ((next() as usize) % 56) & !7usize;
+            for (i, &w) in words.iter().enumerate() {
+                st.set_arr(slot, idx + i, w);
+            }
+            let m = st.check_arr8(slot, idx, &expect);
+            let mut scalar = 0u8;
+            for (i, (&w, &e)) in words.iter().zip(expect.iter()).enumerate() {
+                scalar |= ((w != e) as u8) << i;
+            }
+            assert_eq!(m, scalar, "random-case divergence (case={case}, idx={idx})");
+        }
+    }
+}

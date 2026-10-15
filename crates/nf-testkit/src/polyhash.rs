@@ -41,6 +41,25 @@
 //! chain collapses to ~4 clmul-class uops + a 2-level XOR tree + one
 //! folding reduction.
 //!
+//! # The intrinsics shape on aarch64 (AArch64 NEON + Crypto Extensions)
+//!
+//! The SoC class this track targets (Helio G99: Cortex-A55 + A76,
+//! `/proc/cpuinfo` flags `pmull`/`crc32`/`asimd` — every ARMv8.0 CPU with
+//! the crypto extension) exposes the EXACT same 64×64→128 carry-less
+//! product x86 gets from PCLMULQDQ: the A64 `PMULL Vd.1Q, Vn.1D, Vm.1D`
+//! instruction, surfaced as [`std::arch::aarch64::vmull_p64`] (stable,
+//! `neon,aes` feature-gated). Five independent PMULLs (w0..w3, len — the
+//! products live in Q registers), an EOR tree in NEON (u128 XOR lowers to
+//! EOR v.16b), the first folding round as a sixth PMULL by 0x1B, and the
+//! ≤ 4-bit second round in GPR shifts — one-for-one the PCLMUL path's
+//! shape. Runtime-gated on `is_aarch64_feature_detected!("aes")` (the
+//! ID_AA64ISAR0 AES field = 2 implies both AESE and PMULL.1Q; the Linux
+//! kernel tabulates them as the separate `aes`/`pmull` hwcaps but they
+//! rise and fall together), bit-identical to the portable oracle (the
+//! differential battery `t_r24_*` pins all paths against the derive
+//! script's vectors — verified under QEMU aarch64 emulation as well as
+//! on silicon).
+//!
 //! # The exact intrinsics shape (the worker hot path, x86_64)
 //!
 //! SSE4.2+PCLMUL (universal on target silicon):
@@ -79,6 +98,7 @@ pub const SPANHASH_KEYS: [u64; 5] = [
 ];
 
 /// The keys arranged for one 256-bit VPCLMULQDQ operand pair ([K0,K1,K2,K3]).
+#[cfg(target_arch = "x86_64")]
 const SPANHASH_KEYS_256: [u64; 4] = [
     SPANHASH_KEYS[0],
     SPANHASH_KEYS[1],
@@ -225,12 +245,59 @@ unsafe fn spanhash64_vec256(words: &[u64; 4], len: u32) -> u64 {
     lo2 ^ ((hi2 << 4) ^ (hi2 << 3) ^ (hi2 << 1) ^ hi2)
 }
 
+// ── aarch64: the PMULL (NEON carry-less multiply) path — vmull_p64 ──────
+
+/// The 5-term combine + folding reduction through the A64 crypto
+/// extension's polynomial multiply (PMULL, 64-bit operand form).
+///
+/// `vmull_p64(a, b)` IS the 64×64→128 carry-less product PCLMULQDQ
+/// computes — the u128 result rides a Q register, so the five term
+/// multiplies and the XOR tree execute as parallel NEON EOR/PMULL ops
+/// (Cortex-A76: one crypto-pipe PMULL.1Q each, ~3-cycle latency, dual
+/// issue with the vector pipes; the independent terms hide the latency
+/// entirely). The reduction is the same two-round folding law as the
+/// x86 paths: round 1 is a sixth PMULL by P's low word, round 2 (the
+/// ≤ 4-bit residue) runs in GPR shifts.
+/// SAFETY contract: caller proves the `aes` (crypto/pmull) feature.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,aes")]
+#[inline]
+unsafe fn spanhash64_pmull(words: &[u64; 4], len: u32) -> u64 {
+    use std::arch::aarch64::vmull_p64;
+    // Five INDEPENDENT 64x64->128 carry-less multiplies — the exact
+    // PCLMUL/VPCLMUL term algebra, zero serial dependency. SAFETY: the
+    // feature contract is the caller's; registers are value-only.
+    let p01 = vmull_p64(words[0], SPANHASH_KEYS[0]);
+    let p23 = vmull_p64(words[1], SPANHASH_KEYS[1]);
+    let p45 = vmull_p64(words[2], SPANHASH_KEYS[2]);
+    let p67 = vmull_p64(words[3], SPANHASH_KEYS[3]);
+    let pl = vmull_p64(len as u64, SPANHASH_KEYS[4]);
+    // Tree-XOR of the five 128-bit products (u128 XOR lowers to EOR
+    // v.16b — the products never leave the NEON register file).
+    let s = p01 ^ p23 ^ p45 ^ p67 ^ pl;
+    // Folding round 1: x = hi·x^64 + lo -> (hi ⊗ p) ^ lo. The 128-bit
+    // product hi ⊗ 0x1B stays in a Q register (deg ≤ 67); the low
+    // qword zero-extends exactly like _mm_move_epi64 on x86.
+    let hi = (s >> 64) as u64;
+    let t1 = vmull_p64(hi, SPANHASH_MOD_P_LOW);
+    let x1 = t1 ^ (s as u64 as u128);
+    // Round 2 (the ≤ 4-bit residue): hi2 ⊗ p in the GPR — shifts only,
+    // the same tail as both x86 paths.
+    let hi2 = (x1 >> 64) as u64 & 0xF;
+    let lo = x1 as u64;
+    lo ^ ((hi2 << 4) ^ (hi2 << 3) ^ (hi2 << 1) ^ hi2)
+}
+
 /// The dispatch mode (resolved once — law #9, outside every window).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
     Portable,
+    #[cfg(target_arch = "x86_64")]
     Pclmul,
+    #[cfg(target_arch = "x86_64")]
     Vec256,
+    #[cfg(target_arch = "aarch64")]
+    Pmull,
 }
 
 #[inline]
@@ -254,10 +321,37 @@ fn resolve_mode() -> Mode {
             Mode::Portable
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        match std::env::var("HFT_SPANHASH_VEC").as_deref() {
+            Ok("0") => return Mode::Portable,
+            Ok("1") => {
+                if spanhash_pmull_class() {
+                    return Mode::Pmull;
+                }
+            }
+            _ => {}
+        }
+        if spanhash_pmull_class() {
+            Mode::Pmull
+        } else {
+            Mode::Portable
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         Mode::Portable
     }
+}
+
+/// The aarch64 PMULL class gate: the crypto extension's polynomial
+/// multiply (AES field value 2 — AESE *and* PMULL.1Q; the kernel's
+/// `pmull` hwcap rides the same ID field). Plain ARMv8 without crypto
+/// falls back to the portable bit-serial path.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn spanhash_pmull_class() -> bool {
+    std::arch::is_aarch64_feature_detected!("aes")
 }
 
 /// The AVX-512 vector class gate (mirrors `crcfold::fold512_available`'s
@@ -272,8 +366,8 @@ fn spanhash_vec_class() -> bool {
 
 /// SPANHASH-64: the golden span-value combine over the 4 packed lane-pair
 /// words + the span length. Bit-identical on every path and every host —
-/// the differential battery pins portable/PCLMUL/VPCLMUL against the
-/// derive script's published vectors.
+/// the differential battery pins portable/PCLMUL/VPCLMUL/PMULL against
+/// the derive script's published vectors.
 #[inline(always)]
 pub fn spanhash64(words: &[u64; 4], len: u32) -> u64 {
     static M: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
@@ -288,6 +382,11 @@ pub fn spanhash64(words: &[u64; 4], len: u32) -> u64 {
         Mode::Vec256 => {
             // SAFETY: resolve_mode proved the AVX-512 vector class.
             unsafe { spanhash64_vec256(words, len) }
+        }
+        #[cfg(target_arch = "aarch64")]
+        Mode::Pmull => {
+            // SAFETY: resolve_mode proved the crypto/pmull class.
+            unsafe { spanhash64_pmull(words, len) }
         }
     }
 }
@@ -368,7 +467,9 @@ mod tests {
 
     /// Path parity: the dispatched (accelerated) path must equal the
     /// portable oracle on a pseudo-random corpus (LCG — deterministic,
-    /// allocation-free).
+    /// allocation-free). Covers every compiled dispatch class: on x86_64
+    /// the VPCLMUL/PCLMUL arms, on aarch64 the PMULL arm (pinned under
+    /// QEMU aarch64 emulation AND on the Helio G99 silicon).
     #[test]
     fn t_r24_path_parity() {
         let mut s = 0x243F_6A88_85A3_08D3u64;

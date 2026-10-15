@@ -63,6 +63,7 @@
 //! tree, VPADDQ) is bit-identical — the golden-value law the rest of
 //! the engine obeys. The differential batteries pin this.
 
+#[cfg(target_arch = "x86_64")]
 use std::arch::is_x86_feature_detected;
 
 /// One order-book event (the DECODED form — ITCH bytes are decoded by

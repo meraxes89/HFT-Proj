@@ -531,6 +531,28 @@ fn prefetch_body(ptr: *const u8) {
     }
 }
 
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+fn prefetch_body(ptr: *const u8) {
+    // PRFM PLDL1KEEP (read, high locality) — the _MM_HINT_T0 twin.
+    // SAFETY: a prefetch HINT — defined for any address, never faults;
+    // nomem/nostack keep the compiler's memory model exact (the hint has
+    // no program-visible effect).
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) ptr,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) (ptr as usize + 64) as *const u8,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
 /// R8 phase-4: line-indexed prefetch — the worker's full-span spray walks
 /// bodies one cache line at a time (see PfCfg).
 #[inline(always)]
@@ -545,11 +567,29 @@ fn prefetch_line(ptr: *const u8, line: usize) {
 }
 
 #[inline(always)]
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn prefetch_line(ptr: *const u8, line: usize) {
+    // PRFM PLDL1KEEP — the A64 data-prefetch hint (read, high temporal
+    // locality, L1 target): the exact semantics of the x86 T0 spray. The
+    // full-span line spray is the LOAD-BEARING latency hider on the
+    // Cortex-A55 lanes too (the 15 MB blob is L3-resident; the spray
+    // keeps the in-order cores' demand loads off the DRAM path).
+    // SAFETY: a prefetch HINT — defined for any address, never faults.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) (ptr as usize + line * 64) as *const u8,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn prefetch_line(_ptr: *const u8, _line: usize) {}
 
 #[inline(always)]
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn prefetch_body(_ptr: *const u8) {}
 
 /// Worker batch budget: descriptors processed per outer-loop iteration
@@ -4165,7 +4205,27 @@ mod tests {
                 "zero payload fallbacks on the armed steady path (got {fallbacks})"
             );
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            // The ARM64 contract: armed exactly on crc32 silicon (the
+            // tag kernel's hardware-CRC32C class — the x86_64 twin).
+            if nf_transport::rxdesc::rxdesc_affine_enabled() {
+                assert!(armed, "the affine sidecar must be armed on aarch64 crc32 silicon");
+                assert_eq!(ledger, 0, "ledger-less shape: no transport attached");
+                assert!(
+                    hits > 0,
+                    "workers must have evaluated spans from tags (got {hits})"
+                );
+                assert_eq!(
+                    fallbacks, 0,
+                    "zero payload fallbacks on the armed steady path (got {fallbacks})"
+                );
+            } else {
+                assert!(!armed);
+                let _ = (hits, fallbacks, ledger);
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             assert!(!armed);
             let _ = (hits, fallbacks, ledger);
@@ -4231,7 +4291,27 @@ mod tests {
                 "zero payload fallbacks on the ledger path (got {fallbacks})"
             );
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            // The ARM64 contract: armed exactly on crc32 silicon — the
+            // full ledger pipeline must hold the x86_64 twin's law.
+            if nf_transport::rxdesc::rxdesc_affine_enabled() {
+                assert!(armed, "the affine sidecar must be armed on aarch64 crc32 silicon");
+                assert!(
+                    ledger >= 10_000,
+                    "the RX producer's ledger must have filled (got {ledger} rows)"
+                );
+                assert!(hits > 0, "workers must have evaluated from tags");
+                assert_eq!(
+                    fallbacks, 0,
+                    "zero payload fallbacks on the ledger path (got {fallbacks})"
+                );
+            } else {
+                assert!(!armed);
+                let _ = (hits, fallbacks, ledger);
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             assert!(!armed);
             let _ = (hits, fallbacks, ledger);

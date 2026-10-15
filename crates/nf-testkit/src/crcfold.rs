@@ -406,10 +406,13 @@ pub fn affine_span_const(span_len: usize) -> u64 {
 /// headroom. On x86_64 this is 1 PCLMULQDQ (the product) + 3 PCLMULQDQ
 /// (the plain Barrett: quotient estimate, first correction, final
 /// correction) + byte shifts — ~4-5 dependent clmuls, no memory, no
-/// allocation. PCLMULQDQ presence follows the crate's standing x86_64
-/// runner contract (Westmere 2010+; `kbench`'s probe aborts otherwise —
-/// same precedent as `fold_step_u128_r`). Non-x86_64 falls back to the
-/// portable u128 shift-multiply + the same reduction (tests pin both).
+/// allocation. On aarch64 the same shape rides the crypto extension's
+/// PMULL (`vmull_p64` — one instruction per product; runtime-gated, the
+/// software path remains the oracle). PCLMULQDQ presence follows the
+/// crate's standing x86_64 runner contract (Westmere 2010+; `kbench`'s
+/// probe aborts otherwise — same precedent as `fold_step_u128_r`).
+/// Other arches fall back to the portable u128 shift-multiply + the same
+/// reduction (tests pin all paths bit-equal).
 ///
 /// Returns the FULL reduced value in the low 32 bits; bits ≥ 32 are
 /// cleared (unlike the vend ending, there is no seed multiply here).
@@ -421,10 +424,52 @@ pub unsafe fn clmul_reduce_mod_vm(a: u64, b: u64) -> u64 {
     {
         clmul_reduce_mod_vm_pcl(a, b)
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        if arm64_pmull_hw() {
+            // SAFETY: arm64_pmull_hw() proved the crypto/pmull class.
+            clmul_reduce_mod_vm_pmull(a, b)
+        } else {
+            clmul_reduce_mod_vm_sw(a, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         clmul_reduce_mod_vm_sw(a, b)
     }
+}
+
+/// aarch64: the PMULL class gate for this module, read once per process
+/// (the same `aes` ID field law as `polyhash::spanhash_pmull_class` —
+/// AES=2 implies both AESE and PMULL.1Q).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn arm64_pmull_hw() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::arch::is_aarch64_feature_detected!("aes"))
+}
+
+/// aarch64: the K0 plain Barrett through single-instruction PMULLs —
+/// every clmul of the software path (product, quotient estimate, two
+/// corrections) is one `vmull_p64`; all operands are ≤ 64 bits (width
+/// law: x ≤ 30 bits, VMU 57, qh ≤ 31, VM 33, corr ≤ 32 — every product
+/// < 2^88), so each product's full 128-bit value rides a Q register.
+/// Bit-identical to `clmul_reduce_mod_vm_sw` (the u128 semantics of the
+/// xmm sequence — pinned by `t_affine_kernel_models` on every arch).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,aes")]
+#[inline]
+unsafe fn clmul_reduce_mod_vm_pmull(a: u64, b: u64) -> u64 {
+    use std::arch::aarch64::vmull_p64;
+    // SAFETY: the caller (clmul_reduce_mod_vm) proved the pmull class;
+    // the width law bounds every operand and product below.
+    let prod = vmull_p64(a, b); // P = a ⊗ b (< 2^62)
+    let x = (prod >> 32) as u64; // < 2^30
+    let p = vmull_p64(x, VMU); // (P>>32) ⊗ VMU (< 2^87)
+    let qh = (p >> 56) as u64; // p >> 56 (≤ 2^31)
+    let r = prod ^ vmull_p64(qh, VM);
+    let corr = (r >> 32) as u64;
+    (r ^ vmull_p64(corr, VM)) as u64 & 0xFFFF_FFFF // low 32 = P mod VM
 }
 
 /// The K0 plain Barrett at exact xmm semantics (the vend core with the
@@ -456,9 +501,9 @@ pub(crate) unsafe fn clmul_reduce_mod_vm_pcl(a: u64, b: u64) -> u64 {
     }
 }
 
-/// The portable u128 model of the same kernel (the non-x86_64 path AND
-/// the differential oracle's ground model in tests — pinned against the
-/// hardware path on x86_64 by `t_affine_kernel_models`).
+/// The portable u128 model of the same kernel (the non-accelerated path
+/// AND the differential oracle's ground model in tests — pinned against
+/// the hardware path on x86_64/aarch64 by `t_affine_kernel_models`).
 #[cfg(any(test, not(target_arch = "x86_64")))]
 #[inline(always)]
 pub(crate) fn clmul_reduce_mod_vm_sw(a: u64, b: u64) -> u64 {
@@ -3142,7 +3187,6 @@ mod tests {
         assert_eq!(crc ^ 0xFFFF_FFFF, 0xE306_9283);
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn t_golden_vectors() {
         for (data, want) in GOLDEN {
@@ -4173,6 +4217,7 @@ mod tests {
 
         // ── 3. the 8-lane bridge: span_crc32c_8lane in O(1) for aligned spans ──
         // (R24: the expected combine is the production SPANHASH-64 law)
+        #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
         fn fnv_lanes(lanes: &[u32; 8], ln: usize) -> u64 {
             span_lane_combine(lanes, ln)
         }
@@ -4210,6 +4255,7 @@ mod tests {
                 }
             }
             assert_eq!(pred, direct, "bridge per-lane projection i={i}");
+            #[cfg(target_arch = "x86_64")]
             let v = fnv_lanes(&pred, lb);
             // the software 8-lane model == the production kernel on x86_64
             #[cfg(target_arch = "x86_64")]
@@ -4675,13 +4721,13 @@ mod tests {
     #[test]
     fn t_spec_slice_vec_differential() {
         // Install the vector builder (idempotent; may already be in).
-        let installed = install_spec_slice_vec();
+        let _installed = install_spec_slice_vec();
         #[cfg(target_arch = "x86_64")]
         {
             let hw_ok = std::arch::is_x86_feature_detected!("avx512f")
                 && std::arch::is_x86_feature_detected!("avx512bw");
             assert_eq!(
-                installed, hw_ok,
+                _installed, hw_ok,
                 "install_spec_slice_vec() must succeed exactly on AVX-512F/BW silicon"
             );
         }
@@ -4691,8 +4737,9 @@ mod tests {
             return;
         }
         // 1. The E/O tables vs the software model (basis windows).
-        let mut e_tab = [0u16; 32];
-        let mut o_tab = [0u16; 32];
+        // (The direct AVX-512 builder probe is x86_64-only; on every
+        // other arch the early return above already exited and section 2
+        // never runs — the rng is shared by both sections.)
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = || {
             rng ^= rng << 13;
@@ -4700,22 +4747,27 @@ mod tests {
             rng ^= rng << 17;
             rng
         };
-        for wlen in [2usize, 3, 17, 33, 63, 64] {
-            let mut win = [0u8; 66];
-            for b in win.iter_mut().take(wlen) {
-                *b = next() as u8;
-            }
-            // SAFETY: gated by install-time feature detection.
-            unsafe { spec_slice_vec_tables_avx512(&win[..wlen], &mut e_tab, &mut o_tab) };
-            for j in 0..32usize {
-                // The tables come from the ZERO-PADDED window: a lane's
-                // value mixes a real byte with a zero pad byte when the
-                // pair straddles the real end — exactly what the builder
-                // computes (padding is never read as a length by the walk).
-                let want_e = ((win[2 * j] as u16) << 8) | win[2 * j + 1] as u16;
-                let want_o = ((win[2 * j + 1] as u16) << 8) | win[2 * j + 2] as u16;
-                assert_eq!(e_tab[j], want_e, "E[{j}] wlen={wlen}");
-                assert_eq!(o_tab[j], want_o, "O[{j}] wlen={wlen}");
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut e_tab = [0u16; 32];
+            let mut o_tab = [0u16; 32];
+            for wlen in [2usize, 3, 17, 33, 63, 64] {
+                let mut win = [0u8; 66];
+                for b in win.iter_mut().take(wlen) {
+                    *b = next() as u8;
+                }
+                // SAFETY: gated by install-time feature detection.
+                unsafe { spec_slice_vec_tables_avx512(&win[..wlen], &mut e_tab, &mut o_tab) };
+                for j in 0..32usize {
+                    // The tables come from the ZERO-PADDED window: a lane's
+                    // value mixes a real byte with a zero pad byte when the
+                    // pair straddles the real end — exactly what the builder
+                    // computes (padding is never read as a length by the walk).
+                    let want_e = ((win[2 * j] as u16) << 8) | win[2 * j + 1] as u16;
+                    let want_o = ((win[2 * j + 1] as u16) << 8) | win[2 * j + 2] as u16;
+                    assert_eq!(e_tab[j], want_e, "E[{j}] wlen={wlen}");
+                    assert_eq!(o_tab[j], want_o, "O[{j}] wlen={wlen}");
+                }
             }
         }
         // 2. The vector-path COMPOSITION (builder + register-table walk,

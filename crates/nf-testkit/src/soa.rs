@@ -103,6 +103,7 @@ pub fn ladder8_scalar(firsts: &[u64], ns: &[u64], w: u64) -> bool {
 /// elements (the caller only invokes this for groups entirely below the
 /// publication length). The target feature is verified by
 /// [`ladder8_best`] before this is ever installed.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn ladder8_avx512(firsts: *const u64, ns: *const u64, w: u64) -> bool {
     use std::arch::x86_64::*;
@@ -148,6 +149,7 @@ unsafe fn ladder8_avx512(firsts: *const u64, ns: *const u64, w: u64) -> bool {
 /// The safe callable form installed into `SoaLadder8` (raw pointers keep
 /// the per-group call lean; the 8-element contract is the caller's —
 /// see `steady_scan_soa`).
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn ladder8_avx512_safe(firsts: *const u64, ns: *const u64, w: u64) -> bool {
     // SAFETY: the feature contract is verified by `ladder8_best` before
@@ -155,6 +157,100 @@ fn ladder8_avx512_safe(firsts: *const u64, ns: *const u64, w: u64) -> bool {
     // `SoaLadder8` and enforced by the only caller (groups entirely below
     // the publication length).
     unsafe { ladder8_avx512(firsts, ns, w) }
+}
+
+// ── aarch64: the 128-bit NEON ladder ──────────────────────────────────
+
+/// The NEON group check — the aarch64 twin of `ladder8_avx512`.
+/// Self-contained (anchor + wrap guard + the three vector relations):
+/// four `vld1q_u64` pairs, `vextq` pair-swaps, one `vaddq_u64` per chain
+/// step, `vceqq_u64`/`vcgeq_u64` (unsigned) compares, ONE `vandq_u64`
+/// tree — the verdict lands in lane 0 (masked: the odd-lane relations
+/// the AVX-512 version bit-selects out via `chain & 0x15` /
+/// `dup_le & 0xAA` live in the NEON lanes' high half). The anchor and
+/// wrap guard stay scalar (GPR compare + four lane-0 extracts). Bit-
+/// identical verdicts to the scalar ladder (the aarch64 differential
+/// below pins canonical groups, every corruption pattern, and a PRNG
+/// corpus).
+/// SAFETY CONTRACT: `firsts` and `ns` each hold at least 8 readable
+/// u64 elements; asimd is baseline hardware on every aarch64.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn ladder8_neon(firsts: *const u64, ns: *const u64, w: u64) -> bool {
+    use std::arch::aarch64::*;
+    let f0 = vld1q_u64(firsts);
+    let f1 = vld1q_u64(firsts.add(2));
+    let f2 = vld1q_u64(firsts.add(4));
+    let f3 = vld1q_u64(firsts.add(6));
+    let n0 = vld1q_u64(ns);
+    let n1 = vld1q_u64(ns.add(2));
+    let n2 = vld1q_u64(ns.add(4));
+    let n3 = vld1q_u64(ns.add(6));
+    // Anchor: lane 0 of f0 must equal the scan's watermark.
+    let f0v = vgetq_lane_u64(f0, 0);
+    if f0v != w {
+        return false;
+    }
+    // Wrap guard: Σ ns[even] must not overflow past u64::MAX from lane 0
+    // (keeps the dup-proof's unsigned algebra exact; see the module doc).
+    let sum_even = vgetq_lane_u64(n0, 0)
+        .wrapping_add(vgetq_lane_u64(n1, 0))
+        .wrapping_add(vgetq_lane_u64(n2, 0))
+        .wrapping_add(vgetq_lane_u64(n3, 0));
+    if sum_even != 0 && f0v > u64::MAX - sum_even {
+        return false;
+    }
+    // Pair swap [1,0]: `vextq_u64(v, v, 1)` swaps the two 64-bit lanes,
+    // so lane k of the swap holds v[k^1] — cmeq(v, swap) lane k ⟺
+    // v[k] == v[k^1] (both lanes carry the SAME relation).
+    let pe = vandq_u64(
+        vandq_u64(
+            vceqq_u64(f0, vextq_u64(f0, f0, 1)),
+            vceqq_u64(f1, vextq_u64(f1, f1, 1)),
+        ),
+        vandq_u64(
+            vceqq_u64(f2, vextq_u64(f2, f2, 1)),
+            vceqq_u64(f3, vextq_u64(f3, f3, 1)),
+        ),
+    );
+    // Pure-dup proof: n[odd] ≤ n[even] ⟺ (n ≥ pair-swap(n)) on LANE 0
+    // of each register (cmhs — unsigned higher-or-same).
+    let dl = vandq_u64(
+        vandq_u64(
+            vcgeq_u64(n0, vextq_u64(n0, n0, 1)),
+            vcgeq_u64(n1, vextq_u64(n1, n1, 1)),
+        ),
+        vandq_u64(
+            vcgeq_u64(n2, vextq_u64(n2, n2, 1)),
+            vcgeq_u64(n3, vextq_u64(n3, n3, 1)),
+        ),
+    );
+    // Chain: f[k+1] == f[k] + n[k] — LANE 0 of each adjacent-register
+    // compare is the even-pair relation (f[2k+2] == f[2k] + n[2k]); the
+    // odd-lane results carry the masked-out odd relations.
+    let ch = vandq_u64(
+        vceqq_u64(f1, vaddq_u64(f0, n0)),
+        vandq_u64(
+            vceqq_u64(f2, vaddq_u64(f1, n1)),
+            vceqq_u64(f3, vaddq_u64(f2, n2)),
+        ),
+    );
+    // Verdict: LANE 0 only (pe's lane 1 duplicates lane 0; dl/ch lane 1
+    // carry the masked-out odd relations) — mask and test the low lane.
+    let lane0 = vcombine_u64(vcreate_u64(u64::MAX), vcreate_u64(0));
+    let all = vandq_u64(vandq_u64(vandq_u64(pe, dl), ch), lane0);
+    vgetq_lane_u64(all, 0) == u64::MAX
+}
+
+/// The safe callable NEON form installed into `SoaLadder8` (asimd is
+/// baseline aarch64 hardware — no runtime feature gate).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn ladder8_neon_safe(firsts: *const u64, ns: *const u64, w: u64) -> bool {
+    // SAFETY: NEON is baseline aarch64 hardware; the 8-element bounds
+    // contract is documented on `SoaLadder8` and enforced by the only
+    // caller (groups entirely below the publication length).
+    unsafe { ladder8_neon(firsts, ns, w) }
 }
 
 /// The best available ladder for THIS silicon, or None (scalar ladder).
@@ -180,7 +276,16 @@ pub fn ladder8_best() -> Option<SoaLadder8> {
         if std::arch::is_x86_feature_detected!("avx512f") {
             return Some(ladder8_avx512_safe);
         }
+        // No AVX-512: the scalar ladder wins (the Zen3-class fallback).
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // asimd is baseline hardware on every aarch64 — the NEON ladder
+        // is always installable when the knob is armed.
+        return Some(ladder8_neon_safe);
+    }
+    // Other arches (and non-AVX-512 x86_64): the scalar ladder.
+    #[allow(unreachable_code)]
     None
 }
 
@@ -341,5 +446,139 @@ mod tests {
             assert!(!ladder8_avx512_safe(f3.as_ptr(), n3.as_ptr(), base));
             eprintln!("soa: avx512 cross-check cases={cases}");
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod a64_tests {
+    use super::*;
+
+    /// Builds an ALTERNATING accept-group: `start` anchors the
+    /// watermark, the even-lens drive the chain (first_{k+1} =
+    /// first_k + len_k), each odd entry is a PURE duplicate with
+    /// n_odd = n_even / dup_scale ≤ n_even.
+    fn group_pure(start: u64, even_lens: &[u64], dup_scale: u64) -> (Vec<u64>, Vec<u64>) {
+        let mut firsts = Vec::new();
+        let mut ns = Vec::new();
+        let mut cur = start;
+        for &len in even_lens {
+            firsts.push(cur);
+            ns.push(len);
+            firsts.push(cur);
+            ns.push(len / dup_scale.max(1)); // pure dup: n_odd ≤ n_even
+            cur = cur.wrapping_add(len);
+        }
+        (firsts, ns)
+    }
+
+    /// aarch64 NEON ladder differential: `ladder8_neon_safe` must agree
+    /// with `ladder8_scalar` on canonical accept-shapes, every corruption
+    /// pattern, wrap corners, and a PRNG corpus that actually generates
+    /// ACCEPTING groups (pair-eq + dup-le + chain satisfied) — the
+    /// weak-corpus trap the random-only sweep avoids.
+    #[test]
+    fn t_ladder_neon_matches_scalar() {
+        // 1. Canonical accept-shapes (dup_scale 1..4 — pure dups; the
+        // chain follows the EVEN-lane lens, so every scale accepts).
+        for ds in 1..=4u64 {
+            let (f, n) = group_pure(100, &[10 * ds, 20 * ds, 30 * ds, 40 * ds], ds);
+            let w = f[0];
+            assert!(ladder8_scalar(&f, &n, w), "scalar must accept (ds={ds})");
+            assert!(
+                ladder8_neon_safe(f.as_ptr(), n.as_ptr(), w),
+                "neon must accept the canonical group (ds={ds})"
+            );
+        }
+        // 2. Systematic single-field corruptions of the canonical group:
+        // every (array, index, delta) — both kernels must agree.
+        let (bf, bn) = group_pure(100, &[10, 20, 30, 40], 1);
+        let w = bf[0];
+        for arr in 0..2 {
+            for i in 0..8usize {
+                for delta in [1u64, 7, 0xdead_beef] {
+                    let mut f = bf.clone();
+                    let mut n = bn.clone();
+                    if arr == 0 {
+                        f[i] = f[i].wrapping_add(delta);
+                    } else {
+                        n[i] = n[i].wrapping_add(delta);
+                    }
+                    // anchor corruptions need the w to track f[0]
+                    let wv = if i == 0 && arr == 0 { f[0] } else { w };
+                    let s = ladder8_scalar(&f, &n, wv);
+                    let v = ladder8_neon_safe(f.as_ptr(), n.as_ptr(), wv);
+                    assert_eq!(
+                        s, v,
+                        "corruption disagreement: arr={arr} i={i} d={delta:#x} f={f:?} n={n:?}"
+                    );
+                }
+            }
+        }
+        // 3. Partial-dup boundary: n_odd < n_even accepts, n_odd >
+        // n_even rejects — both kernels must agree at the exact edge.
+        let (f, mut n) = group_pure(100, &[10, 20, 30, 40], 1);
+        n[1] = 9;
+        assert_eq!(ladder8_scalar(&f, &n, 100), ladder8_neon_safe(f.as_ptr(), n.as_ptr(), 100));
+        n[1] = 11; // partial overlap — must REJECT identically
+        assert!(!ladder8_scalar(&f, &n, 100));
+        assert!(!ladder8_neon_safe(f.as_ptr(), n.as_ptr(), 100));
+        // 4. Wrap corner: the final advance crossing u64::MAX rejects.
+        let base = u64::MAX - 100;
+        let mut f3 = vec![0u64; 8];
+        let mut n3 = vec![0u64; 8];
+        for k in 0..4 {
+            f3[2 * k] = base + [0u64, 10, 30, 60][k];
+            f3[2 * k + 1] = f3[2 * k];
+            n3[2 * k] = [10u64, 20, 30, 50][k];
+            n3[2 * k + 1] = n3[2 * k];
+        }
+        assert_eq!(
+            ladder8_scalar(&f3, &n3, base),
+            ladder8_neon_safe(f3.as_ptr(), n3.as_ptr(), base)
+        );
+        assert!(!ladder8_neon_safe(f3.as_ptr(), n3.as_ptr(), base));
+        // 5. PRNG corpus with ACCEPTING group generation: build valid
+        // chains from a random start, then randomize w ± — agreement.
+        let mut x: u64 = 0x243F_6A88_85A3_08D3;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut accepts = 0usize;
+        for _ in 0..20_000 {
+            let mut f = vec![0u64; 8];
+            let mut n = vec![0u64; 8];
+            let start = 1 + next() % (1 << 40);
+            let mut cur = start;
+            for k in 0..4 {
+                let len = 1 + next() % 1000;
+                f[2 * k] = cur;
+                f[2 * k + 1] = cur;
+                n[2 * k] = len;
+                n[2 * k + 1] = if next() & 1 == 0 { len } else { len - 1 };
+                cur = cur.wrapping_add(len);
+            }
+            // Randomize: mostly the anchored w, sometimes off-by-one or
+            // a random field corruption — both kernels must agree.
+            let w = match next() % 10 {
+                0 => start.wrapping_add(1),
+                1 => start.wrapping_sub(1),
+                _ => start,
+            };
+            if next() % 4 == 0 {
+                f[(next() % 8) as usize] = f[(next() % 8) as usize].wrapping_add(1);
+            }
+            if next() % 8 == 0 {
+                n[(next() % 8) as usize] = n[(next() % 8) as usize].wrapping_add(1);
+            }
+            let s = ladder8_scalar(&f, &n, w);
+            let v = ladder8_neon_safe(f.as_ptr(), n.as_ptr(), w);
+            assert_eq!(s, v, "prng disagreement: f={f:?} n={n:?} w={w}");
+            accepts += s as usize;
+        }
+        eprintln!("soa: neon ladder cross-check accepts={accepts}/20000");
+        assert!(accepts > 1000, "corpus too weak: {accepts} accepting groups");
     }
 }

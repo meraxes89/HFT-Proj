@@ -107,6 +107,224 @@ fn read_sibling_group(cpu: usize) -> Option<Vec<usize>> {
     }
 }
 
+// ── big.LITTLE: the asymmetric-cluster topology (R8/ARM64 track) ─────────
+//
+// DynamIQ / big.LITTLE SoCs (the Helio G99 class: 6× Cortex-A55 @ 2.0 GHz
+// + 2× Cortex-A76 @ 2.2 GHz, no SMT) expose two performance classes in
+// ONE allowed-cpu set. The SMT-era placement laws above misfire there:
+// `physical_core_count()` = 8 makes the fabric size 3 workers, the
+// siblings strategy pins them to cpus 2-3 — mid-LITTLE — while BOTH
+// A76 big cores sit idle. This block makes the performance class a
+// first-class placement fact:
+//
+//   * the detection is ARCH-NEUTRAL (sysfs `cpuinfo_max_freq` tiers,
+//     falling back to `/proc/cpuinfo` CPU-part microarchitecture
+//     clusters — PRoot exposes the former only sometimes, the latter
+//     always; Intel P/E hybrid hosts route the same way);
+//   * `fabric_placement`'s default arm routes the HIGH-THROUGHPUT
+//     workers to the big cluster (A76: 4-wide OoO, dual 128-bit NEON
+//     pipes, PMULL/CRC32C crypto unit — the fold workers' silicon) and
+//     the background/ingest threads (main sequencer mailbox, RX
+//     producer) to the little cluster (A55: 2-wide in-order — the RX
+//     poll's cost profile), per the directive's asymmetric law;
+//   * `pipeline_placement` puts the throughput thread (main) on a big
+//     core and the ingest producer (rx) on a little core when the pair
+//     still satisfies the same-L3 mailbox law;
+//   * homogeneous hosts (every CI runner, every server part) detect NO
+//     clusters and keep the standing SMT/physical-core behavior
+//     verbatim — zero behavioral delta where the topology is uniform.
+
+/// The heterogeneous (big.LITTLE) topology of the ALLOWED cpu set,
+/// captured once per process (setup-time sysfs/procfs reads — never
+/// inside a measurement window). `Some((big, little))` partitions the
+/// allowed cpus into the performance cluster (highest max-frequency
+/// tier — on the G99: cores 6-7, the Cortex-A76s) and the efficiency
+/// cluster (the rest — cores 0-5, the Cortex-A55s); `None` on
+/// homogeneous or unreadable topologies (the legacy placement laws).
+pub fn cluster_topology() -> Option<(Vec<usize>, Vec<usize>)> {
+    static T: std::sync::OnceLock<Option<(Vec<usize>, Vec<usize>)>> = std::sync::OnceLock::new();
+    T.get_or_init(cluster_topology_live).clone()
+}
+
+/// The live cluster probe (the OnceLock body — also the unit-test oracle
+/// seam): frequency tiers first, microarchitecture clusters as the
+/// PRoot-safe fallback.
+fn cluster_topology_live() -> Option<(Vec<usize>, Vec<usize>)> {
+    let order = cpu_order();
+    if order.len() < 2 {
+        return None;
+    }
+    // Signal 1: per-cpu max frequency (sysfs cpufreq, kHz). Any cpu
+    // lacking it falls the WHOLE probe to signal 2 (mixed evidence is
+    // worse than the uniform fallback).
+    let mut freqs: Option<Vec<(usize, u64)>> = Some(Vec::new());
+    for &cpu in &order {
+        match read_cpu_max_freq(cpu) {
+            Some(f) => freqs.as_mut()?.push((cpu, f)),
+            None => {
+                freqs = None;
+                break;
+            }
+        }
+    }
+    if let Some(freqs) = freqs {
+        if let Some(part) = split_by_freq(&freqs) {
+            return Some(part);
+        }
+    }
+    // Signal 2: /proc/cpuinfo CPU-part microarchitecture clusters
+    // (readable everywhere, PRoot included). Two distinct parts = a
+    // heterogeneous SoC; the PERFORMANCE cluster is the one with the
+    // FEWER cpus (big.LITTLE sizing: 1-3 big + 4-6 little — the G99's
+    // 2×A76 + 6×A55), ties broken by the higher part id (newer
+    // microarchitecture wins).
+    let mut parts: Vec<(usize, u32)> = Vec::new();
+    for &cpu in &order {
+        parts.push((cpu, read_cpu_part(cpu)?));
+    }
+    split_by_part(&parts)
+}
+
+/// The max frequency (kHz) of `cpu` from sysfs cpufreq (the
+/// `cpuinfo_max_freq` hardware limit; `scaling_max_freq` as fallback).
+fn read_cpu_max_freq(cpu: usize) -> Option<u64> {
+    let a = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+    let b = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_max_freq");
+    let text = std::fs::read_to_string(a)
+        .or_else(|_| std::fs::read_to_string(b))
+        .ok()?;
+    text.trim().parse::<u64>().ok()
+}
+
+/// The `CPU part` (microarchitecture id) of `cpu` from /proc/cpuinfo —
+/// Cortex-A55 = 0xd05, Cortex-A76 = 0xd0e (ARM implementer 0x41).
+fn read_cpu_part(cpu: usize) -> Option<u32> {
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut current: Option<usize> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("processor") {
+            if rest.trim_start().starts_with(':') {
+                current = rest[1..].trim().parse::<usize>().ok();
+            }
+        } else if line.starts_with("CPU part") {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim() == "CPU part" && current == Some(cpu) {
+                    return u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Split by max-frequency tiers: Some only when the top tier is ≥ 5%
+/// above the bottom tier (thermal-headroom jitter is 1-2% and is NOT a
+/// cluster; real big.LITTLE pairs are ≥ 10% apart — the Helio G99's
+/// 2.0→2.2 GHz A55→A76 step is exactly 10%).
+fn split_by_freq(freqs: &[(usize, u64)]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let max_f = freqs.iter().map(|(_, f)| *f).max()?;
+    let min_f = freqs.iter().map(|(_, f)| *f).min()?;
+    if max_f <= min_f + min_f / 20 {
+        return None; // uniform (±5%) — homogeneous host
+    }
+    let big: Vec<usize> = freqs.iter().filter(|(_, f)| *f == max_f).map(|&(c, _)| c).collect();
+    let little: Vec<usize> = freqs
+        .iter()
+        .filter(|(_, f)| *f != max_f)
+        .map(|&(c, _)| c)
+        .collect();
+    if big.is_empty() || little.is_empty() {
+        None
+    } else {
+        Some((big, little))
+    }
+}
+
+/// Split by microarchitecture part: the performance cluster is the
+/// smaller (size ties: the HIGHER part id — the newer core wins).
+fn split_by_part(parts: &[(usize, u32)]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let mut distinct: Vec<u32> = parts.iter().map(|(_, p)| *p).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() < 2 {
+        return None; // one microarchitecture — homogeneous
+    }
+    // Score each part cluster: fewer members first (big.LITTLE sizing:
+    // 1-3 big + 4-6 little), size ties broken by the HIGHER part id
+    // (the newer microarchitecture is the performance cluster).
+    let mut scored: Vec<(usize, std::cmp::Reverse<u32>)> = distinct
+        .iter()
+        .map(|&p| {
+            let members: Vec<usize> = parts
+                .iter()
+                .filter(|(_, q)| *q == p)
+                .map(|&(c, _)| c)
+                .collect();
+            (members.len(), std::cmp::Reverse(p))
+        })
+        .collect();
+    scored.sort_unstable();
+    let big_part = scored.first().map(|(_, std::cmp::Reverse(p))| *p)?;
+    let big: Vec<usize> = parts
+        .iter()
+        .filter(|(_, p)| *p == big_part)
+        .map(|&(c, _)| c)
+        .collect();
+    let little: Vec<usize> = parts
+        .iter()
+        .filter(|(_, p)| *p != big_part)
+        .map(|&(c, _)| c)
+        .collect();
+    if big.is_empty() || little.is_empty() {
+        None
+    } else {
+        Some((big, little))
+    }
+}
+
+/// The PERFORMANCE-cluster core count (the worker-sizing cap on
+/// heterogeneous SoCs — the fold workers' silicon: 2 on the Helio G99).
+/// Homogeneous hosts: the full physical-core count (the standing law).
+pub fn perf_core_count() -> usize {
+    if let Some((big, _)) = cluster_topology() {
+        return big.len();
+    }
+    physical_core_count()
+}
+
+/// The big.LITTLE fabric placement (the default arm's heterogeneous
+/// route): HIGH-THROUGHPUT workers on the performance cluster
+/// round-robin (A76 6,7 — the fold workers' PMULL/CRC32C silicon),
+/// overflow wrapping onto the efficiency cluster; the main sequencer
+/// and the RX ingest producer on DISTINCT efficiency cores (A55 0,1 —
+/// the directive's background/ingest law). Placement only — behavior,
+/// never correctness.
+fn fabric_placement_biglittle(
+    workers: usize,
+    big: &[usize],
+    little: &[usize],
+) -> (Option<usize>, Option<usize>, Vec<usize>) {
+    // Workers: big-first round-robin; the overflow (workers > big.len())
+    // wraps onto the little cluster (a slower fold lane, contained by
+    // the main-core work-assist law).
+    let mut wcpus: Vec<usize> = Vec::with_capacity(workers);
+    for i in 0..workers {
+        if i < big.len() {
+            wcpus.push(big[i]);
+        } else {
+            wcpus.push(little[(i - big.len()) % little.len()]);
+        }
+    }
+    // Main + rx: distinct little cores (the scalar/ingest side).
+    let main = little.first().copied();
+    let rx = little.get(1).copied().or_else(|| {
+        // Degenerate single-little topology: rx takes a big core not
+        // already claimed by a worker, else unpinned.
+        big.iter().copied().find(|c| !wcpus.contains(c))
+    });
+    (main, rx, wcpus)
+}
+
 /// Pin the CALLING thread to `cpu`. Returns success (failure leaves the
 /// thread unpinned — see the module doc).
 pub fn pin_current_to(cpu: usize) -> bool {
@@ -262,7 +480,39 @@ fn read_l3_shared(cpu: usize) -> Option<Vec<usize>> {
 /// but not a physical core when possible (the mailbox handoff is
 /// latency-sensitive; SMT-sharing it with the busy main would timeslice
 /// execution). Returns (main_cpu, rx_cpu).
+///
+/// ARM64 track: on heterogeneous (big.LITTLE) topologies the throughput
+/// thread (main) takes a PERFORMANCE core and the ingest producer (rx)
+/// an EFFICIENCY core — when the pair still satisfies the same-L3
+/// mailbox law (DynamIQ hosts: one shared cluster cache, always true;
+/// split-L3 SoCs keep the standing placement below).
 pub fn pipeline_placement() -> (Option<usize>, Option<usize>) {
+    if let Some((big, little)) = cluster_topology() {
+        let main = big.first().copied();
+        let rx = little.first().copied();
+        if let (Some(m), Some(r)) = (main, rx) {
+            // The mailbox law still wins: only take the asymmetric pair
+            // when the clusters share the L3 domain (identical index-3
+            // lists); split-L3 hosts fall through to the L3-group logic.
+            let same_l3 = match (read_l3_shared(m), read_l3_shared(r)) {
+                (Some(a), Some(b)) => {
+                    let key = |mut v: Vec<usize>| {
+                        v.sort_unstable();
+                        v.dedup();
+                        v
+                    };
+                    key(a) == key(b)
+                }
+                // No sysfs truth: DynamIQ single-domain is the common
+                // case for big.LITTLE — trust the clusters (the
+                // verification line stays honest about what it can see).
+                _ => true,
+            };
+            if same_l3 {
+                return (main, rx);
+            }
+        }
+    }
     let groups = l3_groups();
     // Prefer the L3 group with the most DISTINCT physical cores.
     let mut best: Option<&Vec<usize>> = None;
@@ -533,6 +783,14 @@ pub fn fabric_placement(workers: usize) -> (Option<usize>, Option<usize>, Vec<us
             // siblings — main on cpu1, RX on cpu3, each scalar sharing a
             // physical core with exactly one worker.
             //
+            // ARM64 track: heterogeneous (big.LITTLE / hybrid) hosts take
+            // the asymmetric-cluster route FIRST — the high-throughput
+            // workers on the performance cluster, the scalar/ingest
+            // threads on the efficiency cluster (the directive's law;
+            // homogeneous hosts keep the standing SMT behavior below).
+            if let Some((big, little)) = cluster_topology() {
+                return fabric_placement_biglittle(workers, &big, &little);
+            }
             // R25b POSTMORTEM (the fleet refuted the stack — run 38702884119,
             // 29 target-silicon shards, paired same-shard deltas): the
             // scalars_stacked experiment (main+rx BOTH on cpu1, worker 1's
@@ -785,4 +1043,107 @@ pub fn polite_spin_deep(iters: &mut u32) {
         std::thread::yield_now();
     }
     *iters += 1;
+}
+
+#[cfg(test)]
+mod biglittle_tests {
+    use super::*;
+
+    /// The G99 shape: workers land exactly on the A76 pair (6,7) and the
+    /// scalar/ingest pair on DISTINCT A55 cores — the directive's law.
+    #[test]
+    fn t_biglittle_g99_shape() {
+        let big = vec![6usize, 7];
+        let little = vec![0usize, 1, 2, 3, 4, 5];
+        let (main, rx, workers) = fabric_placement_biglittle(2, &big, &little);
+        assert_eq!(workers, vec![6, 7], "workers must own the big cluster");
+        assert_eq!(main, Some(0), "main on a little core");
+        assert_eq!(rx, Some(1), "rx on a distinct little core");
+        assert_ne!(main, rx);
+        // No worker shares a cpu with main or rx.
+        for w in &workers {
+            assert_ne!(Some(*w), main);
+            assert_ne!(Some(*w), rx);
+        }
+    }
+
+    /// Worker overflow wraps onto the little cluster (never duplicating a
+    /// big core); the degenerate single-little shape routes rx to a spare
+    /// big core or None.
+    #[test]
+    fn t_biglittle_overflow_and_degenerate() {
+        let big = vec![6usize, 7];
+        let little = vec![0usize, 1, 2, 3, 4, 5];
+        let (main, rx, workers) = fabric_placement_biglittle(4, &big, &little);
+        assert_eq!(workers, vec![6, 7, 0, 1]);
+        assert_eq!(main, Some(0)); // main/rx law unchanged by overflow
+        assert_eq!(rx, Some(1));
+        // Degenerate: 1 big, 1 little.
+        let (m, r, w) = fabric_placement_biglittle(1, &[6usize], &[0usize]);
+        assert_eq!(w, vec![6]);
+        assert_eq!(m, Some(0));
+        assert_eq!(r, None, "single-little: rx unpinned (no spare big)");
+        // Degenerate: 2 big, 1 little — rx takes the spare big.
+        let (m, r, w) = fabric_placement_biglittle(1, &[6usize, 7], &[0usize]);
+        assert_eq!(w, vec![6]);
+        assert_eq!(m, Some(0));
+        assert_eq!(r, Some(7));
+    }
+
+    /// Frequency-tier split: 2.2 GHz vs 2.0 GHz splits; uniform (±10%)
+    /// does NOT (thermal jitter is not a cluster).
+    #[test]
+    fn t_biglittle_freq_split() {
+        let g99: Vec<(usize, u64)> = (0..8)
+            .map(|c| (c, if c >= 6 { 2_200_000 } else { 2_000_000 }))
+            .collect();
+        assert_eq!(
+            split_by_freq(&g99),
+            Some((vec![6, 7], vec![0, 1, 2, 3, 4, 5]))
+        );
+        let uniform: Vec<(usize, u64)> = (0..8).map(|c| (c, 2_000_000 + (c as u64) * 1000)).collect();
+        assert_eq!(split_by_freq(&uniform), None);
+    }
+
+    /// Microarchitecture-part split (the PRoot fallback): 6×A55 (0xd05)
+    /// + 2×A76 (0xd0e) — the smaller cluster is the performance cluster.
+    #[test]
+    fn t_biglittle_part_split() {
+        let g99: Vec<(usize, u32)> = (0..8)
+            .map(|c| (c, if c >= 6 { 0xd0e } else { 0xd05 }))
+            .collect();
+        assert_eq!(
+            split_by_part(&g99),
+            Some((vec![6, 7], vec![0, 1, 2, 3, 4, 5]))
+        );
+        let uniform: Vec<(usize, u32)> = (0..8).map(|c| (c, 0xd05u32)).collect();
+        assert_eq!(split_by_part(&uniform), None);
+        // Tie (4+4): the higher part id wins as the performance cluster.
+        let tied: Vec<(usize, u32)> = (0..8)
+            .map(|c| (c, if c >= 4 { 0xd0e } else { 0xd05 }))
+            .collect();
+        assert_eq!(
+            split_by_part(&tied),
+            Some((vec![4, 5, 6, 7], vec![0, 1, 2, 3]))
+        );
+    }
+
+    /// The homogeneous-host contract: cluster detection must not fire on
+    /// this test host (uniform freq/part evidence — the legacy placement
+    /// laws own it), and perf_core_count degrades to the physical count.
+    #[test]
+    fn t_biglittle_homogeneous_host_unaffected() {
+        // Whatever this host is, the detection returns a coherent answer:
+        // Some => a genuine heterogeneous topology (perf < phys), or None
+        // => homogeneous (perf == phys, the standing law).
+        match cluster_topology() {
+            Some((big, little)) => {
+                assert!(!big.is_empty() && !little.is_empty());
+                assert!(perf_core_count() == big.len());
+            }
+            None => {
+                assert_eq!(perf_core_count(), physical_core_count());
+            }
+        }
+    }
 }
