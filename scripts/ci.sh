@@ -519,7 +519,8 @@ grep -q "allocs=0" /tmp/bench_pk_off.txt
 grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_pk_off.txt
 grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_pk_off.txt | head -1
 
-# ── 11s. R29: the ZERO-THREAD INGEST rollback (attribution) ─────────────
+echo "=== 11ss. R29: the ZERO-THREAD INGEST rollback (HFT_SELF_SERVE=0 attribution) ==="
+# ── 11ss. R29: the ZERO-THREAD INGEST rollback (attribution) ────────────
 # The self-serve pre-publish arms when the toroidal epoch reaches the
 # deep-steady threshold (two clean windows at the same count — the R27c
 # hole-free law): the window's open publishes the WHOLE span range
@@ -540,6 +541,7 @@ grep -q "selfserve=0 " /tmp/bench_ss_off.txt
 grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_ss_off.txt
 grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_ss_off.txt | head -1
 
+echo "=== 11rx. R31 candidate: the RX PASS-SUPPLY stack (HFT_PREPATCH_BUDGET=1024 attribution) ==="
 # ── 11rx. R31 candidate: the RX PASS-SUPPLY stack (attribution) ─────────
 # The R29 draw's own telemetry: the self-serve arm doubled the pass
 # cadence (passes 41.8K vs 16.5K) and the wall MOVED — reset_ms 1502 ms
@@ -562,6 +564,7 @@ grep "DIAG rx sustained" /tmp/bench_rxsup.txt | tail -1
 grep "ADVANCE_DIAGNOSTIC sustained" /tmp/bench_rxsup.txt | tail -1
 grep "R16B_RXDESC_VERDICT" /tmp/bench_rxsup.txt | tail -1
 
+echo "=== 11vl. R31 candidate: the RX-supply stack + the VECTOR LADDER (HFT_VEC_LADDER=1 attribution) ==="
 # ── 11vl. R31 candidate: the RX-supply stack + the VECTOR LADDER ────────
 # The R12 verdict priced the 8-entry SoA consumer group at -2..-3.6%
 # (decode-bound: the group body bloated the scan loop past the uop
