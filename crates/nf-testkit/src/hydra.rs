@@ -2573,6 +2573,10 @@ pub struct HydraSpanSink<'a> {
     /// documented rollback — the rotate-and-copy window open, the exact
     /// pre-R27 shape). Per-run constant, read at construction.
     rx_toroidal: bool,
+    /// R28: the fused packed ladder-commit is ON (HFT_PACKED_EMISSION=0
+    /// is the documented rollback — the SpanRec emission, the exact
+    /// pre-R28 shape). Per-run constant, read at construction.
+    packed_emission: bool,
     /// R27: the steady-epoch confidence — consecutive windows on the
     /// current array slot that verified fix-free at the SAME span count
     /// (the deterministic-schedule law: the array + sidecar content is
@@ -2693,6 +2697,7 @@ impl<'a> HydraSpanSink<'a> {
             pass_start_span: u64::MAX,
             batch_submit: std::env::var("HFT_BATCH_SUBMIT").as_deref() != Ok("0"),
             rx_toroidal: std::env::var("HFT_TOROIDAL").as_deref() != Ok("0"),
+            packed_emission: std::env::var("HFT_PACKED_EMISSION").as_deref() != Ok("0"),
             rx_steady_epoch: 0,
             rx_tor_win: false,
             rx_ever_opened: false,
@@ -3619,6 +3624,198 @@ impl<'a> HydraSpanSink<'a> {
         }
     }
 
+    /// R28: reconstruct one packed span's body — `(base_ptr, word)` is the
+    /// SAME slice the SpanRec emission referenced (the ladder's packed
+    /// contract; the blob contract: immutable bytes, valid for the owning
+    /// pass).
+    #[inline(always)]
+    fn packed_body<'b>(&self, base_ptr: usize, w: u64) -> &'b [u8] {
+        let off = (w & nf_transport::rxdesc::RX_PACKED_LOW48) as u32 as usize;
+        let len = ((w >> 32) & 0xFFFF) as usize;
+        debug_assert!(base_ptr.wrapping_add(off) >= self.blob_base || self.blob_base == 0);
+        // SAFETY: the word's (off, len) came from the ladder's span
+        // discovery over the transport's blob frames — the identical
+        // pointer/length pair the SpanRec path carried; the blob stays
+        // alive and immutable for the pass's drain (the standing
+        // HydraLane contract).
+        unsafe { std::slice::from_raw_parts(base_ptr.wrapping_add(off) as *const u8, len) }
+    }
+
+    /// R28: the FUSED packed ladder-commit — the steady scan's packed
+    /// words (batch-relative `(off, len, count)`) checked against the
+    /// array with ONE vector transform + compare per 8 spans
+    /// (`check_arr8_packed` — the count field masked, the flag OR'd, the
+    /// batch-constant delta added). The preamble, the chunk-open assist
+    /// decision, the inline branches and the publish cadence are
+    /// `submit_span_batch_rx`'s, verbatim — only the span word's
+    /// representation changed (no SpanRec materialization, no per-span
+    /// pack arithmetic, no expect[] build).
+    #[inline(never)]
+    fn submit_packed_batch_rx(&mut self, base_ptr: usize, words: &[u64]) {
+        if words.is_empty() {
+            return;
+        }
+        let Some(st) = self.rx.clone() else {
+            unreachable!("submit_packed_batch_rx without rxdesc state");
+        };
+        // The blob base — the packed batch's first body pointer (write-once
+        // per run; MUST precede the first spans_ready Release, which the
+        // window open + publishes below order it into).
+        if self.blob_base == 0 {
+            self.blob_base = base_ptr;
+            st.capture_blob_base(self.blob_base);
+        }
+        // Lazy window open (identical trigger: this batch's first span).
+        if !self.rx_win_open {
+            self.rx_open_window();
+        }
+        // Flow control — once per batch (verbatim).
+        if self.rx_assist_wm > 0 {
+            let mut sb = 0u32;
+            while self.pending() > Self::RX_PACE {
+                self.fold_available();
+                crate::affinity::polite_spin_deep(&mut sb);
+            }
+        }
+        let affine_flag: u64 = if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
+        // R28: the batch-constant translation — batch-relative offsets to
+        // blob-global (the array words' low 32 bits). One value per batch.
+        let delta = (base_ptr as u64).wrapping_sub(self.blob_base as u64);
+        debug_assert!(delta <= u32::MAX as u64, "R28 batch delta overflows u32");
+        let mut i = 0usize;
+        while i < words.len() {
+            // Chunk-open: the assist decision — the batched path's grid
+            // boundary logic, verbatim.
+            if self.submit_rem == CHUNK {
+                let chunk_id = self.next_span / CHUNK;
+                let take_inline = if self.force_inline {
+                    let mut sb = 0u32;
+                    while !self.try_claim_inline() {
+                        self.fold_available();
+                        crate::affinity::polite_spin(&mut sb);
+                    }
+                    true
+                } else {
+                    self.rx_assist_wm > 0
+                        && self.pending() > self.rx_assist_wm
+                        && self.try_claim_inline()
+                };
+                if take_inline {
+                    self.assist_chunks += 1;
+                    // The claim MUST be visible before the spans_ready
+                    // store that exposes this chunk's spans.
+                    st.mark_inline(chunk_id);
+                }
+            }
+            // The run: up to one chunk (or the batch tail) in ONE mode.
+            let run = (self.submit_rem as usize).min(words.len() - i);
+            if let Some(slot) = self.cur_inline {
+                for k in 0..run {
+                    let body = self.packed_body(base_ptr, words[i + k]);
+                    self.submit_inline_span(slot, body);
+                    self.next_span += 1;
+                    self.submit_rem -= 1;
+                }
+                i += run;
+            } else {
+                self.submit_packed_arr_run(&st, base_ptr, &words[i..i + run], affine_flag, delta);
+                i += run;
+            }
+            // Chunk completion — the cadence, verbatim.
+            if self.submit_rem == 0 {
+                self.submit_rem = CHUNK;
+                self.submit_lane = if self.submit_lane + 1 == self.n_lanes {
+                    0
+                } else {
+                    self.submit_lane + 1
+                };
+                if self.cur_inline.is_some() {
+                    self.flush_pending();
+                }
+                self.rx_publish_ready();
+            }
+        }
+    }
+
+    /// R28: one array-mode run over packed words — 8-wide groups through
+    /// the FUSED vector check (`check_arr8_packed`); the mismatch mask
+    /// routes exactly the divergent lanes through the scalar fix path
+    /// (the cold path re-transforms the lane's expected word and
+    /// reconstructs the body from `(base_ptr, word)`). Advances
+    /// `next_span` and `submit_rem` by the run length. The caller proves
+    /// the run stays within one chunk and the window is open.
+    fn submit_packed_arr_run(
+        &mut self,
+        st: &RxdescState,
+        base_ptr: usize,
+        words: &[u64],
+        affine_flag: u64,
+        delta: u64,
+    ) {
+        let n = words.len();
+        let mut i = 0usize;
+        while i < n {
+            if n - i >= 8 {
+                // ── the 8-wide FUSED group ──
+                let base_idx = (self.next_span - self.rx_win_base) as usize;
+                assert!(
+                    base_idx + 8 <= st.cap(),
+                    "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
+                );
+                let group: &[u64; 8] = words[i..i + 8].try_into().unwrap();
+                let bad = st.check_arr8_packed(self.rx_win_slot, base_idx, group, delta, affine_flag);
+                if bad != 0 {
+                    // The COLD path — the same per-lane fix the batched
+                    // SpanRec path applies, in the same ascending order.
+                    for g in 0..8 {
+                        if (bad >> g) & 1 == 0 {
+                            continue;
+                        }
+                        let w = group[g];
+                        let body = self.packed_body(base_ptr, w);
+                        // R27: the toroidal window's shared-slot write —
+                        // wait for the lagging reader of the previous
+                        // window's same word.
+                        self.rx_tor_fix_guard(base_idx + g);
+                        if self.rx_affine {
+                            let tag = self.rx_affine_tag_for(body);
+                            st.set_affine_tag(self.rx_win_slot, base_idx + g, &tag);
+                        }
+                        let expect =
+                            ((w & nf_transport::rxdesc::RX_PACKED_LOW48) + delta) | affine_flag;
+                        st.set_arr(self.rx_win_slot, base_idx + g, expect);
+                        self.rx_fixes += 1;
+                    }
+                }
+                self.next_span += 8;
+                self.submit_rem -= 8;
+                i += 8;
+            } else {
+                // ── the scalar tail (run length not a multiple of 8) ──
+                let w = words[i];
+                let idx = (self.next_span - self.rx_win_base) as usize;
+                assert!(idx < st.cap(), "rxdesc window exceeds array cap (HFT_RXDESC_CAP)");
+                let body = self.packed_body(base_ptr, w);
+                let expect = ((w & nf_transport::rxdesc::RX_PACKED_LOW48) + delta) | affine_flag;
+                if st.get_arr(self.rx_win_slot, idx) != expect {
+                    // R27: the toroidal window's shared-slot write — wait
+                    // for the lagging reader of the previous window's same
+                    // word.
+                    self.rx_tor_fix_guard(idx);
+                    if self.rx_affine {
+                        let tag = self.rx_affine_tag_for(body);
+                        st.set_affine_tag(self.rx_win_slot, idx, &tag);
+                    }
+                    st.set_arr(self.rx_win_slot, idx, expect);
+                    self.rx_fixes += 1;
+                }
+                self.next_span += 1;
+                self.submit_rem -= 1;
+                i += 1;
+            }
+        }
+    }
+
     /// R23c/R24: resolve one span's affine tag — the RX producer's ledger
     /// first (the monotone pointer cursor, O(1) amortized; the pointer +
     /// length match proves the row is THIS body), the direct body scan as
@@ -4241,6 +4438,88 @@ impl<'a> Sink for HydraSpanSink<'a> {
                 // inside submit_span_rx / submit_span_batch_rx owns the
                 // cadence (per-CHUNK, the ring protocol's shape);
                 // end_pass/finish publish the tail.
+            }
+        }
+    }
+
+    /// R28: the fused packed ladder-commit — armed iff the array commit
+    /// path is (the ladder then packs each span's (off, len, count) word
+    /// at discovery and this sink never materializes a SpanRec). The
+    /// ring path (rx == None) and the per-span rollback keep the
+    /// SpanRec emission.
+    #[inline(always)]
+    fn wants_packed_spans(&self) -> bool {
+        self.rx.is_some() && self.batch_submit && self.packed_emission
+    }
+
+    /// R28: the packed batch — the G-INV assert, ONE continuity assert at
+    /// the batch head (the packed contract: the ladder's chain law proves
+    /// the words consecutive in sequence space — steady_step emits only
+    /// contiguous-apply frames and the ladder group verifies the chain),
+    /// the count/last_seq bookkeeping from the batch's (first_seq, total)
+    /// header, then the FUSED array commit
+    /// (`submit_packed_batch_rx` — one vector transform + compare per 8
+    /// spans). The non-rx shapes (defense — the arm never selects them)
+    /// reconstruct each body from `(base_ptr, word)` and route through
+    /// the verbatim per-span paths.
+    #[inline(always)]
+    fn on_span_batch_packed(
+        &mut self,
+        proof: &LiveFeedProof,
+        first_seq: u64,
+        total: u64,
+        base_ptr: usize,
+        words: &[u64],
+    ) {
+        assert!(
+            proof.gen() >= self.last_gen,
+            "G-INV violation: proof gen {} is older than sink last_gen {}",
+            proof.gen(),
+            self.last_gen
+        );
+        if total == 0 {
+            return;
+        }
+        if self.last_seq != 0 {
+            assert_eq!(
+                first_seq,
+                self.last_seq + 1,
+                "Non-monotonic packed span batch: expected {}, got {} (total={})",
+                self.last_seq + 1,
+                first_seq,
+                total
+            );
+        }
+        self.last_seq = first_seq + total - 1;
+        self.count += total;
+        match self.fabric {
+            None => {
+                // Inline mode: evaluate + fold NOW — sequential-equivalent
+                // (the body reconstructed from the packed word).
+                for &w in words {
+                    let body = self.packed_body(base_ptr, w);
+                    let v = span_crc32c_8lane(body);
+                    self.fold_value(v);
+                    self.next_span += 1;
+                    self.fold_pos += 1;
+                }
+            }
+            Some(_) => {
+                if self.rx.is_some() && self.batch_submit && self.packed_emission {
+                    // R28: the FUSED commit — the steady scan's words flow
+                    // straight into the vector check (HFT_BATCH_SUBMIT=0 /
+                    // HFT_PACKED_EMISSION=0 roll back to the SpanRec
+                    // emission upstream).
+                    self.submit_packed_batch_rx(base_ptr, words);
+                } else {
+                    for &w in words {
+                        let body = self.packed_body(base_ptr, w);
+                        self.submit_span(body);
+                        self.next_span += 1;
+                    }
+                }
+                // R16b: NO publish here — the chunk-completion boundary
+                // inside the submit paths owns the cadence.
             }
         }
     }
@@ -4970,6 +5249,30 @@ mod tests {
         )
     }
 
+    /// R28: the packed-emission twin of [`hydra_pass_piped_mode`] — the
+    /// sink's `packed_emission` field selects the fused ladder-commit (the
+    /// HFT_PACKED_EMISSION=0 rollback's parity cell).
+    fn hydra_pass_packed_mode(
+        transport: &mut nf_transport::pipeline::PipelinedReplayTransport,
+        fabric: &HydraFabric,
+        packed: bool,
+    ) -> ((u64, u64, u64), u64, u64) {
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(fabric);
+        sink.packed_emission = packed;
+        let ladder = crate::soa::ladder8_best();
+        while transport.next_batch() {
+            seq.ingest_entries_ladder(transport.entries(), transport.now_ns(), &mut sink, ladder);
+            sink.drain_ready();
+        }
+        sink.finish();
+        (
+            (sink.count, sink.hash, sink.msg_hash),
+            sink.rx_fixes(),
+            sink.assist_chunks(),
+        )
+    }
+
     /// The rxdesc parity matrix: steady + chaos schedules × {check+fix
     /// path (no prefill), forced-inline, pipelined+prefill} × worker
     /// counts. Every cell must be bit-exact vs the sequential reference;
@@ -5505,6 +5808,134 @@ mod tests {
                         );
                     }
                 } // tor
+            } // comp
+        } // chaos
+    }
+
+    /// R28: the fused packed ladder-commit parity — the steady ladder's
+    /// SoA packed emission (one (off, len, count) word per span at
+    /// discovery, the FUSED vector transform+compare per 8 spans, zero
+    /// SpanRec materialization) vs the SpanRec emission (the
+    /// HFT_PACKED_EMISSION=0 rollback, the exact pre-R28 shape). The
+    /// law cell (no prefill, no assists — every entry filled by the
+    /// sink's own fix path, so the packed groups interleave with scalar
+    /// tails and the fused check's mismatch mask routes real fixes)
+    /// must reproduce the sequential reference bit-exact AND fix
+    /// exactly the same spans as the SpanRec mode (the fused
+    /// transform+compare proves exactly as much per span as the
+    /// expect[]-build compare did). The full-stack cell (prefill +
+    /// assists) pins the steady all-clean regime.
+    #[test]
+    fn t_r28_packed_ladder_commit_parity() {
+        let gt = load_mini();
+        for chaos in [false, true] {
+            let cfg = if chaos {
+                ReplayConfig {
+                    seed_a: 0xCAFE_0000_1111_2222,
+                    seed_b: 0xBEEF_3333_4444_5555,
+                    msgs_per_packet: Packetize::MtuBound(1200),
+                    loss: [
+                        LossModel::Bernoulli { p_pm: 80 },
+                        LossModel::Bernoulli { p_pm: 140 },
+                    ],
+                    delay: [
+                        DelayModel::GaussianApprox {
+                            mean_ns: 20_000,
+                            sigma_ns: 6_000,
+                        },
+                        DelayModel::GaussianApprox {
+                            mean_ns: 45_000,
+                            sigma_ns: 18_000,
+                        },
+                    ],
+                    guarantee_coverage: true,
+                    session_change_at_msg: Some(200_000),
+                    ..Default::default()
+                }
+            } else {
+                ReplayConfig {
+                    msgs_per_packet: Packetize::MtuBound(1400),
+                    guarantee_coverage: true,
+                    ..Default::default()
+                }
+            };
+            let sched = build_schedule(&gt, &cfg);
+            let sess = if chaos {
+                *b"R28PACKCHA"
+            } else {
+                *b"R28PACKSTD"
+            };
+            let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+            let want = seq_pass(&mut t0, sess);
+            assert_eq!(want.0, 505_849, "coverage must hold (chaos={chaos})");
+
+            for comp in [true, false] {
+                // (a) the law cell: pipelined WITHOUT the rxdesc attach
+                // (no prefill — every array entry written by the sink's
+                // own fix path), assists disabled — deterministic. Each
+                // mode gets a FRESH fabric (warm-start carryover would
+                // make the fix counts incomparable).
+                let mut results = Vec::new();
+                for packed in [true, false] {
+                    let fabric =
+                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, true);
+                    let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                        &gt,
+                        sched.clone(),
+                        sess,
+                        128,
+                    );
+                    t.reset(sess);
+                    let mut seq = Sequencer::new();
+                    let mut sink = HydraSpanSink::new(&fabric);
+                    sink.packed_emission = packed;
+                    sink.rx_assist_wm = 0; // no assists — deterministic fixes
+                    let ladder = crate::soa::ladder8_best();
+                    while t.next_batch() {
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                        sink.drain_ready();
+                    }
+                    sink.finish();
+                    results.push(((sink.count, sink.hash, sink.msg_hash), sink.rx_fixes()));
+                }
+                let (got_p, fixes_p) = results[0];
+                let (got_s, fixes_s) = results[1];
+                assert_eq!(
+                    got_p, want,
+                    "R28 law cell diverged (packed, chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    got_s, want,
+                    "R28 law cell diverged (SpanRec, chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    fixes_p, fixes_s,
+                    "R28 fix-count divergence: the fused transform+compare must fix exactly the \
+                     SpanRec mode's spans (chaos={chaos}, comp={comp})"
+                );
+
+                // (b) the full-stack cell: pipelined + the RX PREFILL
+                // attached + assists allowed — the sustained arm's exact
+                // shape. Both modes bit-exact.
+                for packed in [true, false] {
+                    let fabric =
+                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, true);
+                    let mut t2 = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                        &gt,
+                        sched.clone(),
+                        sess,
+                        128,
+                    );
+                    if let Some(st) = fabric.rxdesc_state() {
+                        assert!(t2.set_rxdesc(st), "set_rxdesc must attach once");
+                    }
+                    t2.reset(sess);
+                    let (got2, _f2, _a2) = hydra_pass_packed_mode(&mut t2, &fabric, packed);
+                    assert_eq!(
+                        got2, want,
+                        "R28 pipelined diverged (packed={packed}, chaos={chaos}, comp={comp})"
+                    );
+                }
             } // comp
         } // chaos
     }

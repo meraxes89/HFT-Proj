@@ -548,6 +548,21 @@ pub fn rxdesc_unpack_span(w: u64) -> (u32, u16) {
     ((w & 0xFFFF_FFFF) as u32, ((w >> 32) & 0xFFFF) as u16)
 }
 
+/// R28: the packed word's low-48 mask (the (off, len) fields; the count
+/// rides bits 48-63 and never reaches the array).
+pub const RX_PACKED_LOW48: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// R28: transform eight packed span words into expected array words —
+/// `expect[g] = ((word & LOW48) + delta) | flag` (the scalar twin of
+/// `check_arr8_packed`'s vector path; bit-identical). The add's low-32
+/// carry is excluded by the standing off-fits-u32 law.
+#[inline(always)]
+fn transform_packed_expect(words: &[u64; 8], delta: u64, flag: u64, expect: &mut [u64; 8]) {
+    for g in 0..8 {
+        expect[g] = ((words[g] & RX_PACKED_LOW48) + delta) | flag;
+    }
+}
+
 /// Cache-line-padded atomic word (no false sharing between the RX, the
 /// submitting core and the workers).
 #[repr(align(64))]
@@ -1027,6 +1042,79 @@ impl RxdescState {
                 bad |= ((words[i] != expect[i]) as u8) << i;
             }
             bad
+        }
+    }
+
+    /// R28: the FUSED batch-relative check — one vector transform + one
+    /// vector compare per 8 spans replaces the expect[] build + the
+    /// per-span pack arithmetic. `words` are the steady ladder's packed
+    /// span words `(off_batch: u32 | len: u16 | count: u16)`; `delta` is
+    /// the batch-constant `base_ptr − blob_base` (the batch-relative →
+    /// blob-global offset translation) and `flag` the protocol's flag
+    /// half (the count field is masked off, the flag OR'd back in —
+    /// bits 48-63 never reach the array). The expected array word is
+    /// `((word & LOW48) + delta) | flag`: the add's low-32 carry is
+    /// excluded by the standing off-fits-u32 law (debug-asserted at
+    /// pack and here against the first word), so the len field rides
+    /// through untouched. Bit-identical to eight scalar
+    /// `desc8_pack_span(off, len) | flag` compares.
+    ///
+    /// Callers prove `idx + 8 <= cap` (asserted) and the group stays
+    /// inside one chunk.
+    pub fn check_arr8_packed(
+        &self,
+        slot: u8,
+        idx: usize,
+        words: &[u64; 8],
+        delta: u64,
+        flag: u64,
+    ) -> u8 {
+        debug_assert!(delta <= u32::MAX as u64, "R28 delta overflows u32");
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 64 bytes readable at `words`
+                // (a &[u64;8]) and at the array row (idx+8<=cap asserted
+                // below); the array row access follows check_arr8's
+                // slot-ownership protocol.
+                unsafe {
+                    assert!(
+                        idx + 8 <= self.cap,
+                        "rxdesc: array slot {slot} index {idx}+8 exceeds cap {}",
+                        self.cap
+                    );
+                    let arrays = &*self.arrays.get();
+                    let a = _mm512_loadu_si512(
+                        arrays[slot as usize].as_ptr().add(idx) as *const _,
+                    );
+                    let w = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    // (word & LOW48) + delta | flag — the count bits drop,
+                    // the len field rides the add, the flag ORs in.
+                    let low48 = _mm512_set1_epi64(0x0000_FFFF_FFFF_FFFF_u64 as i64);
+                    let d = _mm512_set1_epi64(delta as i64);
+                    let f = _mm512_set1_epi64(flag as i64);
+                    let expect = _mm512_or_si512(
+                        _mm512_add_epi64(_mm512_and_si512(w, low48), d),
+                        f,
+                    );
+                    // Equality is sign-agnostic — epi64 is the AVX-512F
+                    // u64 compare; the mask's bit i is set iff lane i is
+                    // equal. Invert for the mismatch mask.
+                    let eq = _mm512_cmpeq_epi64_mask(a, expect);
+                    !eq
+                }
+            } else {
+                let mut expect = [0u64; 8];
+                transform_packed_expect(words, delta, flag, &mut expect);
+                self.check_arr8(slot, idx, &expect)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut expect = [0u64; 8];
+            transform_packed_expect(words, delta, flag, &mut expect);
+            self.check_arr8(slot, idx, &expect)
         }
     }
 

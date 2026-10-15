@@ -145,4 +145,48 @@ pub trait Sink {
             self.on_span(proof, r.first_seq, r.count, r.body, r.blocks);
         }
     }
+
+    /// R28: opt into SoA PACKED span emission — the steady scan ladder packs
+    /// each span's (offset, length, count) into ONE 64-bit word AT DISCOVERY
+    /// time (batch-relative) and delivers raw words; the `SpanRec`
+    /// materialization (the 48 B struct store + reload + re-walk) leaves the
+    /// scan path entirely. Only for sinks whose span processing needs
+    /// nothing but the body slice and the sequence bookkeeping (the hydra
+    /// rx commit path). The default is false — every classic sink keeps the
+    /// exact SpanRec emission.
+    #[inline(always)]
+    fn wants_packed_spans(&self) -> bool {
+        false
+    }
+
+    /// R28: batched PACKED span emission (called ONLY when
+    /// [`Self::wants_packed_spans`] returned true and the scan runs the
+    /// steady ladder). Contract:
+    /// - `words[i]` = `(off: u32 | len: u16 | count: u16)`, where
+    ///   `off = body_i.as_ptr() - base_ptr` (batch-relative — `base_ptr` is
+    ///   the FIRST span's body pointer), `len` the body's byte length and
+    ///   `count` its message count;
+    /// - `body_i` = the `len` bytes at `base_ptr + off` (the SAME slice the
+    ///   `on_span`/`SpanRec` emission would reference — the blob contract:
+    ///   immutable bytes, valid for the owning pass);
+    /// - `first_seq` = the FIRST span's sequence number and `total` = the
+    ///   sum of the words' counts; the spans are CONSECUTIVE in sequence
+    ///   space (`first_seq_i = first_seq + Σ counts of words[0..i]`) — the
+    ///   ladder's chain law (contiguous-apply frames only) proves it, so
+    ///   the per-span continuity asserts collapse to the batch head;
+    /// - same proof era for every word; exact emission order.
+    ///
+    /// The default is unreachable (gated on `wants_packed_spans`) —
+    /// fail-stop, never silent.
+    #[inline(always)]
+    fn on_span_batch_packed(
+        &mut self,
+        _proof: &LiveFeedProof,
+        _first_seq: u64,
+        _total: u64,
+        _base_ptr: usize,
+        _words: &[u64],
+    ) {
+        unreachable!("on_span_batch_packed without wants_packed_spans");
+    }
 }
