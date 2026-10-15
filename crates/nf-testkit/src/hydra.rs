@@ -97,8 +97,8 @@ use crate::sink::span_crc32c_8lane;
 use crate::crcfold::span_crc32c_affine_sub;
 use nf_arbitrator::types::{Event, LiveFeedProof, Sink, SpanRec};
 use nf_transport::rxdesc::{
-    affine_frame_tag, affine_tag_pack, rxdesc_unpack_span, AffineTagCore,
-    RxdescState, RX_AFFINE_FLAG, RX_AFFINE_TAG_WORDS, RX_NARR,
+    affine_frame_tag, affine_tag_pack, rxdesc_unpack_span, AffineTagCore, RxdescState,
+    RX_AFFINE_FLAG, RX_AFFINE_TAG_WORDS, RX_NARR, REC_RING,
 };
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -318,11 +318,13 @@ struct PassRec {
 /// Completed-pass records kept per sink (harvested by the harness each
 /// pass). R16b: 8 -> 32 — the array-driven submission removed the
 /// descriptor-ring backpressure, so the fold may lag up to the ARRAY
-/// reuse gate (~8 windows ≈ 8 passes) behind submission when the workers
-/// are throughput-bound (the ring protocol's desc-ring backpressure
+/// reuse gate (~64 record slots ≈ 64 passes) behind submission when the
+/// workers are throughput-bound (the ring protocol's desc-ring backpressure
 /// capped the lag at ~1 pass). The harvest ring must hold that lag plus
-/// margin; 32 gives 4x. The records are 40 B each — 1.3 KB total.
-pub const PASS_RING: usize = 32;
+/// margin; R27c's 64-slot record ring raises the reachable fold lag to
+/// ~63 windows, so the harvest ring runs 64 deep to match. The records
+/// are 40 B each — 2.6 KB total.
+pub const PASS_RING: usize = 64;
 
 /// Cache-line-padded cursor to keep producer and consumer writes on
 /// different lines (no false sharing between main and worker cores).
@@ -1194,7 +1196,7 @@ fn lane_worker_rxdesc(
     ) -> bool {
         let mut is_pass = false;
         loop {
-            let s = (*slot + 1) % RX_NARR as u8;
+            let s = (*slot + 1) % REC_RING as u8;
             let (rg, rb, rf, ras) = rx.read_record(s);
             if rg == gen && rb > *base && rb <= gid {
                 *slot = s;
@@ -1223,7 +1225,7 @@ fn lane_worker_rxdesc(
             rec_base = 0;
             blob_base = 0;
             let mut found = false;
-            for s in 0..RX_NARR as u8 {
+            for s in 0..REC_RING as u8 {
                 let (rg, rb, _rf, ras) = rx.read_record(s);
                 if rg == gen && rb == 0 {
                     rec_slot = s;
@@ -1629,7 +1631,7 @@ fn lane_worker_rxdesc_diet(
     ) -> bool {
         let mut is_pass = false;
         loop {
-            let s = (*slot + 1) % RX_NARR as u8;
+            let s = (*slot + 1) % REC_RING as u8;
             let (rg, rb, rf, ras) = rx.read_record(s);
             if rg == gen && rb > *base && rb <= gid {
                 *slot = s;
@@ -1647,7 +1649,7 @@ fn lane_worker_rxdesc_diet(
     /// soundness proof is in the function doc above).
     #[inline(always)]
     fn probe_wb(rx: &RxdescState, gen: u64, slot: u8, base: u64) -> u64 {
-        let s = (slot + 1) % RX_NARR as u8;
+        let s = (slot + 1) % REC_RING as u8;
         let (rg, rb, _rf, _ras) = rx.read_record(s);
         if rg == gen && rb > base {
             rb
@@ -1670,7 +1672,7 @@ fn lane_worker_rxdesc_diet(
             // (next_wb / pf_wb need no reset: the ready-advance refresh
             // below overwrites both before any read.)
             let mut found = false;
-            for s in 0..RX_NARR as u8 {
+            for s in 0..REC_RING as u8 {
                 let (rg, rb, _rf, ras) = rx.read_record(s);
                 if rg == gen && rb == 0 {
                     rec_slot = s;
@@ -2546,11 +2548,11 @@ pub struct HydraSpanSink<'a> {
     /// R27b: the record-ring fold watermark — `rx_rec_end[rec_slot]` is
     /// the fold position the window that LAST owned the record slot
     /// reached at its close. A record slot is reused (overwritten)
-    /// RX_NARR windows later, and a worker still walking the old window
+    /// REC_RING windows later, and a worker still walking the old window
     /// needs its record until its eval cursor passes that window's end
     /// (the fold trails the eval, so `fold_pos >= end` proves every
     /// worker is past it). Enforcing the watermark BEFORE the overwrite
-    /// bounds the sink's window-open lead to < RX_NARR windows in EVERY
+    /// bounds the sink's window-open lead to < REC_RING windows in EVERY
     /// regime: the rotating regime's array-slot reuse gate always
     /// provided this bound implicitly (window w+8's open spun on the
     /// fold passing window w's end before reusing its ARRAY slot, and
@@ -2566,9 +2568,10 @@ pub struct HydraSpanSink<'a> {
     /// The watermark is the missing invariant, restored mode-
     /// independently: ONE local read + compare per window open (zero
     /// atomics, zero copies — the toroidal payoff stands), and a spin
-    /// that only ever binds when the fold lags a full RX_NARR of
-    /// windows (production's pace keeps the lead under one window).
-    rx_rec_end: [u64; RX_NARR],
+    /// that only ever binds when the fold lags a full REC_RING of
+    /// windows (R27c: 64 deep — beyond any 5 s window's reachable lead;
+    /// production's pace keeps the lead under one window).
+    rx_rec_end: [u64; REC_RING],
     /// R27b: the current window's RECORD slot (the ring index its
     /// record was published at — stamps `rx_rec_end` at the close; the
     /// array slot is `rx_win_slot`, but the toroidal epoch DECOUPLES
@@ -2720,7 +2723,7 @@ impl<'a> HydraSpanSink<'a> {
             rx_win_slot: 0,
             rx_win_base: 0,
             rx_slot_end: [u64::MAX; RX_NARR],
-            rx_rec_end: [u64::MAX; RX_NARR],
+            rx_rec_end: [u64::MAX; REC_RING],
             rx_win_rec: 0,
             rx_marks_cleared: false,
             rx_fixes: 0,
@@ -2817,7 +2820,7 @@ impl<'a> HydraSpanSink<'a> {
         self.rx_win_open = false;
         self.rx_marks_cleared = false;
         self.rx_slot_end = [u64::MAX; RX_NARR];
-        self.rx_rec_end = [u64::MAX; RX_NARR];
+        self.rx_rec_end = [u64::MAX; REC_RING];
         // R27: a fresh generation always starts in the rotating regime —
         // the epoch must re-earn itself on the new span grid.
         self.rx_steady_epoch = 0;
@@ -2927,7 +2930,7 @@ impl<'a> HydraSpanSink<'a> {
         if self.rx_win_open {
             self.rx_slot_end[self.rx_win_slot as usize] = self.next_span;
             // R27b: stamp the record slot's fold watermark (the window
-            // that owns `rx_win_rec` ends here; RX_NARR windows later,
+            // that owns `rx_win_rec` ends here; REC_RING windows later,
             // the slot's reuse waits for the fold to pass this span).
             self.rx_rec_end[self.rx_win_rec as usize] = self.next_span;
             let win_count = self.next_span - self.rx_win_base;
@@ -3116,9 +3119,9 @@ impl<'a> HydraSpanSink<'a> {
             st.copy_tags(prev_arr as u8, arr_slot, st.last_window_count());
         }
         // R27b: THE RECORD-RING WATERMARK — the bound that keeps the
-        // sink's window-open lead within RX_NARR of the fold in EVERY
+        // sink's window-open lead within REC_RING of the fold in EVERY
         // regime (see the field doc). The record about to be published
-        // into `rec_slot` overwrites the window RX_NARR opens ago; a
+        // into `rec_slot` overwrites the window REC_RING opens ago; a
         // worker still evaluating that window's spans reads its record
         // every boundary crossing (`resolve_rec`/`probe_wb`). fold_pos
         // ≥ that window's end proves every worker's cursor is past it
@@ -3421,6 +3424,38 @@ impl<'a> HydraSpanSink<'a> {
             }
         }
         if let Some(slot) = self.cur_inline {
+            // R27c: the HOLE-FREE INLINE COMMIT (per-span form) — an
+            // inline span STILL writes its array word. This branch is
+            // how COLD frames reach the array (the classic ladder's
+            // per-span emission — the steady frames ride the batched
+            // paths, whose `arr_check_fix`/`packed_arr_check_fix` twins
+            // carry the same law): without the write, a force-inline or
+            // straddle-claimed window leaves its cold-frame spans'
+            // words stale — the hole propagates through the warm copy
+            // and the next array-path window re-fixes it, disarming the
+            // toroidal epoch (see `arr_check_fix`'s doc). The check is
+            // the per-span load+compare the array path already pays.
+            {
+                let idx = (self.next_span - self.rx_win_base) as usize;
+                assert!(
+                    idx < st.cap(),
+                    "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
+                );
+                debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
+                debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                let w = desc8_pack_span(off as u32, body.len() as u16)
+                    | if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
+                if st.get_arr(self.rx_win_slot, idx) != w {
+                    self.rx_tor_fix_guard(idx);
+                    if self.rx_affine {
+                        let tag = self.rx_affine_tag_for(body);
+                        st.set_affine_tag(self.rx_win_slot, idx, &tag);
+                    }
+                    st.set_arr(self.rx_win_slot, idx, w);
+                    self.rx_fixes += 1;
+                }
+            }
             // Inline chunk: evaluate NOW from the actual body (no array
             // involvement), buffer for the ordered fold — the existing
             // assist path verbatim.
@@ -3573,10 +3608,14 @@ impl<'a> HydraSpanSink<'a> {
                     st.mark_inline(chunk_id);
                 }
             }
-            // The run: up to one chunk (or the batch tail) in ONE mode —
-            // a chunk never mixes array and inline spans.
+            // The run: up to one chunk (or the batch tail) in ONE mode.
             let run = (self.submit_rem as usize).min(recs.len() - i);
             if let Some(slot) = self.cur_inline {
+                // R27c: the hole-free inline commit — keep the slot's words
+                // exact even when the chunk evaluates inline (see
+                // `arr_check_fix`'s doc: the assist must not disarm the
+                // toroidal epoch).
+                self.arr_check_fix(&st, &recs[i..i + run], affine_flag);
                 for _ in 0..run {
                     let body = recs[i].body;
                     self.submit_inline_span(slot, body);
@@ -3684,6 +3723,145 @@ impl<'a> HydraSpanSink<'a> {
         }
     }
 
+    /// R27c: the HOLE-FREE INLINE COMMIT (SpanRec form) — an inline
+    /// (assist) chunk STILL runs the check-and-fix of its words into the
+    /// window's array slot (guards + fixes + `rx_fixes`, verbatim
+    /// `submit_arr_run` semantics) WITHOUT advancing the submission
+    /// cursors (`next_span`/`submit_rem` stay — the inline loop owns the
+    /// advance). Why: an inline chunk's spans previously left the
+    /// window's array words UNTOUCHED (the workers skip marked chunks,
+    /// so nobody read them) — but the NEXT window on the same slot
+    /// (the toroidal epoch) checks those words against its own walk,
+    /// and a never-written word reads stale → a fix → the epoch's clean
+    /// check disarms → the rotating regime returns with its ~22 µs
+    /// warm copy per window (the measured 830 ms/pass-reset wall). With
+    /// the hole-free commit the slot's content is complete after EVERY
+    /// window regardless of where each chunk was evaluated, so the
+    /// assist can no longer disarm the toroidal epoch. The cost is the
+    /// same 8-wide vector check the array path pays (~0.75 cyc/span —
+    /// noise next to the inline CRC evaluation the assist exists to
+    /// run).
+    #[inline(never)]
+    fn arr_check_fix(&mut self, st: &RxdescState, recs: &[SpanRec<'_>], affine_flag: u64) {
+        let n = recs.len();
+        let base_idx = (self.next_span - self.rx_win_base) as usize;
+        let mut i = 0usize;
+        while i < n {
+            if n - i >= 8 {
+                let gidx = base_idx + i;
+                assert!(
+                    gidx + 8 <= st.cap(),
+                    "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
+                );
+                let mut expect = [0u64; 8];
+                for g in 0..8 {
+                    let body = recs[i + g].body;
+                    let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
+                    expect[g] = desc8_pack_span(off as u32, body.len() as u16) | affine_flag;
+                }
+                let bad = st.check_arr8(self.rx_win_slot, gidx, &expect);
+                if bad != 0 {
+                    for g in 0..8 {
+                        if (bad >> g) & 1 == 0 {
+                            continue;
+                        }
+                        let body = recs[i + g].body;
+                        self.rx_tor_fix_guard(gidx + g);
+                        if self.rx_affine {
+                            let tag = self.rx_affine_tag_for(body);
+                            st.set_affine_tag(self.rx_win_slot, gidx + g, &tag);
+                        }
+                        st.set_arr(self.rx_win_slot, gidx + g, expect[g]);
+                        self.rx_fixes += 1;
+                    }
+                }
+                i += 8;
+            } else {
+                let body = recs[i].body;
+                let idx = base_idx + i;
+                assert!(idx < st.cap(), "rxdesc window exceeds array cap (HFT_RXDESC_CAP)");
+                let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
+                let w = desc8_pack_span(off as u32, body.len() as u16) | affine_flag;
+                if st.get_arr(self.rx_win_slot, idx) != w {
+                    self.rx_tor_fix_guard(idx);
+                    if self.rx_affine {
+                        let tag = self.rx_affine_tag_for(body);
+                        st.set_affine_tag(self.rx_win_slot, idx, &tag);
+                    }
+                    st.set_arr(self.rx_win_slot, idx, w);
+                    self.rx_fixes += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// R27c: the hole-free inline commit (packed form) — same law as
+    /// `arr_check_fix` over the R28 packed words (the FUSED
+    /// `check_arr8_packed` transform + compare per 8 spans, the
+    /// batch-constant `delta`), cursor-free: the inline loop below owns
+    /// `next_span`/`submit_rem`. See `arr_check_fix`'s doc for the
+    /// epoch-survival law.
+    #[inline(never)]
+    fn packed_arr_check_fix(
+        &mut self,
+        st: &RxdescState,
+        base_ptr: usize,
+        words: &[u64],
+        affine_flag: u64,
+        delta: u64,
+    ) {
+        let n = words.len();
+        let base_idx = (self.next_span - self.rx_win_base) as usize;
+        let mut i = 0usize;
+        while i < n {
+            if n - i >= 8 {
+                let gidx = base_idx + i;
+                assert!(
+                    gidx + 8 <= st.cap(),
+                    "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
+                );
+                let group: &[u64; 8] = words[i..i + 8].try_into().unwrap();
+                let bad = st.check_arr8_packed(self.rx_win_slot, gidx, group, delta, affine_flag);
+                if bad != 0 {
+                    for g in 0..8 {
+                        if (bad >> g) & 1 == 0 {
+                            continue;
+                        }
+                        let w = group[g];
+                        let body = self.packed_body(base_ptr, w);
+                        self.rx_tor_fix_guard(gidx + g);
+                        if self.rx_affine {
+                            let tag = self.rx_affine_tag_for(body);
+                            st.set_affine_tag(self.rx_win_slot, gidx + g, &tag);
+                        }
+                        let expect =
+                            ((w & nf_transport::rxdesc::RX_PACKED_LOW48) + delta) | affine_flag;
+                        st.set_arr(self.rx_win_slot, gidx + g, expect);
+                        self.rx_fixes += 1;
+                    }
+                }
+                i += 8;
+            } else {
+                let w = words[i];
+                let idx = base_idx + i;
+                assert!(idx < st.cap(), "rxdesc window exceeds array cap (HFT_RXDESC_CAP)");
+                let body = self.packed_body(base_ptr, w);
+                let expect = ((w & nf_transport::rxdesc::RX_PACKED_LOW48) + delta) | affine_flag;
+                if st.get_arr(self.rx_win_slot, idx) != expect {
+                    self.rx_tor_fix_guard(idx);
+                    if self.rx_affine {
+                        let tag = self.rx_affine_tag_for(body);
+                        st.set_affine_tag(self.rx_win_slot, idx, &tag);
+                    }
+                    st.set_arr(self.rx_win_slot, idx, expect);
+                    self.rx_fixes += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+
     /// R28: reconstruct one packed span's body — `(base_ptr, word)` is the
     /// SAME slice the SpanRec emission referenced (the ladder's packed
     /// contract; the blob contract: immutable bytes, valid for the owning
@@ -3770,6 +3948,9 @@ impl<'a> HydraSpanSink<'a> {
             // The run: up to one chunk (or the batch tail) in ONE mode.
             let run = (self.submit_rem as usize).min(words.len() - i);
             if let Some(slot) = self.cur_inline {
+                // R27c: the hole-free inline commit — the packed twin (see
+                // `packed_arr_check_fix`'s doc).
+                self.packed_arr_check_fix(&st, base_ptr, &words[i..i + run], affine_flag, delta);
                 for k in 0..run {
                     let body = self.packed_body(base_ptr, words[i + k]);
                     self.submit_inline_span(slot, body);
@@ -5888,12 +6069,12 @@ mod tests {
 
     /// R27b: the record-ring watermark law — the soundness cell for the
     /// publication bound the toroidal epoch was missing. The record ring
-    /// is an RX_NARR-slot shared structure: a record published at window
-    /// w overwrites window w−RX_NARR's, and a worker still walking that
+    /// is a REC_RING-slot shared structure (R27c: 64 deep): a record published at window
+    /// w overwrites window w−REC_RING's, and a worker still walking that
     /// window probes it at every boundary crossing (`resolve_rec` /
     /// `probe_wb`). The rotating regime's array-slot reuse gate bounded
     /// the sink's window-open lead over the fold implicitly (window
-    /// w+RX_NARR's open spun on the fold passing window w's end, and the
+    /// w+REC_RING's open spun on the fold passing window w's end, and the
     /// two rings advanced in lockstep); R27 froze the array slot and
     /// deleted the gate, leaving NOTHING bounding the ring when the
     /// assist pace is disarmed — the fleet CI caught exactly that on the
@@ -5910,7 +6091,7 @@ mod tests {
     /// (pre-fix, chaos=false/comp=false fails with hash 2532654608340517922 —
     /// the exact fleet value). Post-fix the record-ring watermark bounds
     /// the lead: window w's open waits for the fold to pass window
-    /// w−RX_NARR's end before overwriting its record (one local read +
+    /// w−REC_RING's end before overwriting its record (one local read +
     /// compare per open; the spin itself drives the fold, so liveness
     /// holds), every crossing resolves the live record, and all 12
     /// records come out bit-exact — while the toroidal epoch STILL
@@ -5987,6 +6168,182 @@ mod tests {
                 }
             } // tor
         } // comp
+    }
+
+    /// R27c: the deep record ring — the 60-window unbounded-lead law.
+    /// t_r27b's parked-fold shape at 12 windows stops right where the OLD
+    /// 8-slot ring's watermark began binding (window 9); R27c's 64-deep
+    /// ring must let the same parked shape run SIXTY windows with zero
+    /// binds — the pre-R27c regime deterministically wraps the record
+    /// ring at window 9 and folds wrong (the t_r27b fleet hash), so this
+    /// cell's bit-exact 60 records IS the depth law's proof. The actual
+    /// 64-wrap is STRUCTURALLY unreachable: the sink's own harvest ring
+    /// (PASS_RING=64) forces mid-run harvesting (harness discipline) at
+    /// 63 windows of lead, which forces record completion, which forces
+    /// the fold — the watermark's reuse bound sits beyond every lead the
+    /// protocol can express (the design's own safety: the record-ring
+    /// watermark becomes dead insurance, and the reset wall it priced
+    /// collapses to zero).
+    #[test]
+    fn t_r27c_deep_record_ring_wrap() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let sess = *b"R27CDEEP\0\0";
+        let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+        let want = seq_pass(&mut t0, sess);
+        assert_eq!(want.0, 505_849, "coverage must hold");
+        const PASSES: u64 = 60;
+        for comp in [true, false] {
+            let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, comp, true);
+            let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                &gt,
+                sched.clone(),
+                sess,
+                128,
+            );
+            if let Some(st) = fabric.rxdesc_state() {
+                assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+            }
+            t.reset(sess);
+            let mut seq = Sequencer::new();
+            let mut sink = HydraSpanSink::new(&fabric);
+            sink.rx_toroidal = true;
+            sink.rx_assist_wm = 0; // the deterministic law-cell shape
+            let ladder = crate::soa::ladder8_best();
+            for _pass in 0..PASSES {
+                t.reset(sess);
+                *seq = Sequencer::new_unboxed();
+                sink.begin_pass();
+                while t.next_batch() {
+                    seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                    // NO drain_ready: the fold stays parked — sixty
+                    // windows of unbounded lead, deterministically.
+                }
+                sink.end_pass();
+            }
+            sink.finish();
+            let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+            let mut got = Vec::new();
+            let mut n = sink.harvest_completed(&mut harvested);
+            while n > 0 {
+                for rec in &harvested[..n] {
+                    got.push(*rec);
+                }
+                n = sink.harvest_completed(&mut harvested);
+            }
+            assert_eq!(got.len() as u64, PASSES, "R27c records (comp={comp})");
+            for (k, rec) in got.iter().enumerate() {
+                assert_eq!(
+                    *rec, want,
+                    "R27c pass {k} diverged (comp={comp}) — the deep-ring unbounded-lead shape"
+                );
+            }
+            assert!(
+                sink.rx_steady_epoch >= 2,
+                "R27c toroidal epoch never engaged (comp={comp}, epoch={})",
+                sink.rx_steady_epoch
+            );
+        }
+    }
+
+    /// R27c: the HOLE-FREE INLINE COMMIT — the epoch-survival law. The
+    /// deterministic hole shape: a COLD window (pass 1) whose every chunk
+    /// goes INLINE (force_inline) never array-writes its spans the
+    /// pre-R27c way — the words stay zero, the warm copy propagates the
+    /// zeros, and the next ARRAY-path window (pass 2) re-fixes every
+    /// never-written word (rx_fixes grows) and disarms the toroidal
+    /// epoch (the assist's 830 ms/pass reset wall, reproduced
+    /// deterministically). With the hole-free commit the inline run
+    /// STILL checks-and-fixes its words into the slot, so pass 2 finds
+    /// them exact: the fix count NEVER grows past pass 1's cold fill and
+    /// the epoch engages at pass 2's close. Pinned: (a) every record
+    /// bit-exact, (b) fixes after pass 3 == fixes after pass 1, (c) the
+    /// toroidal epoch armed.
+    #[test]
+    fn t_r27c_hole_free_inline_commit() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let sess = *b"R27CHOLE\0\0";
+        let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+        let want = seq_pass(&mut t0, sess);
+        assert_eq!(want.0, 505_849, "coverage must hold");
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true, true);
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+            &gt,
+            sched.clone(),
+            sess,
+            128,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        t.reset(sess);
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        sink.rx_assist_wm = 0; // deterministic: force_inline is the assist
+        let ladder = crate::soa::ladder8_best();
+        let mut fixes_hist = Vec::new();
+        for pass in 0..3u64 {
+            // Pass 0: the COLD window with EVERY chunk inline — the
+            // hole-free law's fill shape. Passes 1-2: the normal array
+            // path (the re-verification the holes used to poison).
+            sink.force_inline = pass == 0;
+            t.reset(sess);
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            while t.next_batch() {
+                seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                sink.drain_ready();
+            }
+            sink.end_pass();
+            fixes_hist.push(sink.rx_fixes);
+        }
+        sink.finish();
+        let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+        let mut got = Vec::new();
+        let mut n = sink.harvest_completed(&mut harvested);
+        while n > 0 {
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+            n = sink.harvest_completed(&mut harvested);
+        }
+        assert_eq!(got.len(), 3, "R27c hole-free records");
+        for (k, rec) in got.iter().enumerate() {
+            assert_eq!(*rec, want, "R27c hole-free pass {k} diverged");
+        }
+        // (b) THE LAW: the fix count never grows past the cold fill —
+        // passes 1-2 (the array path over the inline-filled slot) find
+        // every word exact. Pre-R27c this grows by the full span count.
+        assert!(
+            fixes_hist[0] > 0,
+            "R27c hole-free: the cold inline fill must have written words (fixes={})",
+            fixes_hist[0]
+        );
+        assert_eq!(
+            fixes_hist[1], fixes_hist[0],
+            "R27c hole-free law violated: pass 1 re-fixed {} words the inline \
+             commit should have written (cold fill {})",
+            fixes_hist[1] - fixes_hist[0],
+            fixes_hist[0]
+        );
+        assert_eq!(fixes_hist[2], fixes_hist[0], "R27c hole-free: pass 2 grew fixes");
+        // (c) the epoch survived the inline-heavy window.
+        assert!(
+            sink.rx_steady_epoch >= 1,
+            "R27c hole-free: the toroidal epoch never engaged (epoch={})",
+            sink.rx_steady_epoch
+        );
     }
 
     /// R28: the fused packed ladder-commit parity — the steady ladder's

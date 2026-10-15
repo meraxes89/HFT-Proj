@@ -69,6 +69,19 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Number of circulating per-pass array slots (see the module doc).
 pub const RX_NARR: usize = 8;
+
+/// R27c: the RECORD ring depth — decoupled from the array ring
+/// (`RX_NARR`, which sizes the descriptor/tag rows and the 3-bit `aslot`
+/// field). The record ring is 4 KB of padded cursors, so it can afford to
+/// run 64 deep: the R27b fold watermark that guards each record-slot
+/// overwrite then only binds once the sink's window-open lead exceeds 63
+/// windows — outside any 5-second window's reachable lead (the R27c
+/// arithmetic: 830 ms of per-open watermark spins per sustained run
+/// collapse to zero, releasing the Zero-Reset Toroidal Pass to run
+/// copy-free AND wait-free). The array ring stays at 8 (the toroidal
+/// epoch freezes its slot; the rotating regime's reuse gate keeps its
+/// lockstep law, and the memory footprint stays flat).
+pub const REC_RING: usize = 64;
 /// Chunk-state ring geometry: one u64 slot per chunk-grid position
 /// (global chunk id mod 2^15). The slot holds `chunk_id + 1` for an
 /// inline-claimed chunk (0 = none) — the VALUE CHECK makes aliasing
@@ -587,12 +600,14 @@ pub struct RxdescState {
     arrays: UnsafeCell<Vec<Box<[u64]>>>,
     cap: usize,
     /// Pass records: `records[i]` = packed `(gen, base_span)` of the
-    /// newest window that used slot i (0 = never used — gen 0 base 0 is
+    /// newest window that used record slot i (0 = never used — gen 0 base 0 is
     /// distinguishable because a real gen-0 window-0 record has base 0
     /// too; the walk matches on generation + monotone base, so a zero
     /// word reads as gen 0/base 0 and is simply a stale/never entry the
-    /// walk's monotone check rejects).
-    records: [RxPad; RX_NARR],
+    /// walk's monotone check rejects). R27c: the ring runs `REC_RING`
+    /// (64) deep — decoupled from the 8-slot array ring so the R27b
+    /// watermark's reuse bound sits far beyond any 5 s window's lead.
+    records: [RxPad; REC_RING],
     /// The publication cursor: packed `(gen, spans_ready)`. Release by
     /// the sink after array fixes; Acquire by workers.
     ready: RxPad,
@@ -800,16 +815,18 @@ impl RxdescState {
         self.gen.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Derive the next array slot from `last_slot` (the module-doc rule —
-    /// the RX at bake points and the sink at window open MUST use this
-    /// same function on the same read for the lockstep to hold).
+    /// Derive the next RECORD slot from `last_slot` (the module-doc rule —
+    /// the sink at window open MUST use this same function on the same
+    /// read for the ring protocol to hold). R27c: the modulus is
+    /// `REC_RING` (64) — the record ring is decoupled from the array
+    /// ring; the record's `aslot` field carries the window's ARRAY slot.
     #[inline]
     pub fn next_slot(&self) -> u8 {
         let last = self.last_slot.load(Ordering::Relaxed);
         if last == u8::MAX {
             0
         } else {
-            (last + 1) % RX_NARR as u8
+            (last + 1) % REC_RING as u8
         }
     }
 
