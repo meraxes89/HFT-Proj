@@ -182,8 +182,54 @@ reset_ms is RX-starvation dominated). What it CAN gate, it gates:
 
 * `HYDRA_BITPARITY → BIT-EXACT` (count/hash/msg_hash identical).
 * `allocs=0` on every arm shape.
-* Workspace: **90 tests, 0 failures**; clippy `--workspace
+* Workspace: **91 tests, 0 failures**; clippy `--workspace
   --all-targets -D warnings` clean.
+
+## 5b. R27b — the record-ring watermark (the fleet CI post-merge fix)
+
+The first push of this branch failed ~20% of the 120-shard matrix on
+`t_r27_toroidal_multipass_parity` — timing-dependent arming, but a
+**deterministic wrong fold** (`R27 toroidal pass 1/2 diverged`, chaos=false
+hash 2532654608340517922, count and msg_hash exact) plus a second
+signature on the composite cells (a `composite record straddled a pass
+boundary` debug assert — the pass-start split firing late).
+
+**Root cause** (reproduced deterministically before the fix): the record
+ring is an 8-slot shared structure — a record published at window w
+overwrites window w−8's, and a worker still walking that window probes it
+at every boundary crossing. The rotating regime's array-slot reuse gate
+always bounded the sink's window-open lead over the fold *implicitly*
+(window w+8's open spun on the fold passing window w's end; the two
+rings advanced in lockstep). R27 froze the array slot and **deleted the
+gate** — leaving the record ring with no bound the moment the assist
+pace is disarmed (the parity cells' deterministic shape; the pace is a
+throughput knob, not a protocol invariant). With the fold parked, the
+sink laps the workers by the full 12 windows: the ring wraps, the
+workers' `resolve_rec`/`probe_wb` read overwritten records, keep a stale
+`rec_base`/`aslot`, and read array indices past the window into stale
+words — every value after the missed crossing comes from the wrong
+frame, and the fold hash diverges with a value that depends only on the
+schedule (hence the same wrong hash on every failing shard).
+
+**The fix**: `rx_rec_end[rec_slot]` — the fold watermark of the window
+that last owned each record slot, stamped at every window close
+(`end_pass` + `finish`), enforced at every window open **in every
+regime** before `publish_record` overwrites the slot: spin until
+`fold_pos >= rx_rec_end[rec_slot]`. `fold_pos >= end(w−8)` proves every
+worker's cursor is past window w−8 (results publish before the fold
+consumes them, so every worker's gid ≥ fold_pos), so no live reader
+needs the record being overwritten. The spin itself drives the fold
+(`fold_available`, the same shape as the array reuse gate) — liveness
+holds; the rotating gate is subsumed (its bound was the same law on the
+array ring). Cost: one local read + compare per window open, zero
+atomics, zero copies — **the toroidal payoff stands** (production's
+assist pace holds the lead under one window, so the spin never binds;
+the watermark is pure soundness insurance). The regression cell
+`t_r27b_record_ring_watermark` pins the law deterministically: the
+multipass shape with the fold never driven mid-pass (no `drain_ready`,
+assists off) — pre-fix it fails with the exact fleet hash, post-fix all
+12 records are bit-exact on both comp modes AND the toroidal epoch
+still engages ≥ 2 (the bound is not a rotating fallback).
 
 ## 6. The fleet pricing program
 
@@ -211,6 +257,6 @@ ceiling) are the instruments.
 | `crates/nf-transport/src/rxdesc.rs` | SoA sidecar (tagvals/tagraws), `get_affine_value`/`get_values8`/`get_arr8`, `copy_tags` both rows; the aslot record packing (`rx_pack_record`/`rx_unpack_record`, `publish_record`, `read_record`, `last_slot_value`); `check_arr8_packed` + `RX_PACKED_LOW48` |
 | `crates/nf-arbitrator/src/lib.rs` | `SpanEmit`/`RecEmitter`/`PackedEmitter`; `steady_step`/`ladder_group_apply`/`steady_scan_ladder` generic over the emitter; `ingest_entries_ladder`'s packed branch |
 | `crates/nf-arbitrator/src/types.rs` | `Sink::wants_packed_spans` + `Sink::on_span_batch_packed` (the packed contract) |
-| `crates/nf-testkit/src/hydra.rs` | The worker vertical group + spray auto-mute + `SegAcc::push8`; the epoch/toroidal window open + `rx_tor_fix_guard` + the epoch update at close; `submit_packed_batch_rx`/`submit_packed_arr_run`/`packed_body`; the sink's packed overrides; tests `t_r26_worker_group_parity`, `t_r27_toroidal_multipass_parity`, `t_r28_packed_ladder_commit_parity` |
+| `crates/nf-testkit/src/hydra.rs` | The worker vertical group + spray auto-mute + `SegAcc::push8`; the epoch/toroidal window open + `rx_tor_fix_guard` + the epoch update at close; `submit_packed_batch_rx`/`submit_packed_arr_run`/`packed_body`; the sink's packed overrides; R27b `rx_rec_end`/`rx_win_rec` record-ring watermark (open-time spin + close-time stamps); tests `t_r26_worker_group_parity`, `t_r27_toroidal_multipass_parity`, `t_r27b_record_ring_watermark`, `t_r28_packed_ladder_commit_parity` |
 | `scripts/ci.sh` | arms 11g / 11t / 11p (the three rollbacks' attribution) |
 | `docs/41-r26-r28-toroidal-fused-commit.md` | this report |

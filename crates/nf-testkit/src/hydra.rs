@@ -2543,6 +2543,37 @@ pub struct HydraSpanSink<'a> {
     /// This sink's per-slot window-end spans (u64::MAX = never used by
     /// this sink) — the array reuse gate.
     rx_slot_end: [u64; RX_NARR],
+    /// R27b: the record-ring fold watermark — `rx_rec_end[rec_slot]` is
+    /// the fold position the window that LAST owned the record slot
+    /// reached at its close. A record slot is reused (overwritten)
+    /// RX_NARR windows later, and a worker still walking the old window
+    /// needs its record until its eval cursor passes that window's end
+    /// (the fold trails the eval, so `fold_pos >= end` proves every
+    /// worker is past it). Enforcing the watermark BEFORE the overwrite
+    /// bounds the sink's window-open lead to < RX_NARR windows in EVERY
+    /// regime: the rotating regime's array-slot reuse gate always
+    /// provided this bound implicitly (window w+8's open spun on the
+    /// fold passing window w's end before reusing its ARRAY slot, and
+    /// the two rings advanced in lockstep); the toroidal epoch froze the
+    /// array slot and deleted the gate, leaving the record ring with NO
+    /// bound — the assist pace (HFT_ASSIST_WATERMARK) is a throughput
+    /// knob, not a protocol invariant, and the deterministic parity
+    /// cells disarm it. Unbounded lead wraps the 8-slot record ring;
+    /// the workers' `resolve_rec`/`probe_wb` then read overwritten
+    /// records (a stale `rec_base` + `aslot`, array indices running past
+    /// the window into stale words — a deterministic wrong fold, plus
+    /// the composite pass-boundary split firing late and straddling).
+    /// The watermark is the missing invariant, restored mode-
+    /// independently: ONE local read + compare per window open (zero
+    /// atomics, zero copies — the toroidal payoff stands), and a spin
+    /// that only ever binds when the fold lags a full RX_NARR of
+    /// windows (production's pace keeps the lead under one window).
+    rx_rec_end: [u64; RX_NARR],
+    /// R27b: the current window's RECORD slot (the ring index its
+    /// record was published at — stamps `rx_rec_end` at the close; the
+    /// array slot is `rx_win_slot`, but the toroidal epoch DECOUPLES
+    /// the two rings, so neither derives the other).
+    rx_win_rec: u8,
     /// The inline-claim marks were cleared for this sink's generation
     /// (at its FIRST window open — the activation; see
     /// `RxdescState::clear_chunk_states`).
@@ -2689,6 +2720,8 @@ impl<'a> HydraSpanSink<'a> {
             rx_win_slot: 0,
             rx_win_base: 0,
             rx_slot_end: [u64::MAX; RX_NARR],
+            rx_rec_end: [u64::MAX; RX_NARR],
+            rx_win_rec: 0,
             rx_marks_cleared: false,
             rx_fixes: 0,
             rx_assist_wm: Self::assist_watermark(),
@@ -2784,6 +2817,7 @@ impl<'a> HydraSpanSink<'a> {
         self.rx_win_open = false;
         self.rx_marks_cleared = false;
         self.rx_slot_end = [u64::MAX; RX_NARR];
+        self.rx_rec_end = [u64::MAX; RX_NARR];
         // R27: a fresh generation always starts in the rotating regime —
         // the epoch must re-earn itself on the new span grid.
         self.rx_steady_epoch = 0;
@@ -2892,6 +2926,10 @@ impl<'a> HydraSpanSink<'a> {
         // while the main core arbitrates the next pass.
         if self.rx_win_open {
             self.rx_slot_end[self.rx_win_slot as usize] = self.next_span;
+            // R27b: stamp the record slot's fold watermark (the window
+            // that owns `rx_win_rec` ends here; RX_NARR windows later,
+            // the slot's reuse waits for the fold to pass this span).
+            self.rx_rec_end[self.rx_win_rec as usize] = self.next_span;
             let win_count = self.next_span - self.rx_win_base;
             if let Some(st) = &self.rx {
                 st.set_last_window_count(win_count);
@@ -3077,6 +3115,27 @@ impl<'a> HydraSpanSink<'a> {
             // word compare.
             st.copy_tags(prev_arr as u8, arr_slot, st.last_window_count());
         }
+        // R27b: THE RECORD-RING WATERMARK — the bound that keeps the
+        // sink's window-open lead within RX_NARR of the fold in EVERY
+        // regime (see the field doc). The record about to be published
+        // into `rec_slot` overwrites the window RX_NARR opens ago; a
+        // worker still evaluating that window's spans reads its record
+        // every boundary crossing (`resolve_rec`/`probe_wb`). fold_pos
+        // ≥ that window's end proves every worker's cursor is past it
+        // (the fold trails the eval, and every worker's gid ≥ fold_pos
+        // — results publish before the fold consumes them). The spin
+        // drives the fold itself (same shape as the array reuse gate);
+        // in production the assist pace holds the lead under one
+        // window, so the spin never binds — the watermark is pure
+        // soundness insurance at one local load + compare per open.
+        let rend = self.rx_rec_end[rec_slot as usize];
+        if rend != u64::MAX {
+            let mut sb = 0u32;
+            while self.fold_pos < rend {
+                self.fold_available();
+                crate::affinity::polite_spin(&mut sb);
+            }
+        }
         // R25a: the pass-start flag — a window opening exactly at the
         // current pass's first span is a pass boundary (begin_pass's
         // eager open, or the lazy open firing on the pass's first
@@ -3086,6 +3145,7 @@ impl<'a> HydraSpanSink<'a> {
         let pass_start = self.next_span == self.pass_start_span;
         st.publish_record(rec_slot, self.rx_gen, self.next_span, pass_start, arr_slot);
         self.rx_win_slot = arr_slot;
+        self.rx_win_rec = rec_slot;
         self.rx_win_base = self.next_span;
         self.rx_win_open = true;
         self.rx_ever_opened = true;
@@ -4191,6 +4251,10 @@ impl<'a> HydraSpanSink<'a> {
             // claims to finish their queues).
             if self.rx_win_open {
                 self.rx_slot_end[self.rx_win_slot as usize] = self.next_span;
+                // R27b: stamp the record slot's fold watermark (same law
+                // as end_pass's close — the burst shape's windows own
+                // record slots too).
+                self.rx_rec_end[self.rx_win_rec as usize] = self.next_span;
                 let win_count = self.next_span - self.rx_win_base;
                 if let Some(st) = &self.rx {
                     st.set_last_window_count(win_count);
@@ -5820,6 +5884,109 @@ mod tests {
                 } // tor
             } // comp
         } // chaos
+    }
+
+    /// R27b: the record-ring watermark law — the soundness cell for the
+    /// publication bound the toroidal epoch was missing. The record ring
+    /// is an RX_NARR-slot shared structure: a record published at window
+    /// w overwrites window w−RX_NARR's, and a worker still walking that
+    /// window probes it at every boundary crossing (`resolve_rec` /
+    /// `probe_wb`). The rotating regime's array-slot reuse gate bounded
+    /// the sink's window-open lead over the fold implicitly (window
+    /// w+RX_NARR's open spun on the fold passing window w's end, and the
+    /// two rings advanced in lockstep); R27 froze the array slot and
+    /// deleted the gate, leaving NOTHING bounding the ring when the
+    /// assist pace is disarmed — the fleet CI caught exactly that on the
+    /// 120-shard matrix (20% of shards, timing-dependent arming, but a
+    /// DETERMINISTIC wrong fold: the workers keep a stale rec_base/aslot
+    /// and read array indices past the window into stale words —
+    /// `t_r27 toroidal pass 1/2 diverged`, plus the composite
+    /// pass-boundary split firing late and straddling).
+    ///
+    /// THE DETERMINISTIC SHAPE: the multipass cell with the fold never
+    /// driven mid-pass (no `drain_ready`, assists off, one worker) —
+    /// the sink laps the workers by the full 12 windows, the ring wraps
+    /// four times, and the wrong fold reproduces WITHOUT timing luck
+    /// (pre-fix, chaos=false/comp=false fails with hash 2532654608340517922 —
+    /// the exact fleet value). Post-fix the record-ring watermark bounds
+    /// the lead: window w's open waits for the fold to pass window
+    /// w−RX_NARR's end before overwriting its record (one local read +
+    /// compare per open; the spin itself drives the fold, so liveness
+    /// holds), every crossing resolves the live record, and all 12
+    /// records come out bit-exact — while the toroidal epoch STILL
+    /// engages (the watermark is not a rotating fallback: windows 3+
+    /// stay zero-copy toroidal; asserted via the epoch). The rotating
+    /// control (tor=false) pins the same shape through the classic
+    /// regime's own gate.
+    #[test]
+    fn t_r27b_record_ring_watermark() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let sess = *b"R27BWRAP\0\0";
+        let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+        let want = seq_pass(&mut t0, sess);
+        assert_eq!(want.0, 505_849, "coverage must hold");
+        for comp in [true, false] {
+            for tor in [true, false] {
+                let label = if tor { "toroidal" } else { "rotating" };
+                let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, comp, true);
+                let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                    &gt,
+                    sched.clone(),
+                    sess,
+                    128,
+                );
+                if let Some(st) = fabric.rxdesc_state() {
+                    assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+                }
+                t.reset(sess);
+                let mut seq = Sequencer::new();
+                let mut sink = HydraSpanSink::new(&fabric);
+                sink.rx_toroidal = tor;
+                sink.rx_assist_wm = 0; // the deterministic law-cell shape
+                let ladder = crate::soa::ladder8_best();
+                for _pass in 0..12u64 {
+                    t.reset(sess);
+                    *seq = Sequencer::new_unboxed();
+                    sink.begin_pass();
+                    while t.next_batch() {
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                        // NO drain_ready: the fold stays parked — the
+                        // unbounded-lead regime, deterministically.
+                    }
+                    sink.end_pass();
+                }
+                sink.finish();
+                let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+                let mut got = Vec::new();
+                let mut n = sink.harvest_completed(&mut harvested);
+                while n > 0 {
+                    for rec in &harvested[..n] {
+                        got.push(*rec);
+                    }
+                    n = sink.harvest_completed(&mut harvested);
+                }
+                assert_eq!(got.len(), 12, "R27b {label} records (comp={comp})");
+                for (k, rec) in got.iter().enumerate() {
+                    assert_eq!(
+                        *rec, want,
+                        "R27b {label} pass {k} diverged (comp={comp}) — the ring-wrap shape"
+                    );
+                }
+                if tor {
+                    assert!(
+                        sink.rx_steady_epoch >= 2,
+                        "R27b toroidal epoch never engaged (comp={comp}, epoch={})",
+                        sink.rx_steady_epoch
+                    );
+                }
+            } // tor
+        } // comp
     }
 
     /// R28: the fused packed ladder-commit parity — the steady ladder's
