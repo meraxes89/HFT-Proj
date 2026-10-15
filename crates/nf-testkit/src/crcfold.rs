@@ -622,26 +622,32 @@ pub fn span_crc32c_8lane_affine_sub(
     fnv_lanes_64(&lanes, span_len)
 }
 
-/// The `span_crc32c_8lane` lane combine: FNV-1a-64 over the 8 lane
-/// registers + the span length (bit-identical to sink.rs's tail).
+/// R24 (Run 500+ Track 1): the `span_crc32c_8lane` lane combine —
+/// SPANHASH-64, the CLMUL polynomial hash over the 8 lane registers +
+/// the span length (replaces the 9-multiply FNV-1a-64 serial chain; see
+/// `polyhash` — the VPCLMULQDQ/PCLMULQDQ/portable paths are bit-identical,
+/// pinned against the derive script's published vectors).
 #[inline(always)]
+pub fn span_lane_combine(lanes: &[u32; 8], len: usize) -> u64 {
+    crate::polyhash::spanhash64_lanes(lanes, len)
+}
+
+/// Kept as the historical name's tombstone (docs reference it); the law
+/// is [`span_lane_combine`].
+#[inline(always)]
+#[allow(dead_code)]
 fn fnv_lanes_64(lanes: &[u32; 8], len: usize) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &c in lanes.iter() {
-        h ^= c as u64;
-        h = h.wrapping_mul(0x0100_0000_01B3);
-    }
-    h ^= (len as u32) as u64;
-    h.wrapping_mul(0x0100_0000_01B3)
+    span_lane_combine(lanes, len)
 }
 
 /// R23c (Engineer 3's pipeline wiring): the WORKER's O(1) golden-value
 /// evaluation from the rxdesc affine tag — the EXACT
 /// `span_crc32c_8lane(body)` value reconstructed from the 8 lane
 /// REGISTER TAGS (the tag kernel's lanes are the reference kernel's own
-/// lane registers, tail folded into lane 0; the combine is the
-/// reference's FNV-1a-64 tail) — for ARBITRARY span lengths, ZERO
-/// payload reads, nine multiplies.
+/// lane registers, tail folded into lane 0) — for ARBITRARY span lengths,
+/// ZERO payload reads. R24: the combine is SPANHASH-64 (the CLMUL
+/// polynomial hash — the 9-multiply FNV-1a serial chain is retired, the
+/// value law is unchanged).
 ///
 /// Relation to Engineer 2's kernels: for 64-byte-aligned spans this is
 /// value-identical to [`span_crc32c_8lane_affine_sub`] with a zero
@@ -653,7 +659,7 @@ fn fnv_lanes_64(lanes: &[u32; 8], len: usize) -> u64 {
 /// ([`span_crc32c_affine_sub`]) as the integrity check.
 #[inline]
 pub fn span_crc32c_8lane_from_tags(lanes: &[u32; 8], len: usize) -> u64 {
-    fnv_lanes_64(lanes, len)
+    span_lane_combine(lanes, len)
 }
 
 /// The AVX-512 vector core of [`span_crc32c_8lane_affine_sub`] (the
@@ -704,19 +710,14 @@ unsafe fn span_crc32c_8lane_affine_sub_vec(
         let mut bufb = [0u64; 8];
         _mm512_storeu_si512(bufa.as_mut_ptr() as *mut __m512i, oa);
         _mm512_storeu_si512(bufb.as_mut_ptr() as *mut __m512i, ob);
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut lanes = [0u32; 8];
         for k in 0..4 {
-            let v = (bufa[2 * k] as u32) ^ cum_lanes[k];
-            h ^= v as u64;
-            h = h.wrapping_mul(0x0100_0000_01B3);
+            lanes[k] = (bufa[2 * k] as u32) ^ cum_lanes[k];
+            lanes[4 + k] = (bufb[2 * k] as u32) ^ cum_lanes[4 + k];
         }
-        for k in 0..4 {
-            let v = (bufb[2 * k] as u32) ^ cum_lanes[4 + k];
-            h ^= v as u64;
-            h = h.wrapping_mul(0x0100_0000_01B3);
-        }
-        h ^= (span_len as u32) as u64;
-        h.wrapping_mul(0x0100_0000_01B3)
+        // R24: the SPANHASH-64 combine (value law unchanged; the FNV
+        // serial chain is retired).
+        span_lane_combine(&lanes, span_len)
     }
 }
 
@@ -2011,14 +2012,8 @@ pub(crate) mod imp {
             }
         }
 
-        // ---- FNV lane combine (identical to the scalar kernel) ----
-        let mut h: u64 = 0xcbf29ce484222325;
-        for c in lanes {
-            h ^= c as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= len as u64 & 0xFFFF_FFFF;
-        h = h.wrapping_mul(0x100000001b3);
+        // ---- R24 SPANHASH-64 lane combine (identical to the scalar kernel) ----
+        let h = crate::crcfold::span_lane_combine(&lanes, len);
         std::hint::black_box(h)
     }
 
@@ -2595,14 +2590,8 @@ pub(crate) mod imp {
             }
         }
 
-        // ---- FNV lane combine (identical to the scalar kernel) ----
-        let mut h: u64 = 0xcbf29ce484222325;
-        for c in lanes {
-            h ^= c as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= len as u64 & 0xFFFF_FFFF;
-        h = h.wrapping_mul(0x100000001b3);
+        // ---- R24 SPANHASH-64 lane combine (identical to the scalar kernel) ----
+        let h = crate::crcfold::span_lane_combine(&lanes, len);
         std::hint::black_box(h)
     }
 
@@ -2784,14 +2773,8 @@ pub(crate) mod imp {
             }
         }
 
-        // ---- FNV lane combine (identical to the scalar kernel) ----
-        let mut h: u64 = 0xcbf29ce484222325;
-        for c in lanes {
-            h ^= c as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h ^= len as u64 & 0xFFFF_FFFF;
-        h = h.wrapping_mul(0x100000001b3);
+        // ---- R24 SPANHASH-64 lane combine (identical to the scalar kernel) ----
+        let h = crate::crcfold::span_lane_combine(&lanes, len);
         std::hint::black_box(h)
     }
 
@@ -4189,14 +4172,9 @@ mod tests {
         assert_eq!(crc_scan(0, &t, b"123456789"), 0x58E3_FA20);
 
         // ── 3. the 8-lane bridge: span_crc32c_8lane in O(1) for aligned spans ──
+        // (R24: the expected combine is the production SPANHASH-64 law)
         fn fnv_lanes(lanes: &[u32; 8], ln: usize) -> u64 {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for &c in lanes {
-                h ^= c as u64;
-                h = h.wrapping_mul(0x0100_0000_01B3);
-            }
-            h ^= (ln as u32) as u64;
-            h.wrapping_mul(0x0100_0000_01B3)
+            span_lane_combine(lanes, ln)
         }
         let mut pkt = [0u8; 64 * 40];
         for i in 0..256usize {
@@ -4399,6 +4377,18 @@ mod tests {
             let want = span_crc32c_8lane(&body[..len]);
             let got = span_crc32c_8lane_from_tags(&tag.lanes, len);
             assert_eq!(got, want, "r23c lanes diverged at len={len}");
+            // (1b) R24 Track 2: the packed sidecar's VALUE word == the
+            // same golden value (the worker loads word 2 verbatim — the
+            // pack law is the hot path's value law).
+            let packed = nf_transport::rxdesc::affine_tag_pack(&tag, got);
+            assert_eq!(packed.len(), nf_transport::rxdesc::RX_AFFINE_TAG_WORDS);
+            assert_eq!(packed[2], want, "r24 pack value word at len={len}");
+            assert_eq!(packed[0] as u32, tag.prefix_crc, "r24 pack prefix at len={len}");
+            assert_eq!((packed[0] >> 32) as u32, tag.cum_crc, "r24 pack cum at len={len}");
+            assert_eq!(packed[1] as u32, tag.raw_crc, "r24 pack raw at len={len}");
+            let view = nf_transport::rxdesc::affine_tag_unpack(&packed);
+            assert_eq!(view.value, want, "r24 unpack value at len={len}");
+            assert_eq!(view.raw_crc, tag.raw_crc, "r24 unpack raw at len={len}");
             // (2) The raw triple vs the direct scans.
             let h = len / 2;
             let prefix = crc_scan(0, &t, &body[..h]);
@@ -4667,13 +4657,7 @@ mod tests {
                 let p = unsafe { clmul_reduce_mod_vm(cl_start[j] as u64, c_adv) };
                 lanes[j] = cl_end[j] ^ (p as u32);
             }
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for &c in lanes.iter() {
-                h ^= c as u64;
-                h = h.wrapping_mul(0x0100_0000_01B3);
-            }
-            h ^= (lb as u32) as u64;
-            h = h.wrapping_mul(0x0100_0000_01B3);
+            let h = span_lane_combine(&lanes, lb);
             if h != want {
                 scalar_errs += 1;
             }

@@ -545,8 +545,29 @@ impl Iterator for SpecSliceIter<'_> {
 /// The ingest-side count driver: unrolled wire-speed message slicing over the
 /// message-block stream, folding every length into `sink` (anti-DCE).
 /// Returns the message count. Zero-alloc, zero iterator overhead.
+///
+/// R24 (Run 500+ Track 3) — THE AFFINE SINK FOLD: the legacy per-message
+/// update `acc = rotl(acc, 7) ^ L` is a 2-cycle-latency serial chain, one
+/// link per message — the ingest arm's recursion wall. Re-derived as an
+/// AFFINE RECURSION over GF(2)^64: with R = rotl(., 7),
+///
+/// ```text
+/// acc_k = R^k(acc_0)  XOR  ( L_1 clmul-free weight: R^(k-1)(L_1) ^ R^(k-2)(L_2) ^ ... ^ R^0(L_k) )
+/// ```
+///
+/// — composition of affine maps is associative, so a BATCH of k message
+/// lengths folds as ONE rotate of the accumulator plus k INDEPENDENT
+/// rotations (RORX-class, no data dependency between them) XOR-tree'd.
+/// The serial chain collapses from 2c x N messages to ~2c x N batches +
+/// a log-depth tree; the boundary walk (loads + adds, throughput-bound)
+/// becomes the only per-message work. The final `sink` value is
+/// BIT-IDENTICAL to the legacy sequential fold (the composition law is
+/// exact algebra — pinned by the differential battery), batches are
+/// bounded at 16 messages (the lens array lives in registers), and the
+/// truncated-tail terminal matches the reference walk exactly.
 #[inline(always)]
 pub fn spec_slice_ingest(payload: &[u8], sink: &mut u64) -> u64 {
+    const BATCH: usize = 16;
     let len = payload.len();
     if len < 2 {
         return 0;
@@ -554,17 +575,46 @@ pub fn spec_slice_ingest(payload: &[u8], sink: &mut u64) -> u64 {
     let mut pos = 0usize;
     let mut count = 0u64;
     let mut acc = *sink;
+    let mut lens = [0u16; BATCH];
 
-    while pos + 2 <= len {
-        // Read 2-byte BE message length directly in 100% safe Rust (forbid(unsafe_code))
-        let msg_len = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
-        let next_pos = pos + 2 + msg_len;
-        if next_pos > len {
-            break;
+    'outer: while pos + 2 <= len {
+        // ── boundary batch: up to BATCH messages, direct L1 reads (the
+        // measured verdict: the direct walk beats the E/O table build on
+        // every hot-resident class — the R22.1 law).
+        let mut k = 0usize;
+        let mut p = pos;
+        let mut truncated = false;
+        while p + 2 <= len {
+            let msg_len = u16::from_be_bytes([payload[p], payload[p + 1]]) as usize;
+            let next = p + 2 + msg_len;
+            if next > len {
+                // Truncated message: terminal AFTER this batch folds (the
+                // messages before it in the batch still count — the
+                // reference walk's exact semantics).
+                truncated = true;
+                break;
+            }
+            if k == BATCH {
+                break; // batch full — fold and continue
+            }
+            lens[k] = msg_len as u16;
+            k += 1;
+            p = next;
         }
-        count += 1;
-        acc = acc.rotate_left(7) ^ (msg_len as u64);
-        pos = next_pos;
+        // ── the affine batch fold (the composition law): acc' =
+        // R^k(acc) ^ XOR_{i=0..k-1} R^{k-1-i}(lens[i]). The k rotations
+        // are INDEPENDENT (RORX), the XOR tree has no cross-message
+        // dependency — the 2c/message serial chain is gone.
+        acc = acc.rotate_left((7 * k as u32) & 63);
+        for (i, &l) in lens.iter().enumerate().take(k) {
+            acc ^= (l as u64).rotate_left((7 * (k - 1 - i) as u32) & 63);
+        }
+        count += k as u64;
+        debug_assert!(k > 0 || truncated, "batch progress law");
+        pos = p;
+        if truncated {
+            break 'outer;
+        }
     }
     *sink = acc;
     count
@@ -971,5 +1021,95 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0], SpecMsg { off: 2, len: 128 });
         assert_eq!(msgs[1], SpecMsg { off: 132, len: 1216 });
+    }
+
+    /// R24 (Run 500+ Track 3): the affine sink-fold differential — the
+    /// batch-fold driver must produce the EXACT count and the EXACT final
+    /// sink value as the legacy sequential fold `acc = rotl(acc,7) ^ L`
+    /// on random block streams (the composition law is exact algebra;
+    /// this battery pins it against random batch splits, zero-length
+    /// runs, truncated tails, and non-zero initial accumulators).
+    #[test]
+    fn t14_spec_ingest_affine_fold_differential() {
+        const SEED: u64 = 0xA11F_0E01_D0D0_5132;
+        let mut rng = SimpleRng(SEED);
+        for i in 0..20_000u32 {
+            // Random block stream: 0..64 messages, ITCH-like length mix.
+            let n = (rng.next_u64() % 64) as usize;
+            let mut stream = Vec::new();
+            for _ in 0..n {
+                let msg_len = match rng.next_u64() % 10 {
+                    0 => 0,
+                    1 => (rng.next_u64() % 64) as usize,
+                    2 => 1 + (rng.next_u64() % 63) as usize,
+                    3 => 64 + (rng.next_u64() % 192) as usize,
+                    _ => 8 + (rng.next_u64() % 56) as usize,
+                };
+                stream.extend_from_slice(&(msg_len as u16).to_be_bytes());
+                stream.extend(std::iter::repeat_n(0x77u8, msg_len));
+            }
+            // Occasionally append a truncated tail (claims more than
+            // remains) or a 1-byte tail — both are terminal for the walk.
+            match rng.next_u64() % 8 {
+                0 => stream.extend_from_slice(&600u16.to_be_bytes()),
+                1 => stream.push(0xEE),
+                _ => {}
+            }
+            // Non-zero initial accumulator (the across-frame chaining
+            // case — the driver folds INTO a carried acc).
+            let acc0 = rng.next_u64();
+            let mut sink_vec = acc0;
+            let c_vec = spec_slice_ingest(&stream, &mut sink_vec);
+            // The legacy sequential fold, verbatim.
+            let mut expect_count = 0u64;
+            let mut acc = acc0;
+            let mut p = 0usize;
+            while p + 2 <= stream.len() {
+                let l = u16::from_be_bytes([stream[p], stream[p + 1]]) as usize;
+                let next = p + 2 + l;
+                if next > stream.len() {
+                    break;
+                }
+                expect_count += 1;
+                acc = acc.rotate_left(7) ^ (l as u64);
+                p = next;
+            }
+            assert_eq!(c_vec, expect_count, "count drift on stream {i}");
+            assert_eq!(sink_vec, acc, "affine sink-fold drift on stream {i}");
+        }
+    }
+
+    /// R24 Track 3, law 2: the batch fold composes across BATCH
+    /// boundaries exactly (k < 16 tails, multi-batch streams, the
+    /// 16-boundary itself).
+    #[test]
+    fn t15_spec_ingest_batch_boundary_law() {
+        // Exactly 16, 17, 31, 32, 33 fixed-length messages: the batch
+        // splits land on the boundary and inside.
+        for n in [0usize, 1, 15, 16, 17, 31, 32, 33, 64, 100] {
+            let mut stream = Vec::new();
+            for j in 0..n {
+                stream.extend_from_slice(&(j as u16).to_be_bytes());
+                stream.extend(std::iter::repeat_n(0x33u8, j));
+            }
+            let mut sink_vec = 0x0123_4567_89AB_CDEFu64;
+            let mut sink_seq = 0x0123_4567_89AB_CDEFu64;
+            let c = spec_slice_ingest(&stream, &mut sink_vec);
+            let mut acc = sink_seq;
+            let mut p = 0usize;
+            let mut ec = 0u64;
+            while p + 2 <= stream.len() {
+                let l = u16::from_be_bytes([stream[p], stream[p + 1]]) as usize;
+                if p + 2 + l > stream.len() {
+                    break;
+                }
+                ec += 1;
+                acc = acc.rotate_left(7) ^ (l as u64);
+                p += 2 + l;
+            }
+            sink_seq = acc;
+            assert_eq!(c, ec, "count at n={n}");
+            assert_eq!(sink_vec, sink_seq, "fold at n={n}");
+        }
     }
 }

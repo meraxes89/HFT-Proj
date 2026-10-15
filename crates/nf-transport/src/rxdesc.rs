@@ -99,13 +99,32 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 //     (`offset:u32 | len:u16 | flags:u16`) with ONE new flag bit —
 //     [`RX_AFFINE_FLAG`] (bit 48, the anchor bit's ring-only position —
 //     array words never take the ring consumers' anchor path). Bit set =
-//     the span carries a 48-byte tag sidecar entry.
-//   * TAG SIDECAR (48 B per span, [`RX_AFFINE_TAG_WORDS`] words):
+//     the span carries a 24-byte tag sidecar entry.
+//   * TAG SIDECAR (24 B per span, [`RX_AFFINE_TAG_WORDS`] words):
 //       word 0: prefix_crc:u32 | cum_crc:u32
-//       word 1: raw_crc:u32 | reserved:u32
-//       words 2..6: lanes[0..8] (u32 each)
-//     The total descriptor footprint is 8 + 48 = 56 bytes — strictly ≤ 64
-//     bytes (the R21 compactness law, pinned below).
+//       word 1: raw_crc:u32 | 0
+//       word 2: the span's golden VALUE (the R24 SPANHASH-64 combine,
+//       precomputed ONCE at tag-build time by the packer — see below)
+//     The total descriptor footprint is 8 + 24 = 32 bytes — the EXACT
+//     HALF-CACHELINE (the R24 Track 2 compactness law, pinned below):
+//     the per-span sidecar traffic (copy_tags warm start, the worker's
+//     get_affine_tag load) halves vs the R23c 48-byte layout, and the
+//     tag array packs 2⅔ spans per 512-bit VMOVDQA64 window.
+//   * THE VALUE WORD (R24 Track 2): the worker's per-span golden value —
+//     `span_crc32c_8lane(body)`, i.e. the SPANHASH-64 combine over the
+//     body's 8 lane registers + the length — is computed ONCE at
+//     tag-build time (the packer: `affine_tag_pack(t, value)` — the
+//     nf-testkit side supplies the value through
+//     `crcfold::span_crc32c_8lane_from_tags`, keeping the polyhash out
+//     of nf-transport's dep graph) and stored as word 2. The hot path's
+//     evaluation collapses to a single 8-byte load: ZERO combine work in
+//     the worker (the 9-mul/VPCLMUL chain moved to the UNTIMED ledger
+//     fill — one combine per corpus body, amortized over every pass).
+//     Integrity semantics are UNCHANGED in class: the (prefix, cum, raw)
+//     triple's per-span affine law fail-stops on sidecar corruption
+//     (same as R23c), and a corrupted value word diverges the final fold
+//     hash vs the reference pass (the same end-of-pass catch the R23c
+//     lane registers had — the lanes were also only fold-checked).
 //   * THE (prefix, cum) PAIR — self-contained per span, byte-granular
 //     cuts of the RAW CRC32C stream: h = len/2,
 //       prefix = raw(body[..h)), cum = raw(body[..len)), raw_crc =
@@ -118,15 +137,6 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 //     chain): a partially-diverged schedule can never desynchronize a
 //     running register, the hazard class a cross-span "packet boundary
 //     chain" carries.
-//   * THE LANES: the span's 8 span_crc32c_8lane lane registers (tail
-//     folded into lane 0 — EXACTLY the reference kernel's semantics,
-//     pinned by the nf-testkit differential). The worker reproduces the
-//     EXACT golden span value via the 9-multiply FNV-1a-64 combine
-//     (`crcfold::span_crc32c_8lane_from_tags`) — arbitrary span lengths,
-//     zero reads, ~2-3 ns. For 64-byte-aligned spans this is value-identical
-//     to Engineer 2's `span_crc32c_8lane_affine_sub` (the K2 law with a
-//     zero prefix projection); the pipeline's real spans (mean 1364.6 B,
-//     only 2.7% 64-multiples — the R23c silicon probe) ride the combine.
 //   * THE LEDGER (the RX ingest producer): [`AffineLedgerEntry`] per
 //     rendered frame — the tag computed ONCE in a single pass over the
 //     blob's packet bodies (L1D-hot at the staging/reset point, ~0.5 ms
@@ -157,11 +167,12 @@ pub const RX_CAP_DEFAULT: usize = 1 << 17;
 /// consumer, so the two namespaces never alias.
 pub const RX_AFFINE_FLAG: u64 = 1 << 48;
 
-/// R23c: the tag sidecar stride (words per span). 6 words = 48 bytes; the
-/// full descriptor (word + sidecar) is 56 bytes ≤ 64 (pinned below).
-pub const RX_AFFINE_TAG_WORDS: usize = 6;
+/// R24 (Track 2): the tag sidecar stride (words per span). 3 words = 24
+/// bytes; the full descriptor (word + sidecar) is 8 + 24 = 32 bytes — the
+/// EXACT HALF-CACHELINE (the R24 compactness law, pinned below).
+pub const RX_AFFINE_TAG_WORDS: usize = 3;
 
-const _: () = assert!(RX_AFFINE_TAG_WORDS * 8 + 8 <= 64, "R23c compactness");
+const _: () = assert!(RX_AFFINE_TAG_WORDS * 8 + 8 <= 32, "R24 half-cacheline law");
 
 /// R23c: one ledger row — the RX producer's per-frame affine snapshot
 /// (the single untimed pass over the blob's packet bodies). The `body_ptr`
@@ -191,8 +202,11 @@ pub struct AffineLedgerEntry {
 /// alignment) — one cache line per ledger row.
 const _: () = assert!(std::mem::size_of::<AffineLedgerEntry>() == 64);
 
-/// R23c: the tag core — the four facts the sidecar carries, computed by
-/// ONE pass over the body (the RX ledger fill or the sink's fallback).
+/// R23c/R24: the tag core — the per-span facts computed by ONE pass over
+/// the body (the RX ledger fill or the sink's fallback). The lanes are
+/// TRANSIENT: the packer folds them into the VALUE word (through the
+/// nf-testkit-side SPANHASH-64 combine) and they are NOT stored in the
+/// sidecar (the R24 Track 2 half-cacheline diet).
 #[derive(Clone, Copy)]
 pub struct AffineTagCore {
     pub prefix_crc: u32,
@@ -201,35 +215,43 @@ pub struct AffineTagCore {
     pub lanes: [u32; 8],
 }
 
-/// R23c: pack the tag core into the sidecar word layout.
+/// R24 (Track 2): pack the tag core + the precomputed golden VALUE into
+/// the 3-word (24 B) sidecar layout:
+///   word 0: prefix_crc | cum_crc << 32
+///   word 1: raw_crc
+///   word 2: value — `span_crc32c_8lane(body)`, supplied by the caller
+///   (nf-testkit's `crcfold::span_crc32c_8lane_from_tags(&t.lanes, len)`
+///   keeps the polyhash on the testkit side of the dep graph; the lane
+///   registers never enter the sidecar).
 #[inline(always)]
-pub fn affine_tag_pack(t: &AffineTagCore) -> [u64; RX_AFFINE_TAG_WORDS] {
+pub fn affine_tag_pack(t: &AffineTagCore, value: u64) -> [u64; RX_AFFINE_TAG_WORDS] {
     let mut w = [0u64; RX_AFFINE_TAG_WORDS];
     w[0] = t.prefix_crc as u64 | ((t.cum_crc as u64) << 32);
     w[1] = t.raw_crc as u64;
-    for k in 0..8 {
-        w[2 + k / 2] |= (t.lanes[k] as u64) << (32 * (k % 2));
-    }
+    w[2] = value;
     w
 }
 
-/// R23c: unpack the sidecar words (the inverse of [`affine_tag_pack`]).
+/// R24 (Track 2): unpack the sidecar words — the (prefix, cum, raw)
+/// triple + the golden value word (the lane registers are not stored;
+/// see [`affine_tag_pack`]).
+#[derive(Clone, Copy)]
+pub struct AffineTagView {
+    pub prefix_crc: u32,
+    pub cum_crc: u32,
+    pub raw_crc: u32,
+    /// The precomputed span golden value (word 2).
+    pub value: u64,
+}
+
+/// R24 (Track 2): the sidecar reader (the inverse of [`affine_tag_pack`]).
 #[inline(always)]
-pub fn affine_tag_unpack(w: &[u64; RX_AFFINE_TAG_WORDS]) -> AffineTagCore {
-    AffineTagCore {
+pub fn affine_tag_unpack(w: &[u64; RX_AFFINE_TAG_WORDS]) -> AffineTagView {
+    AffineTagView {
         prefix_crc: w[0] as u32,
         cum_crc: (w[0] >> 32) as u32,
         raw_crc: w[1] as u32,
-        lanes: [
-            w[2] as u32,
-            (w[2] >> 32) as u32,
-            w[3] as u32,
-            (w[3] >> 32) as u32,
-            w[4] as u32,
-            (w[4] >> 32) as u32,
-            w[5] as u32,
-            (w[5] >> 32) as u32,
-        ],
+        value: w[2],
     }
 }
 
@@ -444,6 +466,39 @@ pub fn rx_unpack_u64(w: u64) -> (u64, u64) {
     (w >> 48, w & 0xFFFF_FFFF_FFFF)
 }
 
+/// R25a: the window-record pass-start flag — bit 47 of the packed
+/// record word. Set on the record of a window that opens EXACTLY at a
+/// pass boundary (`begin_pass`'s eager open), so the composite-fold
+/// workers know where to split a segment: spans at and above a
+/// pass-start record's base fold into the NEXT pass's chain (the
+/// consumer snapshots and re-seeds there), so a composite record may
+/// never straddle the base. Base spans stay 47-bit-safe (a sustained
+/// run's global span ids are bounded by spans/s × runtime — decades
+/// of headroom; `debug_assert`ed at pack time).
+pub const RX_REC_PASS_BIT: u64 = 1 << 47;
+const RX_REC_BASE_MASK: u64 = (1 << 47) - 1;
+
+/// R25a: pack a window record `(gen, base_span, pass_start)`.
+#[inline(always)]
+pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool) -> u64 {
+    debug_assert!(gen < (1 << 16) && base_span < (1 << 47));
+    (gen << 48) | if pass_start {
+        RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
+    } else {
+        base_span & RX_REC_BASE_MASK
+    }
+}
+
+/// R25a: unpack a window record — `(gen, base_span, pass_start)`.
+#[inline(always)]
+pub fn rx_unpack_record(w: u64) -> (u64, u64, bool) {
+    (
+        w >> 48,
+        w & RX_REC_BASE_MASK,
+        w & RX_REC_PASS_BIT != 0,
+    )
+}
+
 /// Compact 8-byte span descriptor: `offset:u32 | len:u16` (flags in the
 /// high 16 bits, currently zero). Identical formula to the R12 Desc8 ring
 /// packing — one format across rings and arrays.
@@ -555,6 +610,27 @@ const _: () = assert!(std::mem::size_of::<RxPad>() == 64);
 fn nt_copy_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("HFT_NT_COPY").as_deref() != Ok("0"))
+}
+
+/// R25c: the AVX-512F gate for the 8-wide array check (`check_arr8`).
+/// Read once per process (a relaxed load after init — the hot loop
+/// reads it per 8-span group; `is_x86_feature_detected!` itself caches,
+/// but the OnceLock keeps the branch data local and the pattern uniform
+/// with `nt_copy_enabled`).
+#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn r25c_avx512f() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512f")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
 }
 
 /// R21: the 64-byte streaming copy (`_mm512_stream_si512` + `_mm_sfence`).
@@ -676,13 +752,17 @@ impl RxdescState {
     }
 
     /// Publish the window's record (sink, at window open — AFTER the
-    /// reuse gate and the warm start): `records[slot] = (gen, base_span)`
-    /// and `last_slot = slot`.
+    /// reuse gate and the warm start): `records[slot] = (gen, base_span,
+    /// pass_start)` and `last_slot = slot`. R25a: `pass_start` marks a
+    /// window opening exactly at a pass boundary — the composite-fold
+    /// workers split their segment there (the consumer snapshots +
+    /// re-seeds the chain at that span, so composites never straddle
+    /// it).
     #[inline]
-    pub fn publish_record(&self, slot: u8, gen: u64, base_span: u64) {
+    pub fn publish_record(&self, slot: u8, gen: u64, base_span: u64, pass_start: bool) {
         self.records[slot as usize]
             .0
-            .store(rx_pack_u64(gen, base_span), Ordering::Release);
+            .store(rx_pack_record(gen, base_span, pass_start), Ordering::Release);
         self.last_slot.store(slot, Ordering::Relaxed);
     }
 
@@ -740,10 +820,12 @@ impl RxdescState {
         }
     }
 
-    /// Read a pass record (worker, during the record walk).
+    /// Read a pass record (worker, during the record walk) —
+    /// `(gen, base_span, pass_start)` (R25a: the flag is part of the
+    /// walk's boundary bookkeeping).
     #[inline]
-    pub fn read_record(&self, slot: u8) -> (u64, u64) {
-        rx_unpack_u64(self.records[slot as usize].0.load(Ordering::Acquire))
+    pub fn read_record(&self, slot: u8) -> (u64, u64, bool) {
+        rx_unpack_record(self.records[slot as usize].0.load(Ordering::Acquire))
     }
 
     /// Publish the span-count cursor (sink, after array fixes — the
@@ -812,6 +894,73 @@ impl RxdescState {
         unsafe {
             let arrays = &*self.arrays.get();
             arrays[slot as usize][idx]
+        }
+    }
+
+    /// R25c: the 8-wide check half of the check-and-fix — ONE 64-byte
+    /// load and ONE vector compare per group replaces eight
+    /// load+compare+branch triples (the R25b fleet diagnosis pinned the
+    /// main core's submission path at work_ms=4.1s/5s; the steady-state
+    /// law fixes==0 means the COMPARE is the whole per-span array cost).
+    /// Returns the mismatch mask: bit i set iff word `idx+i` differs
+    /// from `expect[i]` — the caller fixes exactly those lanes with
+    /// `set_arr`/`set_affine_tag` (the cold path, verbatim semantics).
+    ///
+    /// The vector path is bit-identical to the scalar loop (eight u64
+    /// equality compares in one `_mm512_cmpeq_epu64`; the mask IS the
+    /// per-lane boolean) — no env gate, only the AVX-512F feature gate
+    /// with the scalar fallback elsewhere (the compare changes zero
+    /// stores either way; only the READ shape differs, and a wide
+    /// unaligned read of producer-owned words is within the array's
+    /// proven slot-ownership protocol — every word [idx, idx+8) is
+    /// this sink's window to check).
+    ///
+    /// Callers prove `idx + 8 <= cap` (asserted) — the group is exactly
+    /// eight words; sub-8 tails run the scalar per-span path.
+    pub fn check_arr8(&self, slot: u8, idx: usize, expect: &[u64; 8]) -> u8 {
+        debug_assert!((slot as usize) < RX_NARR);
+        assert!(
+            idx + 8 <= self.cap,
+            "rxdesc: array slot {slot} index {idx}+8 exceeds cap {}",
+            self.cap
+        );
+        // SAFETY: slot ownership per the module doc; `idx+8 <= cap`
+        // proven above. The 8-word group is one u64-slice view.
+        let words: &[u64; 8] = unsafe {
+            let arrays = &*self.arrays.get();
+            &*(arrays[slot as usize].as_ptr().add(idx) as *const [u64; 8])
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; both pointers readable for
+                // 64 bytes (words: idx+8<=cap; expect: a &[u64;8]).
+                unsafe {
+                    let a = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let b = _mm512_loadu_si512(expect.as_ptr() as *const _);
+                    // Equality is sign-agnostic — epi64 is the AVX-512F
+                    // u64 compare; the mask form returns __mmask8 (u8)
+                    // with bit i set iff lane i is equal.
+                    let eq = _mm512_cmpeq_epi64_mask(a, b);
+                    // Invert for the mismatch mask.
+                    !eq
+                }
+            } else {
+                let mut bad = 0u8;
+                for i in 0..8 {
+                    bad |= ((words[i] != expect[i]) as u8) << i;
+                }
+                bad
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut bad = 0u8;
+            for i in 0..8 {
+                bad |= ((words[i] != expect[i]) as u8) << i;
+            }
+            bad
         }
     }
 

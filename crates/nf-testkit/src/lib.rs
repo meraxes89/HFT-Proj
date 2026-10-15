@@ -8,6 +8,8 @@ pub mod crcfold;
 pub mod fakeserver;
 pub mod golden;
 pub mod hydra;
+pub mod lobstate;
+pub mod polyhash;
 pub mod reference;
 pub mod sched;
 pub mod sink;

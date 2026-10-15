@@ -341,7 +341,10 @@ impl TopologyVerdict {
 pub fn verify_pair_topology(main_cpu: usize, rx_cpu: usize) -> TopologyVerdict {
     if main_cpu == rx_cpu {
         return TopologyVerdict::Violated(format!(
-            "main and rx both on cpu{main_cpu} (same core, no pipeline overlap)"
+            "main and rx both on cpu{main_cpu} (R25b scalars-stacked — the \
+             intentional 2-worker 2-core SMT shape: the RX leaves worker 1's \
+             sibling at the cost of pipeline overlap; docs/39 §4. \
+             HFT_FABRIC_PLACE=distinct restores the Task-4 overlap)"
         ));
     }
     // Distinct physical cores: rx must not sit in main's SMT sibling group.
@@ -522,23 +525,28 @@ pub fn fabric_placement(workers: usize) -> (Option<usize>, Option<usize>, Vec<us
     match std::env::var("HFT_FABRIC_PLACE").as_deref() {
         Ok("siblings") => fabric_placement_siblings(workers),
         Ok("distinct") => fabric_placement_distinct(workers),
+        Ok("scalars_stacked") => fabric_placement_scalars_stacked(workers),
         _ => {
-            // R16d: THE DEFAULT FLIP for the 2-physical-core SMT draws
-            // (the 8573C/8370C 4-vCPU shape). The R8 default stacked BOTH
-            // workers on one physical core's hyperthreads, capping their
-            // combined fold at the kbench `2cpu_smt` ceiling (~32.8 GB/s)
-            // while the `2cpu_distinct` pool (~61 GB/s) sat unused — and
-            // the R11 `distinct` experiment proved the system main-bound
-            // (workers folded +15% more spans, sustained flat). R16b's
-            // array-driven submission (rxdesc) removes the main-side wall;
-            // with it, workers on DISTINCT physical cores is the correct
-            // default — the scalar threads (main, RX) become the SMT
-            // siblings, stealing issue slots from one worker each instead
-            // of stacking both folders on one core. Every other shape
-            // (≥3 workers, non-SMT hosts, ≥4 physical cores) keeps the
-            // R8 default — the flip is exactly the 2-worker 2-core SMT
-            // case the 2B target runs on. HFT_FABRIC_PLACE=siblings is
-            // the rollback (CI arm 11k).
+            // R16d: THE DEFAULT for the 2-physical-core SMT draws (the
+            // 8573C/8370C/9V45 4-vCPU shape): workers on DISTINCT physical
+            // cores; the scalar threads (main, RX) take the leftover SMT
+            // siblings — main on cpu1, RX on cpu3, each scalar sharing a
+            // physical core with exactly one worker.
+            //
+            // R25b POSTMORTEM (the fleet refuted the stack — run 38702884119,
+            // 29 target-silicon shards, paired same-shard deltas): the
+            // scalars_stacked experiment (main+rx BOTH on cpu1, worker 1's
+            // sibling idle) measured **−32.5% median** (min −35.6%, max
+            // −29.2%, ALL shards negative). The system is MAIN-BOUND, not
+            // worker-SMT-bound: stacking main (~90% busy) + rx (~28%)
+            // timeshares one logical cpu at ~118% combined demand — main
+            // loses ~a quarter of its own throughput, and the RX sits in
+            // main's critical loop (next_batch), compounding the stall.
+            // The RX's SMT residency on cpu3 costs worker 1 ~10-15% of ONE
+            // worker — the cheaper theft by far. `HFT_FABRIC_PLACE=
+            // scalars_stacked` stays armed as the counterfactual instrument
+            // (CI arm 11smt); the Run-500+ diagnosis's hyperthread-trap
+            // hypothesis is priced and REJECTED on this fleet.
             let n_phys = physical_core_count();
             let order = cpu_order();
             let smt = !order.is_empty() && order.len() > n_phys.max(1);
@@ -549,6 +557,37 @@ pub fn fabric_placement(workers: usize) -> (Option<usize>, Option<usize>, Vec<us
             }
         }
     }
+}
+
+/// R25b (REFUTED — kept as the counterfactual instrument): workers on
+/// DISTINCT physical cores; main AND rx STACKED on the leftover SMT
+/// sibling (cpu1 on the 4-vCPU draws: sibling pairs 0-1/2-3, workers
+/// (0, 2)). The hypothesis — the RX ingest thread on worker 1's sibling
+/// (cpu3) robs the worker, so stacking the scalars frees a full physical
+/// core — priced at **−32.5% median** across 29 target-silicon shards
+/// (run 38702884119, paired same-shard): the stack timeshares main
+/// (~90% busy) + rx (~28%) on one logical cpu, throttling the MAIN core
+/// (the system's binding constraint) by ~a quarter, and the RX in main's
+/// critical loop compounds the stall. NEVER the default; armed only via
+/// `HFT_FABRIC_PLACE=scalars_stacked` (CI arm 11smt) so the fleet can
+/// re-price it on future silicon (e.g. ≥3 physical cores, where the
+/// tradeoff shape differs).
+fn fabric_placement_scalars_stacked(workers: usize) -> (Option<usize>, Option<usize>, Vec<usize>) {
+    let order = cpu_order(); // distinct-physical representatives FIRST
+    if order.is_empty() {
+        return (None, None, Vec::new());
+    }
+    // Workers: one per physical core by construction (as `distinct`).
+    let wcpus: Vec<usize> = (0..workers).map(|i| order[i % order.len()]).collect();
+    // The scalars: BOTH on the first leftover (the representative's SMT
+    // sibling, trailing in `order`).
+    let rest: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|c| !wcpus.contains(c))
+        .collect();
+    let main = rest.first().copied();
+    (main, main, wcpus) // rx == main: the STACK
 }
 
 /// R11: workers on DISTINCT physical cores first; main and rx take the
@@ -650,10 +689,12 @@ mod fabric_placement_tests {
     #[test]
     fn t_fabric_placement_no_worker_on_main_sibling_when_possible() {
         let (main, rx, workers) = fabric_placement(2);
-        if let (Some(m), Some(r)) = (main, rx) {
-            assert_ne!(m, r);
-        }
-        // On multi-core hosts, workers must not land on main's cpu.
+        // R25b: the stacked experiment (rx == main) is REFUTED and
+        // never the default (see `fabric_placement_scalars_stacked`);
+        // the default distinct layout keeps rx off main's cpu. The
+        // invariant that matters on EVERY shape: no worker pinned on
+        // the main thread's own cpu when the topology has room.
+        let _ = rx;
         if let Some(m) = main {
             for w in &workers {
                 if crate::affinity::cpu_order().len() > 2 {
