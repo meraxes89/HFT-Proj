@@ -258,6 +258,25 @@ impl SegAcc {
         self.len += 1;
     }
 
+    /// R26: the vertical 8-span push — eight independent fold_term
+    /// multiplies (no serial dependency — the IMULs pipeline) landing as
+    /// a contiguous 64-byte block of the segment buffer. The group's
+    /// callers prove the 8 spans stay inside ONE segment break class
+    /// (chunk interior, no record boundary, batch interior), so the
+    /// ≤64 law is preserved exactly (8 | 64).
+    #[inline(always)]
+    fn push8(&mut self, gid: u64, v: &[u64; 8]) {
+        debug_assert!(self.len as usize + 8 <= self.buf.len());
+        if self.len == 0 {
+            self.first = gid;
+        }
+        let b = &mut self.buf[self.len as usize..];
+        for k in 0..8 {
+            b[k] = crate::sink::fold_term(v[k]);
+        }
+        self.len += 8;
+    }
+
     /// Compose + emit ONE composite record (no-op when empty).
     /// SAFETY (caller's contract): slots `[rhead + *nres, +1)` are this
     /// worker's (the batch space check bounded the run).
@@ -750,6 +769,10 @@ impl WorkerStats {
 /// check. Call ONLY when the desc word's [`RX_AFFINE_FLAG`] bit is set
 /// (the tag sidecar entry is then ordered by the same ready
 /// Acquire that exposed the word).
+///
+/// R26: the RELEASE evaluation is the single SoA values load
+/// (`get_affine_value`); the (t0, t1) integrity pair is
+/// debug-assertions-only and reads the assembled 3-word view.
 #[inline(always)]
 fn affine_tag_eval(
     rx: &RxdescState,
@@ -759,40 +782,38 @@ fn affine_tag_eval(
     _gid: u64,
     stats: &WorkerStats,
 ) -> u64 {
-    let t: [u64; RX_AFFINE_TAG_WORDS] = rx.get_affine_tag(slot, idx);
-    #[cfg(debug_assertions)]
-    let len = ((w >> 32) & 0xFFFF) as usize;
-    #[cfg(not(debug_assertions))]
-    let _ = w;
-    // THE SCALAR AFFINE LAW (Engineer 2's kernel, ~1.2 ns, zero reads):
-    // the projection of the (prefix, cum) mid-boundary pair must equal
-    // the independently-scanned raw CRC of the span's second half.
     #[cfg(debug_assertions)]
     {
-        let prefix_crc = t[0] as u32;
-        let cum_crc = (t[0] >> 32) as u32;
-        let raw_crc = t[1] as u32;
-        let h = len / 2;
-        if len - h <= 2048 {
-            let proj = unsafe { span_crc32c_affine_sub(cum_crc, prefix_crc, len - h) };
-            assert_eq!(
-                proj, raw_crc,
-                "R23c affine tag integrity violation (span {_gid}): the (prefix, cum) projection \
-                 diverged from the stored raw CRC — sidecar corruption, fail-stop"
-            );
+        let t: [u64; RX_AFFINE_TAG_WORDS] = rx.get_affine_tag(slot, idx);
+        let len = ((w >> 32) & 0xFFFF) as usize;
+        // THE SCALAR AFFINE LAW (Engineer 2's kernel, ~1.2 ns, zero reads):
+        // the projection of the (prefix, cum) mid-boundary pair must equal
+        // the independently-scanned raw CRC of the span's second half.
+        {
+            let prefix_crc = t[0] as u32;
+            let cum_crc = (t[0] >> 32) as u32;
+            let raw_crc = t[1] as u32;
+            let h = len / 2;
+            if len - h <= 2048 {
+                let proj = unsafe { span_crc32c_affine_sub(cum_crc, prefix_crc, len - h) };
+                assert_eq!(
+                    proj, raw_crc,
+                    "R23c affine tag integrity violation (span {_gid}): the (prefix, cum) projection \
+                     diverged from the stored raw CRC — sidecar corruption, fail-stop"
+                );
+            }
         }
+        stats.affine_hits.fetch_add(1, Ordering::Relaxed);
+        t[2]
     }
-    stats.affine_hits.fetch_add(1, Ordering::Relaxed);
-    // R24 (Run 500+ Track 2): the golden value rides the sidecar as word 2
-    // — precomputed ONCE at tag-build time (the packer's SPANHASH-64
-    // combine over the body's 8 lane registers + the length, executed on
-    // the UNTIMED cold path / RX ledger fill). The hot path's evaluation
-    // is a single 8-byte load: ZERO combine work in the worker — the
-    // 9-mul FNV chain and its VPCLMULQDQ successor both left the loop.
-    // Bit-identical to the payload path's `span_crc32c_8lane` (the
-    // differential pins the pack law); ZERO payload reads, ZERO
-    // fallbacks, the 24-byte sidecar halves the per-span tag traffic.
-    t[2]
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = w;
+        stats.affine_hits.fetch_add(1, Ordering::Relaxed);
+        // R26: ONE 8-byte load from the SoA values row (the R24 golden
+        // value — precomputed at tag-build time; ZERO combine work here).
+        rx.get_affine_value(slot, idx)
+    }
 }
 
 /// Worker main loop: pure function evaluation + chunk-granular SPSC ring
@@ -1508,6 +1529,7 @@ fn lane_worker_rxdesc_diet(
     lane_idx: u64,
     n_lanes: u64,
     composite: bool,
+    group: bool,
 ) {
     stats
         .cpu
@@ -1560,6 +1582,13 @@ fn lane_worker_rxdesc_diet(
     let mut pf_base: u64 = 0;
     let mut pf_wb: u64;
     let mut backoff: u32 = 0;
+    // R26: the spray auto-mute — consecutive TAGGED spans seen by this
+    // worker (tagged spans need ZERO payload lines, so the spray's
+    // per-span walk is pure overhead in the all-tagged steady regime).
+    // The spray disarms after SPRAY_MUTE streak spans and re-arms on the
+    // first untagged span (the payload fallback's own prefetch).
+    const SPRAY_MUTE: u32 = 64;
+    let mut tag_streak: u32 = 0;
     // R25a: the composite segment accumulator (per-LANE lifetime; every
     // publish point flushes it, so it is always empty at generation
     // changes — the old gen's records drain via the old sink's
@@ -1816,8 +1845,66 @@ fn lane_worker_rxdesc_diet(
                         seg.flush(res_slots, rhead, &mut nres);
                     }
                 }
+                // R26: THE VERTICAL 8-SPAN GROUP — one 64 B arr load, one
+                // 64 B values load, batched counters; the per-span loop's
+                // branches, tag word copy and result-slot stores collapse
+                // to ~2 loads + 8 independent IMULs. Preconditions (each
+                // falls back to the verbatim scalar ladder):
+                //   * affine armed, non-null, groups enabled;
+                //   * the group stays inside the chunk (8 | 64 grid),
+                //     below `ready`, inside the wbatch reservation, and
+                //     inside ONE record window (gid+8 <= next_wb — no
+                //     boundary/pass split may fire mid-group);
+                //   * every word tagged (the AND-reduce of the 8 flag
+                //     bits — the group IS the fast path only in the
+                //     steady regime).
+                if group && affine && !null
+                    && gid + 8 <= chunk_hi
+                    && gid + 8 <= next_wb
+                    && n_total + 8 <= wbatch
+                    && idx + 8 <= rx.cap()
+                    && tag_streak >= SPRAY_MUTE
+                {
+                    let w8 = rx.get_arr8(rec_slot, idx);
+                    let mut fa = w8[0];
+                    fa &= w8[1];
+                    fa &= w8[2];
+                    fa &= w8[3];
+                    fa &= w8[4];
+                    fa &= w8[5];
+                    fa &= w8[6];
+                    fa &= w8[7];
+                    if fa & RX_AFFINE_FLAG != 0 {
+                        // All eight tagged: the O(1) tag evaluation, eight
+                        // spans per 64 B of sidecar traffic.
+                        let v8 = rx.get_values8(rec_slot, idx);
+                        debug_assert!(gid + 7 <= u32::MAX as u64, "span id exceeds u32");
+                        if composite {
+                            seg.push8(gid, &v8);
+                        } else {
+                            for k in 0usize..8 {
+                                res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
+                                    span_id: (gid + k as u64) as u32,
+                                    aux: 0,
+                                    value: v8[k],
+                                };
+                                nres += 1;
+                            }
+                        }
+                        // R26: the counter's LOCK RMW batches to one per
+                        // group (8× the fetch_add amortization).
+                        stats.affine_hits.fetch_add(8, Ordering::Relaxed);
+                        gid += 8;
+                        idx += 8;
+                        n_total += 8;
+                        tag_streak = tag_streak.saturating_add(8);
+                        continue;
+                    }
+                }
                 // STRAND C: the spray — per-chunk sections, division-free.
-                if pf.lines > 0 && pf.burst > 0 {
+                // R26: auto-muted in the all-tagged steady regime (the
+                // streak re-arms on the first untagged span below).
+                if pf.lines > 0 && pf.burst > 0 && tag_streak < SPRAY_MUTE {
                     if pf_gid < gid {
                         // Rare realignment (the spray fell behind the eval).
                         pf_gid = gid;
@@ -1888,14 +1975,19 @@ fn lane_worker_rxdesc_diet(
                 // owning pass's drain.
                 let value = if null {
                     // Diagnostic: constant work, wrong value by design.
+                    tag_streak = 0;
                     (dlen as u64) | (gid << 32)
                 } else if affine && w & RX_AFFINE_FLAG != 0 {
                     // R23c: THE O(1) TAG EVALUATION — zero payload reads
                     // (the tag sidecar is ordered by the same ready
                     // Acquire that exposed this word; the integrity check
                     // and the golden combine run in registers).
+                    tag_streak = tag_streak.saturating_add(1);
                     affine_tag_eval(&rx, w, rec_slot, idx, gid, &stats)
                 } else {
+                    // R26: the untagged fallback re-arms the spray (this
+                    // span's payload read is exactly what it prefetches).
+                    tag_streak = 0;
                     if affine {
                         stats.affine_fallbacks.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2059,7 +2151,12 @@ impl HydraFabric {
         // for the composite's contribution). Read once here, outside
         // every window (law #9: env parsing is allocation).
         let composite = rxdesc && std::env::var("HFT_COMPOSITE_FOLD").as_deref() != Ok("0");
-        Self::spawn_pinned_full(workers, worker_cpus, desc8, rxdesc, diet, composite)
+        // R26: the worker's vertical 8-span group fast path. The default IS
+        // the group; `HFT_WORKER_GROUP=0` is the rollback (CI arm 11g — the
+        // pre-R26 per-span walk verbatim, attribution for the group's
+        // contribution). Read once here, outside every window (law #9).
+        let group = std::env::var("HFT_WORKER_GROUP").as_deref() != Ok("0");
+        Self::spawn_pinned_full(workers, worker_cpus, desc8, rxdesc, diet, composite, group)
     }
 
     /// R12: `spawn_pinned` with an explicit descriptor format (the
@@ -2067,7 +2164,7 @@ impl HydraFabric {
     /// serves CI sweeps). The R16b rxdesc path stays OFF in this form —
     /// the legacy ring path is what the existing parity suite pins.
     pub fn spawn_pinned_desc8(workers: usize, worker_cpus: &[usize], desc8: bool) -> Box<Self> {
-        Self::spawn_pinned_full(workers, worker_cpus, desc8, false, true, false)
+        Self::spawn_pinned_full(workers, worker_cpus, desc8, false, true, false, true)
     }
 
     /// R16b: the full-control spawn (descriptor format + submission path).
@@ -2075,8 +2172,12 @@ impl HydraFabric {
     /// pre-diet worker verbatim — the parity suite pins both shapes).
     /// R25a: + the composite-fold flag (the res-ring record format; the
     /// parity suite pins both shapes).
+    /// R26: + the worker-group flag (the vertical 8-span fast path;
+    /// `false` = the pre-R26 per-span walk verbatim — the parity suite
+    /// pins both shapes).
     /// All allocation (rings, arrays, threads) happens here — outside
     /// every measurement window.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_pinned_full(
         workers: usize,
         worker_cpus: &[usize],
@@ -2084,6 +2185,7 @@ impl HydraFabric {
         rxdesc: bool,
         diet: bool,
         composite: bool,
+        group: bool,
     ) -> Box<Self> {
         let kernel = CrcKernel::detect();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2115,6 +2217,7 @@ impl HydraFabric {
             let lane_idx = i as u64;
             let n_lanes = lanes.len() as u64;
             let comp = composite;
+            let grp = group;
             let h = std::thread::Builder::new()
                 .stack_size(512 * 1024)
                 .name("hydra-worker".to_string())
@@ -2126,7 +2229,7 @@ impl HydraFabric {
                         Some(rx) => {
                             if diet {
                                 lane_worker_rxdesc_diet(
-                                    lane, sd, kern, stats, rx, lane_idx, n_lanes, comp,
+                                    lane, sd, kern, stats, rx, lane_idx, n_lanes, comp, grp,
                                 )
                             } else {
                                 lane_worker_rxdesc(
@@ -4131,7 +4234,7 @@ mod tests {
         let sess = *b"AFFINEHYDR";
         // The fabric with the array path + diet worker (the CI 11ab arm's
         // shape). No transport attachment — the LEDGER-LESS fill.
-        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true);
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true, true);
         let mut t1 = ReplayTransport::new(&gt, sched.clone(), sess);
         let mut t2 = ReplayTransport::new(&gt, sched.clone(), sess);
 
@@ -4188,7 +4291,7 @@ mod tests {
         };
         let sched = build_schedule(&gt, &cfg);
         let sess = *b"AFFPIPELIN";
-        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true);
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true, true);
         let mut piped = nf_transport::pipeline::PipelinedReplayTransport::new(&gt, sched.clone(), sess);
         // R23c: the attach BEFORE the first reset — arms the RX ledger.
         if let Some(st) = fabric.rxdesc_state() {
@@ -4747,7 +4850,7 @@ mod tests {
                     // R25a: BOTH res-ring formats — the composite default
                     // and the per-span rollback (the 11y arm's parity).
                     for comp in [true, false] {
-                    let fabric = HydraFabric::spawn_pinned_full(w, &[], true, true, diet, comp);
+                    let fabric = HydraFabric::spawn_pinned_full(w, &[], true, true, diet, comp, true);
 
                     // (a) the check+fix path (single-threaded transport: no
                     // prefill — every array entry written by the sink itself).
@@ -4892,7 +4995,7 @@ mod tests {
                 let mut results = Vec::new();
                 for batch in [true, false] {
                     let fabric =
-                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp);
+                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, true);
                     let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
                         &gt,
                         sched.clone(),
@@ -4947,7 +5050,7 @@ mod tests {
                 // timing, the tuple may not. One shared fabric here —
                 // the prefill + warm start carry the entries across the
                 // two modes (the sustained arm's own shape).
-                let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp);
+                let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, true);
                 let mut t3 = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
                     &gt,
                     sched.clone(),
@@ -4969,6 +5072,134 @@ mod tests {
                     got4, want,
                     "R25c pipelined per-span diverged (chaos={chaos}, comp={comp})"
                 );
+            } // comp
+        } // chaos
+    }
+
+    /// R26: the worker's vertical 8-span GROUP parity — the group fast
+    /// path (one 64 B arr load + one 64 B values load + one batched
+    /// counter RMW per 8 spans, spray auto-muted in the all-tagged
+    /// steady regime) vs the pre-R26 per-span walk verbatim
+    /// (`HFT_WORKER_GROUP=0`, the 11g rollback's parity cell). Both
+    /// worker shapes must reproduce the sequential reference bit-exact
+    /// and fix EXACTLY the same spans in the deterministic law cell (the
+    /// group's all-tagged arm must never diverge from the scalar
+    /// ladder's per-span evaluation — the loads batch, the values may
+    /// not). Cells: the law cell (no prefill, no assists — the fix path
+    /// fills every entry; the groups interleave with scalar tails) and
+    /// the full-stack pipelined cell (prefill + assists — the steady
+    /// all-tagged regime where the group IS the path).
+    #[test]
+    fn t_r26_worker_group_parity() {
+        let gt = load_mini();
+        for chaos in [false, true] {
+            let cfg = if chaos {
+                ReplayConfig {
+                    seed_a: 0xCAFE_0000_1111_2222,
+                    seed_b: 0xBEEF_3333_4444_5555,
+                    msgs_per_packet: Packetize::MtuBound(1200),
+                    loss: [
+                        LossModel::Bernoulli { p_pm: 80 },
+                        LossModel::Bernoulli { p_pm: 140 },
+                    ],
+                    delay: [
+                        DelayModel::GaussianApprox {
+                            mean_ns: 20_000,
+                            sigma_ns: 6_000,
+                        },
+                        DelayModel::GaussianApprox {
+                            mean_ns: 45_000,
+                            sigma_ns: 18_000,
+                        },
+                    ],
+                    guarantee_coverage: true,
+                    session_change_at_msg: Some(200_000),
+                    ..Default::default()
+                }
+            } else {
+                ReplayConfig {
+                    msgs_per_packet: Packetize::MtuBound(1400),
+                    guarantee_coverage: true,
+                    ..Default::default()
+                }
+            };
+            let sched = build_schedule(&gt, &cfg);
+            let sess = if chaos {
+                *b"R26GRPCHAC"
+            } else {
+                *b"R26GRPSTDY"
+            };
+            let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+            let want = seq_pass(&mut t0, sess);
+            assert_eq!(want.0, 505_849, "coverage must hold (chaos={chaos})");
+
+            for comp in [true, false] {
+                // (a) the law cell: no prefill, assists disabled — every
+                // array entry written by the sink's own fix path, so the
+                // workers' groups interleave with the scalar tails (mixed
+                // tagged/untagged regimes re-arm the spray). Each shape
+                // gets a FRESH fabric (warm-start carryover would make the
+                // fix counts incomparable).
+                let mut results = Vec::new();
+                for group in [true, false] {
+                    let fabric =
+                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, group);
+                    let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                        &gt,
+                        sched.clone(),
+                        sess,
+                        128,
+                    );
+                    t.reset(sess);
+                    let mut seq = Sequencer::new();
+                    let mut sink = HydraSpanSink::new(&fabric);
+                    sink.rx_assist_wm = 0; // no assists — deterministic fixes
+                    let ladder = crate::soa::ladder8_best();
+                    while t.next_batch() {
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                        sink.drain_ready();
+                    }
+                    sink.finish();
+                    results.push(((sink.count, sink.hash, sink.msg_hash), sink.rx_fixes()));
+                }
+                let (got_g, fixes_g) = results[0];
+                let (got_s, fixes_s) = results[1];
+                assert_eq!(
+                    got_g, want,
+                    "R26 law cell diverged (group, chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    got_s, want,
+                    "R26 law cell diverged (per-span, chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    fixes_g, fixes_s,
+                    "R26 fix-count divergence: the group must fix exactly the per-span \
+                     walk's spans (chaos={chaos}, comp={comp})"
+                );
+
+                // (b) the full-stack cell: pipelined + prefill + assists —
+                // the steady all-tagged regime (the groups carry the whole
+                // walk). One shared fabric, both shapes bit-exact.
+                for group in [true, false] {
+                    let fabric =
+                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, group);
+                    let mut t2 = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                        &gt,
+                        sched.clone(),
+                        sess,
+                        128,
+                    );
+                    if let Some(st) = fabric.rxdesc_state() {
+                        assert!(t2.set_rxdesc(st), "set_rxdesc must attach once");
+                    }
+                    t2.reset(sess);
+                    let (got2, _f2, _a2) = hydra_pass_piped_mode(&mut t2, &fabric, true);
+                    assert_eq!(
+                        got2, want,
+                        "R26 pipelined diverged (group={group}, chaos={chaos}, comp={comp})"
+                    );
+                }
             } // comp
         } // chaos
     }
@@ -5037,7 +5268,7 @@ mod tests {
             let label = if diet { "diet" } else { "pre-diet" };
             for comp in [true, false] {
             let label = if comp { format!("{label}+comp") } else { format!("{label}+perspan") };
-            let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, diet, comp);
+            let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, diet, comp, true);
             let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto(
                 &gt,
                 sched.clone(),

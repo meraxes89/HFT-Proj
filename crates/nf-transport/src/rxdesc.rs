@@ -174,6 +174,26 @@ pub const RX_AFFINE_TAG_WORDS: usize = 3;
 
 const _: () = assert!(RX_AFFINE_TAG_WORDS * 8 + 8 <= 32, "R24 half-cacheline law");
 
+// ── R26: the SoA sidecar re-derivation ─────────────────────────────────────
+//
+// The R24 layout stored the 3 tag words AoS ([t0, t1, t2] per span —
+// 24 B/span interleaved). The worker's steady evaluation needs ONLY t2
+// (the golden value) in release mode; t0/t1 feed the debug-only integrity
+// law and the cold fix path. AoS forces the hot loop to strided 24 B
+// loads (1⅔ lines per 8 spans, 2 of every 3 loaded words discarded) plus
+// the 3-word slice copy in `get_affine_tag`.
+//
+// R26 splits the sidecar SoA at exactly that seam:
+//   * `tagvals[slot][idx]`     — the golden VALUE, 8 B/span: EIGHT
+//     consecutive spans pack ONE 64-byte line (`get_values8` — a single
+//     512-bit load feeding the vertical 8-span group).
+//   * `tagraws[slot][2*idx+1]` — the (t0, t1) pair, 16 B/span: the cold
+//     integrity/fix path only.
+// The [u64; 3] API (set/get_affine_tag, affine_tag_pack) is PRESERVED
+// verbatim — the split is a storage re-derivation, not a protocol change;
+// the sidecar rides the same slot protocol, warm start and fix paths.
+const _: () = assert!(RX_AFFINE_TAG_WORDS == 3, "R26 SoA split assumes the 3-word pack");
+
 /// R23c: one ledger row — the RX producer's per-frame affine snapshot
 /// (the single untimed pass over the blob's packet bodies). The `body_ptr`
 /// is the frame's span-body ABSOLUTE address (the blob is stable for the
@@ -567,13 +587,18 @@ pub struct RxdescState {
     chunk_state: UnsafeCell<Box<[u64; RX_CHUNK_CAP as usize]>>,
     /// Prefill fixes applied by sinks (telemetry; Relaxed).
     pub fixes: AtomicU64,
-    /// R23c: the affine tag sidecar — RX_NARR arrays of `cap` spans ×
-    /// [`RX_AFFINE_TAG_WORDS`] words each, riding the SAME slot protocol
-    /// as `arrays` (warm-copied at window open; fixed by the sink's
-    /// check-and-fix cold path; read by workers after the ready
-    /// Acquire). EMPTY (cap-0 rows) when the affine mode is disarmed —
-    /// zero cost on the rollback.
-    tags: UnsafeCell<Vec<Box<[u64]>>>,
+    /// R23c: the affine tag sidecar — RX_NARR arrays of `cap` spans, riding
+    /// the SAME slot protocol as `arrays` (warm-copied at window open;
+    /// fixed by the sink's check-and-fix cold path; read by workers after
+    /// the ready Acquire). EMPTY (cap-0 rows) when the affine mode is
+    /// disarmed — zero cost on the rollback.
+    ///
+    /// R26: the sidecar is SoA — `tagvals` (the golden VALUE word, 8 B/span,
+    /// one 64 B line per 8 spans for the vertical group) and `tagraws` (the
+    /// (t0, t1) integrity pair, 16 B/span, cold-path only). The [u64; 3]
+    /// pack API is assembled/disassembled at the boundary.
+    tagvals: UnsafeCell<Vec<Box<[u64]>>>,
+    tagraws: UnsafeCell<Vec<Box<[u64]>>>,
     /// R23c: the RX producer's affine ledger — one [`AffineLedgerEntry`]
     /// per rendered frame, filled ONCE by the RX thread's single pass
     /// over the blob's packet bodies (untimed; attach-allocated). The
@@ -689,9 +714,11 @@ impl RxdescState {
         // R23c: the tag sidecar rides the array protocol only when the
         // affine mode is armed (the process-wide OnceLock gate — read
         // once HERE, at construction, never inside a window). Disarmed:
-        // empty rows, zero footprint.
-        let tag_cap = if rxdesc_affine_enabled() {
-            cap.saturating_mul(RX_AFFINE_TAG_WORDS)
+        // empty rows, zero footprint. R26: SoA rows (values 8 B/span,
+        // raws 16 B/span).
+        let tag_cap = if rxdesc_affine_enabled() { cap } else { 0 };
+        let raw_cap = if rxdesc_affine_enabled() {
+            cap.saturating_mul(2)
         } else {
             0
         };
@@ -700,8 +727,12 @@ impl RxdescState {
             .map(|_| vec![0u64; cap].into_boxed_slice())
             .collect();
         #[allow(clippy::disallowed_types)]
-        let tags: Vec<Box<[u64]>> = (0..RX_NARR)
+        let tagvals: Vec<Box<[u64]>> = (0..RX_NARR)
             .map(|_| vec![0u64; tag_cap].into_boxed_slice())
+            .collect();
+        #[allow(clippy::disallowed_types)]
+        let tagraws: Vec<Box<[u64]>> = (0..RX_NARR)
+            .map(|_| vec![0u64; raw_cap].into_boxed_slice())
             .collect();
         Self {
             arrays: UnsafeCell::new(arrays),
@@ -719,7 +750,8 @@ impl RxdescState {
                     .unwrap(),
             ),
             fixes: AtomicU64::new(0),
-            tags: UnsafeCell::new(tags),
+            tagvals: UnsafeCell::new(tagvals),
+            tagraws: UnsafeCell::new(tagraws),
             ledger: UnsafeCell::new(Box::new([])),
             ledger_len: AtomicU64::new(0),
         }
@@ -1017,8 +1049,9 @@ impl RxdescState {
         rxdesc_affine_enabled()
     }
 
-    /// R23c: write one span's tag (the sink's fix path; the same slot
-    /// ownership protocol as `set_arr`).
+    /// R23c/R26: write one span's tag (the sink's fix path; the same slot
+    /// ownership protocol as `set_arr`). The [u64; 3] pack splits into the
+    /// SoA rows: vals[idx] = t2, raws[2i] = t0, raws[2i+1] = t1.
     #[inline(always)]
     pub fn set_affine_tag(&self, slot: u8, idx: usize, w: &[u64; RX_AFFINE_TAG_WORDS]) {
         debug_assert!((slot as usize) < RX_NARR);
@@ -1031,14 +1064,20 @@ impl RxdescState {
         // SAFETY: slot ownership per the module doc; disjoint access at
         // any instant (RX s+1 / sink s / workers ≤ s).
         unsafe {
-            let tags = &mut *self.tags.get();
-            let base = idx * RX_AFFINE_TAG_WORDS;
-            tags[slot as usize][base..base + RX_AFFINE_TAG_WORDS]
-                .copy_from_slice(w);
+            let vals = &mut *self.tagvals.get();
+            let raws = &mut *self.tagraws.get();
+            if vals.is_empty() || vals[slot as usize].is_empty() {
+                return; // disarmed: the sidecar was never allocated
+            }
+            vals[slot as usize][idx] = w[2];
+            raws[slot as usize][idx * 2] = w[0];
+            raws[slot as usize][idx * 2 + 1] = w[1];
         }
     }
 
-    /// R23c: read one span's tag (workers, after the ready Acquire).
+    /// R23c/R26: read one span's tag (the debug integrity law and the
+    /// parity tests; workers after the ready Acquire) — assembled from
+    /// the SoA rows (the inverse of `set_affine_tag`).
     #[inline(always)]
     pub fn get_affine_tag(&self, slot: u8, idx: usize) -> [u64; RX_AFFINE_TAG_WORDS] {
         debug_assert!((slot as usize) < RX_NARR && idx < self.cap);
@@ -1046,21 +1085,111 @@ impl RxdescState {
         // SAFETY: the entry was published by the sink's ready store (the
         // caller Acquired it); read-only here.
         unsafe {
-            let tags = &*self.tags.get();
-            let base = idx * RX_AFFINE_TAG_WORDS;
-            out.copy_from_slice(
-                &tags[slot as usize][base..base + RX_AFFINE_TAG_WORDS],
-            );
+            let vals = &*self.tagvals.get();
+            let raws = &*self.tagraws.get();
+            if vals.is_empty() || vals[slot as usize].is_empty() {
+                return out; // disarmed
+            }
+            out[0] = raws[slot as usize][idx * 2];
+            out[1] = raws[slot as usize][idx * 2 + 1];
+            out[2] = vals[slot as usize][idx];
         }
         out
     }
 
-    /// R23c: the WARM-START twin for the tag sidecar — copy `n` spans'
+    /// R26: read one span's golden VALUE — the hot-path twin of
+    /// `get_affine_tag` for the worker's steady evaluation (ONE 8-byte
+    /// load from the SoA values row; the (t0, t1) integrity pair is
+    /// debug-cold-path only). Callers prove the entry is published
+    /// (the ready Acquire) and the word's [`RX_AFFINE_FLAG`] is set.
+    #[inline(always)]
+    pub fn get_affine_value(&self, slot: u8, idx: usize) -> u64 {
+        debug_assert!((slot as usize) < RX_NARR && idx < self.cap);
+        // SAFETY: read-only after the ready Acquire; the row exists iff
+        // the sidecar is armed (the pack path checked).
+        unsafe {
+            let vals = &*self.tagvals.get();
+            vals[slot as usize][idx]
+        }
+    }
+
+    /// R26: load EIGHT consecutive spans' golden values — ONE 64-byte
+    /// line of the SoA values row (the vertical 8-span group's whole
+    /// tag traffic). AVX-512F wide load when present, eight scalar
+    /// loads otherwise (bit-identical). Callers prove `idx + 8 <= cap`
+    /// and every word's [`RX_AFFINE_FLAG`] is set.
+    pub fn get_values8(&self, slot: u8, idx: usize) -> [u64; 8] {
+        debug_assert!((slot as usize) < RX_NARR);
+        assert!(
+            idx + 8 <= self.cap,
+            "rxdesc: values slot {slot} index {idx}+8 exceeds cap {}",
+            self.cap
+        );
+        // SAFETY: the entries were published by the sink's ready store
+        // (the caller Acquired it); `idx+8 <= cap` proven above; the row
+        // exists iff the sidecar is armed.
+        let words: &[u64; 8] = unsafe {
+            let vals = &*self.tagvals.get();
+            &*(vals[slot as usize].as_ptr().add(idx) as *const [u64; 8])
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 64 bytes readable at `words`
+                // (idx+8 <= cap, the row is cap words).
+                unsafe {
+                    let v = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let mut out = [0u64; 8];
+                    _mm512_storeu_si512(out.as_mut_ptr() as *mut _, v);
+                    return out;
+                }
+            }
+        }
+        *words
+    }
+
+    /// R26: load EIGHT consecutive array words — ONE 64-byte line of the
+    /// descriptor row (the vertical group's flag sweep: one AND-reduce
+    /// tests all eight [`RX_AFFINE_FLAG`] bits). AVX-512F wide load when
+    /// present; callers prove `idx + 8 <= cap` (mirrors `check_arr8`'s
+    /// read contract — the group is exactly eight words).
+    pub fn get_arr8(&self, slot: u8, idx: usize) -> [u64; 8] {
+        debug_assert!((slot as usize) < RX_NARR);
+        assert!(
+            idx + 8 <= self.cap,
+            "rxdesc: array slot {slot} index {idx}+8 exceeds cap {}",
+            self.cap
+        );
+        // SAFETY: `idx+8 <= cap` proven above; the group is one u64-slice
+        // view of the published row.
+        let words: &[u64; 8] = unsafe {
+            let arrays = &*self.arrays.get();
+            &*(arrays[slot as usize].as_ptr().add(idx) as *const [u64; 8])
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 64 bytes readable.
+                unsafe {
+                    let v = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let mut out = [0u64; 8];
+                    _mm512_storeu_si512(out.as_mut_ptr() as *mut _, v);
+                    return out;
+                }
+            }
+        }
+        *words
+    }
+
+    /// R23c/R26: the WARM-START twin for the tag sidecar — copy `n` spans'
     /// tags from slot `from` to slot `to` (the sink, at window open,
     /// right after `copy_arr`; the same NT-copy law when the phases
-    /// match). No-op when the sidecar is disarmed (the slots are empty
-    /// zero-capacity allocations with dangling bases — the length check
-    /// MUST gate before any pointer math).
+    /// match). No-op when the sidecar is disarmed (the rows are empty
+    /// zero-capacity allocations — the length check MUST gate before any
+    /// pointer math). R26: both SoA rows copy (values 8 B/span — the NT
+    /// streaming law; raws 16 B/span).
     pub fn copy_tags(&self, from: u8, to: u8, n: usize) {
         let n = n.min(self.cap);
         if n == 0 || from == to {
@@ -1070,14 +1199,25 @@ impl RxdescState {
         // holds the previous window's published, immutable entries — the
         // same protocol as copy_arr.
         unsafe {
-            let tags = &mut *self.tags.get();
-            if tags.is_empty() || tags[0].is_empty() {
+            let vals = &mut *self.tagvals.get();
+            if vals.is_empty() || vals[0].is_empty() {
                 return; // disarmed: the sidecar was never allocated
             }
-            let words = n * RX_AFFINE_TAG_WORDS;
-            let src = tags[from as usize].as_ptr();
-            let dst = tags[to as usize].as_mut_ptr();
-            std::ptr::copy_nonoverlapping(src, dst, words);
+            let raws = &mut *self.tagraws.get();
+            let vsrc = vals[from as usize].as_ptr();
+            let vdst = vals[to as usize].as_mut_ptr();
+            if nt_copy_enabled() && (vsrc as usize) % 64 == (vdst as usize) % 64 {
+                nt_copy_u64(vsrc, vdst, n);
+            } else {
+                std::ptr::copy_nonoverlapping(vsrc, vdst, n);
+            }
+            let rsrc = raws[from as usize].as_ptr();
+            let rdst = raws[to as usize].as_mut_ptr();
+            if nt_copy_enabled() && (rsrc as usize) % 64 == (rdst as usize) % 64 {
+                nt_copy_u64(rsrc, rdst, n * 2);
+            } else {
+                std::ptr::copy_nonoverlapping(rsrc, rdst, n * 2);
+            }
         }
     }
 
