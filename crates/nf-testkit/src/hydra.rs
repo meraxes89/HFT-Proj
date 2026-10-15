@@ -694,18 +694,16 @@ fn affine_tag_eval(
         }
     }
     stats.affine_hits.fetch_add(1, Ordering::Relaxed);
-    // Direct 9-multiply FNV-1a-64 combine on packed register words without stack allocations:
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    h = (h ^ (t[2] as u32 as u64)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[2] >> 32)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[3] as u32 as u64)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[3] >> 32)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[4] as u32 as u64)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[4] >> 32)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[5] as u32 as u64)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (t[5] >> 32)).wrapping_mul(0x0100_0000_01B3);
-    h = (h ^ (len as u32 as u64)).wrapping_mul(0x0100_0000_01B3);
-    h
+    // R24 (Run 500+ Track 1): the VPCLMULQDQ polynomial-hash combine — the
+    // 9-multiply FNV-1a-64 serial chain (27 cycles of IMUL latency) is
+    // retired. t[2..5] are the 8 lane registers packed as 4 contiguous
+    // u64 words: ONE 256-bit load, TWO VPCLMULQDQ (four INDEPENDENT
+    // carry-less products), the VPTERNLOGQ tree-XOR + the length product,
+    // and a single Barrett-style folding reduction mod the irreducible
+    // spanhash modulus — ~4 clmul-class uops, no serial dependency.
+    // Bit-identical to the payload path's `span_crc32c_8lane` (the
+    // differential pins both sides); ZERO payload reads, ZERO fallbacks.
+    crate::polyhash::spanhash64(&[t[2], t[3], t[4], t[5]], len as u32)
 }
 
 /// Worker main loop: pure function evaluation + chunk-granular SPSC ring

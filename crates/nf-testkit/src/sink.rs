@@ -399,8 +399,10 @@ impl Sink for ConformanceSink {
 // expected value and every measured pass must reproduce it exactly.
 // ══════════════════════════════════════════════════════════════════════════
 
-/// 8-lane interleaved hardware CRC32C over a byte span, lanes combined by an
-/// FNV-1a-64 mix. Deterministic for a given (bytes) on every SSE4.2 x86_64.
+/// 8-lane interleaved hardware CRC32C over a byte span, lanes combined by
+/// the R24 SPANHASH-64 CLMUL polynomial hash. Deterministic for a given
+/// (bytes) on every SSE4.2 x86_64 — and since R24, bit-identical on every
+/// host (the portable fallback reproduces the exact lane layout).
 ///
 /// Memory-level-parallelism note: 8 independent CRC lanes give 8 in-flight
 /// loads per 64B block, but line-level MLP is what hides DRAM latency — the
@@ -468,21 +470,86 @@ pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
             c0 = _mm_crc32_u8(c0, body[i]);
         }
     }
-    // Lane combine: FNV-1a-64 mix over lane states + length.
-    let mut h: u64 = 0xcbf29ce484222325;
-    for c in [c0, c1, c2, c3, c4, c5, c6, c7, len as u32] {
-        h ^= c as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+    // Lane combine: R24 SPANHASH-64 — the CLMUL polynomial hash over the
+    // 8 lane registers + the length (replaces the FNV-1a-64 serial chain;
+    // value law: pure function of (lanes, len), bit-identical on every
+    // host and path — the polyhash differential pins it).
+    crate::crcfold::span_lane_combine(&[c0, c1, c2, c3, c4, c5, c6, c7], len)
 }
 
-/// Non-x86_64 fallback: FNV-1a-64 over the span (portable, deterministic per
-/// arch — same policy as FastHashSink).
+/// Non-x86_64 fallback: the SAME 8-lane layout + SPANHASH-64 combine in
+/// portable code (software CRC32C lanes) — R24 upgraded this from FNV
+/// over bytes to TRUE cross-arch bit parity with the x86_64 value (the
+/// differential suite now pins identical golden values everywhere).
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 pub fn span_crc32c_8lane(body: &[u8]) -> u64 {
-    fnv_bytes(0xcbf29ce484222325, body)
+    const CRC32C_POLY_REFLECTED: u32 = 0x82F6_3B78;
+    #[inline(always)]
+    fn crc8(c: u32, b: u8) -> u32 {
+        let mut c = c ^ (b as u32);
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ CRC32C_POLY_REFLECTED
+            } else {
+                c >> 1
+            };
+        }
+        c
+    }
+    #[inline(always)]
+    fn crc_w(c: u32, w: u64) -> u32 {
+        // LSB byte first — the _mm_crc32_u64 register semantics.
+        let mut c = c;
+        for b in w.to_le_bytes() {
+            c = crc8(c, b);
+        }
+        c
+    }
+    let len = body.len();
+    let mut lanes = [0u32; 8];
+    let mut i = 0usize;
+    // 64B blocks — lane k hashes bytes i+8k..i+8k+8 (the exact x86_64
+    // lane layout; qwords little-endian).
+    while i + 64 <= len {
+        for k in 0..8usize {
+            let w = u64::from_le_bytes(
+                body[i + 8 * k..i + 8 * k + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            lanes[k] = crc_w(lanes[k], w);
+        }
+        i += 64;
+    }
+    // Tail (< 64B) folded into lane 0 sequentially.
+    while i + 8 <= len {
+        let w = u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
+        lanes[0] = crc_w(lanes[0], w);
+        i += 8;
+    }
+    if i + 4 <= len {
+        let w = u32::from_le_bytes(body[i..i + 4].try_into().unwrap());
+        let mut c = lanes[0];
+        for b in w.to_le_bytes() {
+            c = crc8(c, b);
+        }
+        lanes[0] = c;
+        i += 4;
+    }
+    if i + 2 <= len {
+        let w = u16::from_le_bytes([body[i], body[i + 1]]);
+        let mut c = lanes[0];
+        for b in w.to_le_bytes() {
+            c = crc8(c, b);
+        }
+        lanes[0] = c;
+        i += 2;
+    }
+    if i < len {
+        lanes[0] = crc8(lanes[0], body[i]);
+    }
+    crate::crcfold::span_lane_combine(&lanes, len)
 }
 
 /// R4: span-mode conformance sink — opts into R3 batched emission while

@@ -534,15 +534,12 @@ fn test_d11_crc_kernel_differential() {
     for (i, e) in body.iter_mut().enumerate() {
         *e = (i * 131 + 17) as u8;
     }
-    // len < 64: everything is lane 0 + tail => span hash = FNV over
-    // [c0..c7, len] where c0 = raw crc of the whole body.
+    // len < 64: everything is lane 0 + tail => span hash = SPANHASH-64 over
+    // [c0..c7, len] where c0 = raw crc of the whole body (R24: the CLMUL
+    // polynomial combine replaced the FNV-1a chain).
     let h = span_crc32c_8lane(&body[..40]);
     let c0 = ref_crc32c(&body[..40]);
-    let mut want = 0xcbf29ce484222325u64;
-    for c in [c0, 0u32, 0, 0, 0, 0, 0, 0, 40u32] {
-        want ^= c as u64;
-        want = want.wrapping_mul(0x100000001b3);
-    }
+    let want = nf_testkit::crcfold::span_lane_combine(&[c0, 0u32, 0, 0, 0, 0, 0, 0], 40);
     assert_eq!(h, want, "D11: scalar kernel lane-0 semantics diverged from reference CRC32C");
 
     // 2) Fold kernel differential (skipped on non-AVX-512 silicon).

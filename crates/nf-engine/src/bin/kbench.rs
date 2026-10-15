@@ -794,8 +794,8 @@ fn mode_affine_sub_1t(buf: &[u8], sink: &mut u64) -> usize {
     corpus.pairs.len() * SPAN
 }
 
-/// R23b Task 1 (vector row): the 8-lane O(1) projection + the FNV-1a-64
-/// golden combine over the packed-SPAN corpus — the EXACT
+/// R23b Task 1 (vector row): the 8-lane O(1) projection + the R24
+/// SPANHASH-64 golden combine over the packed-SPAN corpus — the EXACT
 /// span_crc32c_8lane value per span without reading a span byte. On
 /// AVX-512 class: 2 × VPCLMULQDQ projection + 2 × plain-Barrett
 /// reduction + the combine; scalar fallback elsewhere (bit-identical).
