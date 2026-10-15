@@ -492,30 +492,45 @@ pub fn rx_unpack_u64(w: u64) -> (u64, u64) {
 /// workers know where to split a segment: spans at and above a
 /// pass-start record's base fold into the NEXT pass's chain (the
 /// consumer snapshots and re-seeds there), so a composite record may
-/// never straddle the base. Base spans stay 47-bit-safe (a sustained
-/// run's global span ids are bounded by spans/s × runtime — decades
-/// of headroom; `debug_assert`ed at pack time).
+/// never straddle the base.
 pub const RX_REC_PASS_BIT: u64 = 1 << 47;
-const RX_REC_BASE_MASK: u64 = (1 << 47) - 1;
+const RX_REC_BASE_MASK: u64 = (1 << 44) - 1;
+const RX_REC_SLOT_MASK: u64 = 0x7 << 44;
 
-/// R25a: pack a window record `(gen, base_span, pass_start)`.
+const _: () = assert!(RX_NARR <= 8, "R27 aslot field is 3 bits");
+
+/// R27: pack a window record `(gen, base_span, pass_start, arr_slot)`.
+/// The array-slot field (3 bits) decouples the RECORD ring slot (which
+/// rotates every window — the workers' walk consumes record slots in
+/// order, and a lagging walker must find every window's record) from
+/// the ARRAY slot the window's descriptors live in. In the classic
+/// protocol the two are equal (the array rotates with the record); the
+/// toroidal epoch (R27) freezes the ARRAY slot while the record keeps
+/// rotating — the record is the epoch tag, the array is the invariant
+/// tape. Base spans stay 44-bit-safe (17.6T spans — decades of
+/// sustained headroom; `debug_assert`ed at pack time).
 #[inline(always)]
-pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool) -> u64 {
-    debug_assert!(gen < (1 << 16) && base_span < (1 << 47));
-    (gen << 48) | if pass_start {
-        RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
-    } else {
-        base_span & RX_REC_BASE_MASK
-    }
+pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool, arr_slot: u8) -> u64 {
+    debug_assert!(gen < (1 << 16) && base_span < (1 << 44));
+    debug_assert!((arr_slot as usize) < RX_NARR);
+    (gen << 48)
+        | if pass_start {
+            RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
+        } else {
+            base_span & RX_REC_BASE_MASK
+        }
+        | ((arr_slot as u64) << 44)
 }
 
-/// R25a: unpack a window record — `(gen, base_span, pass_start)`.
+/// R25a/R27: unpack a window record — `(gen, base_span, pass_start,
+/// arr_slot)`.
 #[inline(always)]
-pub fn rx_unpack_record(w: u64) -> (u64, u64, bool) {
+pub fn rx_unpack_record(w: u64) -> (u64, u64, bool, u8) {
     (
         w >> 48,
         w & RX_REC_BASE_MASK,
         w & RX_REC_PASS_BIT != 0,
+        ((w & RX_REC_SLOT_MASK) >> 44) as u8,
     )
 }
 
@@ -783,18 +798,36 @@ impl RxdescState {
         }
     }
 
+    /// R27: the newest published RECORD slot (u8::MAX = none yet). The
+    /// toroidal epoch reuses the previous window's ARRAY slot while the
+    /// RECORD slot keeps rotating — the sink needs the raw tracker (not
+    /// `next_slot`) to publish the next record on the right ring slot.
+    #[inline]
+    pub fn last_slot_value(&self) -> u8 {
+        self.last_slot.load(Ordering::Relaxed)
+    }
+
     /// Publish the window's record (sink, at window open — AFTER the
     /// reuse gate and the warm start): `records[slot] = (gen, base_span,
-    /// pass_start)` and `last_slot = slot`. R25a: `pass_start` marks a
-    /// window opening exactly at a pass boundary — the composite-fold
-    /// workers split their segment there (the consumer snapshots +
-    /// re-seeds the chain at that span, so composites never straddle
-    /// it).
+    /// pass_start, arr_slot)` and `last_slot = slot`. R25a: `pass_start`
+    /// marks a window opening exactly at a pass boundary — the
+    /// composite-fold workers split their segment there (the consumer
+    /// snapshots + re-seeds the chain at that span, so composites never
+    /// straddle it). R27: `arr_slot` is the ARRAY slot the window's
+    /// descriptors live in (== `slot` in the classic protocol; the
+    /// toroidal epoch freezes it while the record ring rotates).
     #[inline]
-    pub fn publish_record(&self, slot: u8, gen: u64, base_span: u64, pass_start: bool) {
+    pub fn publish_record(
+        &self,
+        slot: u8,
+        gen: u64,
+        base_span: u64,
+        pass_start: bool,
+        arr_slot: u8,
+    ) {
         self.records[slot as usize]
             .0
-            .store(rx_pack_record(gen, base_span, pass_start), Ordering::Release);
+            .store(rx_pack_record(gen, base_span, pass_start, arr_slot), Ordering::Release);
         self.last_slot.store(slot, Ordering::Relaxed);
     }
 
@@ -853,10 +886,11 @@ impl RxdescState {
     }
 
     /// Read a pass record (worker, during the record walk) —
-    /// `(gen, base_span, pass_start)` (R25a: the flag is part of the
-    /// walk's boundary bookkeeping).
+    /// `(gen, base_span, pass_start, arr_slot)` (R25a: the flag is part
+    /// of the walk's boundary bookkeeping; R27: the array slot decouples
+    /// the record ring from the descriptor array).
     #[inline]
-    pub fn read_record(&self, slot: u8) -> (u64, u64, bool) {
+    pub fn read_record(&self, slot: u8) -> (u64, u64, bool, u8) {
         rx_unpack_record(self.records[slot as usize].0.load(Ordering::Acquire))
     }
 
