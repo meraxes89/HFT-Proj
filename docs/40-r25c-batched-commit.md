@@ -35,8 +35,9 @@ that already existed on the scan side):
 | Publish cadence (`spans_ready` Release) | per 64 spans | unchanged — per 64 spans |
 
 Local 2-vCPU smoke (1 worker, noisy): `work_ms` 3164-3350 →
-2920-2960 (**−8%**), tuples BIT-EXACT, `allocs=0`. Fleet pricing rides
-the new **11bs** attribution arm (same-draw delta 11ab − 11bs).
+2920-2960 (**−8%**), tuples BIT-EXACT, `allocs=0`. Fleet pricing rode
+the new **11bs** attribution arm (same-draw delta 11ab − 11bs) — and
+**landed far beyond the model**, see §5.
 
 ## 2. The Confirmation Run (and the Typo That Fought Back)
 
@@ -184,33 +185,70 @@ proves exactly as much per span as the scalar one did.
 constant, never in a window). The CI **11bs** arm runs it on every
 draw; same-draw delta 11ab − 11bs is the lever's fleet price.
 
-## 5. What This Buys (the model)
+## 5. What the Fleet Priced (runs 38716351075 + 38716405744, `06acc8c`)
 
-Main's per-span commit tax drops from ~45-55c to ~8-12c; at the
-healthy draw's ~40M spans/s that frees ~1.3-1.7G cycles/s on the
-binding core. Those cycles convert through the assist (the R10
-work-assist exists precisely to convert spare main-core cycles into
-in-window CRC) or relax the pace gate so the workers absorb more —
-either way the ceiling moves. The honest expectation is **+8-15%**
-(the local smoke's −8% work is the floor; the fleet's co-binding
-equilibrium decides the conversion rate), putting the healthy window
-at ~2.2-2.35B. The 3.5B program needs the follow-through tracks
-below.
+Both runs: 99/100 shards green (the single failure in each is a kbench
+CV-noise gate on a co-tenant draw — `stddev 2.71c > 2.5c` / `cv 42.6% >
+25%`, no correctness involvement); every perf arm completed; bit-parity
++ `allocs=0` + `payload_fallbacks=0` held on every draw.
+
+| Instrument (paired, same draw) | Run 38716351075 (38 draws) | Run 38716405744 (33 draws) |
+|---|---|---|
+| **11ab (batched) vs 11bs (per-span) — the R25c lever** | **+82.6% median, 38/38 positive** (min +38.1%) | **+55.7% median, 33/33 positive** (healthy draws +85-91%) |
+| 11ab healthy window (p75 / max) | **3.799B / 4.061B** | 3.753B / 4.053B |
+| 11bs (the rollback) p75 / max | 2.070B / 2.160B | 2.040B / 2.167B |
+| Composite vs per-span fold | +0.76% (23/38) | −0.41% (14/33) — noise-level |
+| Distinct vs stacked placement | +91.3% median | +68.0% median |
+| R23 2.5B verdict (11ab) | **27 shards PASS at 3.7-4.06B** | (draws noisier; top rates equal) |
+
+The healthy sustained window moved **2.05B → 3.75-4.06B msg/s** — the
+2.0B→3.5B program goal is passed with margin, bit-exact and zero-alloc.
+
+The mechanism (the 3.768B draw's own `DIAG sustained`):
+
+```
+passes=37244 reset_ms=833.8 scan_ms=4161.0 work_ms=3893.4 fold_ms=112.7
+pending_max=3920 assist_chunks=615 crc_demand_gb_s=104.20
+```
+
+* **`assist_chunks=615`** (was 176k-428k on d4398f2): the R10 assist is
+  nearly DORMANT — the freed main cycles did not convert into inline
+  CRC, they converted into SUBMISSION. Main was the strangler; with
+  the per-span tax drained, the workers absorb the load themselves
+  (104 GB/s CRC demand across 2 workers ≈ 52 GB/s each — ~1/3 of the
+  151 GB/s single-core kernel peak, the walk/protocol residue).
+* Per-span main budget: ~86c (2.05B, 40M spans/s) → **~48c at 74.5M
+  spans/s** — the commit machinery roughly halved while the span rate
+  ~doubled; throughput ∝ 1/(per-span cost) held exactly.
+* `fold_ms=112.7`, consumer parks 62 (was 1389): the R25a composite
+  fold has headroom to spare at 2× the rate.
+* The model's +8-15% was the conservative floor — the assist
+  equilibrium flipped instead (main no longer needs to subsidize the
+  workers), so the lever priced at the full strangler share.
 
 ## 6. The Residual (next tracks)
 
-1. **`reset_ms` (17% of wall):** ~70µs/pass on the fleet — the pass
-   boundary's synchronous bake tail (ADVANCE_DIAGNOSTIC's tail; the
-   window warm copy + record publish). R25d: overlap the bake with
-   the tail drain, or amortize the record protocol across passes.
-2. **Worker supply at the new main rate:** with main freed, the
-   workers become the binding side (they were already ~98% busy).
-   The worker walk's per-span array check/tag read is the next
-   per-span tax to batch (the record-resolution diet already batches
-   the wake; the eval walk may not).
-3. **The pace/assist equilibrium:** the assist fired on 77% of chunks
-   in the slowest healthy draw — the freed main cycles change the
-   equilibrium; re-price `HFT_ASSIST_WATERMARK` after the fleet data.
+The wall is rebalanced: `scan_ms 4.16s (83%) / reset_ms 0.83s (17%)`
+with main ~78% busy in pure ladder+batched-commit work at 74.5M
+spans/s, and the workers at ~1/3 of kernel peak. The next levers, in
+expected-value order:
+
+1. **The worker-side walk (the new binding side):** 104 GB/s demand vs
+   151 GB/s/core kernel peak — ~2/3 of the workers' cycles are the
+   record walk, tag reads and res/composite protocol. Batching the
+   worker's per-span walk the way R25c batched main's is the natural
+   R26 (the record-resolution diet already batches the wake).
+2. **`reset_ms` (17% of wall):** ~22µs/pass at 37k passes — the pass
+   boundary's bake tail + window warm copy. Overlapping it with the
+   tail drain (or amortizing the record protocol across passes) is
+   worth up to +17% at the new rate.
+3. **The ladder's per-span residue on main:** the steady_step/
+   ladder_group_apply SpanRec build is now the dominant per-span cost
+   (~48c/span includes it) — a SoA-native batch emission (ladder →
+   sink without the per-entry SpanRec materialization) attacks it.
+4. **The pace/assist equilibrium re-tune:** with assists dormant,
+   `RX_PACE=8192` and `HFT_ASSIST_WATERMARK=2048` were tuned for the
+   main-bound regime; re-price them at the worker-bound equilibrium.
 
 ## 7. Files
 
