@@ -433,10 +433,32 @@ echo "=== 11smt. R25b: Scalars-Stacked Placement ARMED (the refuted lever, count
 # shape priceable on every draw (the counterfactual instrument — the
 # tradeoff shape differs on >=3-physical-core silicon).
 HFT_RXDESC=1 HFT_FABRIC_PLACE=scalars_stacked cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_smtstack.txt
-grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_smtback.txt
-grep -q "allocs=0" /tmp/bench_smtback.txt
-grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_smtback.txt
-grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_smtback.txt | head -1
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_smtstack.txt
+grep -q "allocs=0" /tmp/bench_smtstack.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_smtstack.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_smtstack.txt | head -1
+
+echo "=== 11bs. R25c: Batched Array Commit ROLLBACK (attribution) ==="
+# THE R25c SHIP (docs/40): the main core's commit path was the R25b
+# fleet diagnosis's binding wall (ingest_entries_ladder + the per-span
+# array check-and-fix: work_ms=4.1s/5s, scan_ms=83% of wall). The batch
+# path drains the per-span fixed costs — ONE Arc clone/drop pair per
+# <=32-rec batch (was two locked RMWs per SPAN), ONE flow-control gate
+# per batch (was a cross-core fold_pos load per span), the
+# check-and-fix 8 WIDE (ONE 64-byte load + ONE vector compare per
+# group — the steady state's fixes==0 law makes the compare the whole
+# per-span array cost), and the chunk-boundary arithmetic per run.
+# THIS arm is the rollback: the per-span submit loop verbatim (the
+# pre-R25c shape, HFT_BATCH_SUBMIT=0's semantics on the default
+# placement). The verdict line stays the instrument; same-draw delta
+# 11ab - 11bs = the batched commit's contribution to the main-side
+# wall (the t_r25c_batch_submit_parity differential pins the tuples
+# bit-exact and the fix counts identical).
+HFT_RXDESC=1 HFT_BATCH_SUBMIT=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_bs_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_bs_off.txt
+grep -q "allocs=0" /tmp/bench_bs_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_bs_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_bs_off.txt | head -1
 
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the

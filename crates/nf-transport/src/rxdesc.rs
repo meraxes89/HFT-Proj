@@ -612,6 +612,27 @@ fn nt_copy_enabled() -> bool {
     *V.get_or_init(|| std::env::var("HFT_NT_COPY").as_deref() != Ok("0"))
 }
 
+/// R25c: the AVX-512F gate for the 8-wide array check (`check_arr8`).
+/// Read once per process (a relaxed load after init — the hot loop
+/// reads it per 8-span group; `is_x86_feature_detected!` itself caches,
+/// but the OnceLock keeps the branch data local and the pattern uniform
+/// with `nt_copy_enabled`).
+#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn r25c_avx512f() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512f")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
 /// R21: the 64-byte streaming copy (`_mm512_stream_si512` + `_mm_sfence`).
 /// Callers prove: `src`/`dst` share their 64-byte phase (same `% 64`),
 /// `n` words are readable at `src` and writable at `dst`, and the ranges
@@ -873,6 +894,73 @@ impl RxdescState {
         unsafe {
             let arrays = &*self.arrays.get();
             arrays[slot as usize][idx]
+        }
+    }
+
+    /// R25c: the 8-wide check half of the check-and-fix — ONE 64-byte
+    /// load and ONE vector compare per group replaces eight
+    /// load+compare+branch triples (the R25b fleet diagnosis pinned the
+    /// main core's submission path at work_ms=4.1s/5s; the steady-state
+    /// law fixes==0 means the COMPARE is the whole per-span array cost).
+    /// Returns the mismatch mask: bit i set iff word `idx+i` differs
+    /// from `expect[i]` — the caller fixes exactly those lanes with
+    /// `set_arr`/`set_affine_tag` (the cold path, verbatim semantics).
+    ///
+    /// The vector path is bit-identical to the scalar loop (eight u64
+    /// equality compares in one `_mm512_cmpeq_epu64`; the mask IS the
+    /// per-lane boolean) — no env gate, only the AVX-512F feature gate
+    /// with the scalar fallback elsewhere (the compare changes zero
+    /// stores either way; only the READ shape differs, and a wide
+    /// unaligned read of producer-owned words is within the array's
+    /// proven slot-ownership protocol — every word [idx, idx+8) is
+    /// this sink's window to check).
+    ///
+    /// Callers prove `idx + 8 <= cap` (asserted) — the group is exactly
+    /// eight words; sub-8 tails run the scalar per-span path.
+    pub fn check_arr8(&self, slot: u8, idx: usize, expect: &[u64; 8]) -> u8 {
+        debug_assert!((slot as usize) < RX_NARR);
+        assert!(
+            idx + 8 <= self.cap,
+            "rxdesc: array slot {slot} index {idx}+8 exceeds cap {}",
+            self.cap
+        );
+        // SAFETY: slot ownership per the module doc; `idx+8 <= cap`
+        // proven above. The 8-word group is one u64-slice view.
+        let words: &[u64; 8] = unsafe {
+            let arrays = &*self.arrays.get();
+            &*(arrays[slot as usize].as_ptr().add(idx) as *const [u64; 8])
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; both pointers readable for
+                // 64 bytes (words: idx+8<=cap; expect: a &[u64;8]).
+                unsafe {
+                    let a = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let b = _mm512_loadu_si512(expect.as_ptr() as *const _);
+                    // Equality is sign-agnostic — epi64 is the AVX-512F
+                    // u64 compare; the mask form returns __mmask8 (u8)
+                    // with bit i set iff lane i is equal.
+                    let eq = _mm512_cmpeq_epi64_mask(a, b);
+                    // Invert for the mismatch mask.
+                    !eq
+                }
+            } else {
+                let mut bad = 0u8;
+                for i in 0..8 {
+                    bad |= ((words[i] != expect[i]) as u8) << i;
+                }
+                bad
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut bad = 0u8;
+            for i in 0..8 {
+                bad |= ((words[i] != expect[i]) as u8) << i;
+            }
+            bad
         }
     }
 

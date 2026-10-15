@@ -2439,6 +2439,10 @@ pub struct HydraSpanSink<'a> {
     /// the composite-fold workers split their segment at the boundary
     /// (the consumer snapshots + re-seeds the chain there).
     pass_start_span: u64,
+    /// R25c: the batched array commit path is ON (HFT_BATCH_SUBMIT=0 is
+    /// the documented rollback — the per-span submit loop, the exact
+    /// pre-R25c shape). Per-run constant, read at construction.
+    batch_submit: bool,
 }
 
 impl<'a> HydraSpanSink<'a> {
@@ -2537,6 +2541,7 @@ impl<'a> HydraSpanSink<'a> {
             rx_affine,
             rx_affine_cursor: 0,
             pass_start_span: u64::MAX,
+            batch_submit: std::env::var("HFT_BATCH_SUBMIT").as_deref() != Ok("0"),
         };
         // R21 (Task 2, the fused arm's flip-validation instrument): prove
         // the fused shape armed — printed ONCE per process at the first
@@ -3143,6 +3148,199 @@ impl<'a> HydraSpanSink<'a> {
         }
     }
 
+    /// R25c: the BATCHED array commit path — the R25b fleet diagnosis
+    /// (work_ms=4.1s/5s on the binding main core) re-derived the
+    /// submission path's per-span fixed costs, and the batch drains
+    /// them instead of amortizing per span:
+    ///
+    /// * ONE `Arc` clone/drop pair per BATCH (`<= 32` recs) — the
+    ///   per-span pair was two locked RMWs on the refcount line for a
+    ///   pointer the sink already owns, ~20-30c of the ~90c/span
+    ///   submit budget on the 9V45 draws;
+    /// * ONE flow-control gate per batch (`pending()` loads the
+    ///   consumer-written `fold_pos` line — cross-core Shared — and
+    ///   the gate's RX_PACE=8192 headroom dwarfs a 32-span overshoot);
+    /// * the check-and-fix 8 WIDE (`RxdescState::check_arr8`): one
+    ///   64-byte load + one vector compare per group replaces eight
+    ///   load+compare+branch triples; the steady-state law
+    ///   `rx_fixes==0` (every RX prefill entry already exact) makes
+    ///   the compare the WHOLE per-span array cost, and a mismatching
+    ///   lane takes the exact scalar fix path (tag sidecar + word +
+    ///   counter) — bit-identical stores, identical order;
+    /// * the chunk-boundary arithmetic runs per RUN (one array or
+    ///   inline run per 64-span chunk), not per span.
+    ///
+    /// Semantics are the per-span path's verbatim (the
+    /// `t_r25c_batch_submit_parity` differential + the full
+    /// `t_rxdesc_parity_matrix` pin it): the chunk-open assist
+    /// decision fires at exactly the same grid boundaries
+    /// (`submit_rem == CHUNK`), the publish cadence stays one
+    /// `spans_ready` Release per chunk, the warm-start/reuse-gate
+    /// window protocol is untouched (`rx_open_window`), and
+    /// `HFT_BATCH_SUBMIT=0` is the documented rollback.
+    #[inline(never)]
+    fn submit_span_batch_rx(&mut self, recs: &[SpanRec<'_>]) {
+        if recs.is_empty() {
+            return;
+        }
+        let Some(st) = self.rx.clone() else {
+            unreachable!("submit_span_batch_rx without rxdesc state")
+        };
+        // The blob base — submit_span's preamble, verbatim (write-once
+        // per run; MUST precede the first spans_ready Release, which
+        // the window open + publishes below order it into).
+        if self.blob_base == 0 {
+            self.blob_base = recs[0].body.as_ptr() as usize;
+            st.capture_blob_base(self.blob_base);
+        }
+        // Lazy window open (identical trigger: this batch's first span).
+        if !self.rx_win_open {
+            self.rx_open_window();
+        }
+        // Flow control — once per batch. The per-span loop's gate could
+        // fire mid-batch; the batch check bounds the overshoot at the
+        // batch length (<= 32 spans, 0.4% of RX_PACE) — the drain loop
+        // itself is unchanged (fold + deep spin).
+        if self.rx_assist_wm > 0 {
+            let mut sb = 0u32;
+            while self.pending() > Self::RX_PACE {
+                self.fold_available();
+                crate::affinity::polite_spin_deep(&mut sb);
+            }
+        }
+        let affine_flag: u64 = if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
+        let mut i = 0usize;
+        while i < recs.len() {
+            // Chunk-open: the assist decision — submit_span_rx's grid
+            // boundary logic, verbatim (fires exactly when
+            // `submit_rem == CHUNK`, before the chunk's first span).
+            if self.submit_rem == CHUNK {
+                let chunk_id = self.next_span / CHUNK;
+                let take_inline = if self.force_inline {
+                    // Parity-test mode: every chunk inline, fold until an
+                    // inline-ring slot frees (the existing force
+                    // semantics).
+                    let mut sb = 0u32;
+                    while !self.try_claim_inline() {
+                        self.fold_available();
+                        crate::affinity::polite_spin(&mut sb);
+                    }
+                    true
+                } else {
+                    self.rx_assist_wm > 0
+                        && self.pending() > self.rx_assist_wm
+                        && self.try_claim_inline()
+                };
+                if take_inline {
+                    self.assist_chunks += 1;
+                    // The claim MUST be visible before the spans_ready
+                    // store that exposes this chunk's spans.
+                    st.mark_inline(chunk_id);
+                }
+            }
+            // The run: up to one chunk (or the batch tail) in ONE mode —
+            // a chunk never mixes array and inline spans.
+            let run = (self.submit_rem as usize).min(recs.len() - i);
+            if let Some(slot) = self.cur_inline {
+                for _ in 0..run {
+                    let body = recs[i].body;
+                    self.submit_inline_span(slot, body);
+                    self.next_span += 1;
+                    self.submit_rem -= 1;
+                    i += 1;
+                }
+            } else {
+                self.submit_arr_run(&st, &recs[i..i + run], affine_flag);
+                i += run;
+            }
+            // Chunk completion — submit_span_rx's cadence, verbatim:
+            // wrap the tracker, seal an inline chunk, publish.
+            if self.submit_rem == 0 {
+                self.submit_rem = CHUNK;
+                self.submit_lane = if self.submit_lane + 1 == self.n_lanes {
+                    0
+                } else {
+                    self.submit_lane + 1
+                };
+                if self.cur_inline.is_some() {
+                    self.flush_pending();
+                }
+                self.rx_publish_ready();
+            }
+        }
+    }
+
+    /// R25c: one array-mode run — `recs.len()` consecutive spans'
+    /// check-and-fix in 8-wide groups (the vector compare's mismatch
+    /// mask routes exactly the divergent lanes through the scalar fix
+    /// path — `rx_affine_tag_for` + `set_affine_tag` + `set_arr` +
+    /// `rx_fixes`, verbatim). Advances `next_span` and `submit_rem` by
+    /// the run length. The caller proves the run stays within one
+    /// chunk and the window is open.
+    fn submit_arr_run(&mut self, st: &RxdescState, recs: &[SpanRec<'_>], affine_flag: u64) {
+        let n = recs.len();
+        let mut i = 0usize;
+        while i < n {
+            if n - i >= 8 {
+                // ── the 8-wide group ──
+                let base_idx = (self.next_span - self.rx_win_base) as usize;
+                assert!(
+                    base_idx + 8 <= st.cap(),
+                    "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
+                );
+                let mut expect = [0u64; 8];
+                for g in 0..8 {
+                    let body = recs[i + g].body;
+                    let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
+                    debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                    debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                    expect[g] = desc8_pack_span(off as u32, body.len() as u16) | affine_flag;
+                }
+                let bad = st.check_arr8(self.rx_win_slot, base_idx, &expect);
+                if bad != 0 {
+                    // The COLD path — the same per-lane fix the scalar
+                    // loop applies, in the same ascending order.
+                    for g in 0..8 {
+                        if (bad >> g) & 1 == 0 {
+                            continue;
+                        }
+                        let body = recs[i + g].body;
+                        if self.rx_affine {
+                            let tag = self.rx_affine_tag_for(body);
+                            st.set_affine_tag(self.rx_win_slot, base_idx + g, &tag);
+                        }
+                        st.set_arr(self.rx_win_slot, base_idx + g, expect[g]);
+                        self.rx_fixes += 1;
+                    }
+                }
+                self.next_span += 8;
+                self.submit_rem -= 8;
+                i += 8;
+            } else {
+                // ── the scalar tail (run length not a multiple of 8) —
+                // the per-span check-and-fix, verbatim ──
+                let body = recs[i].body;
+                let idx = (self.next_span - self.rx_win_base) as usize;
+                assert!(idx < st.cap(), "rxdesc window exceeds array cap (HFT_RXDESC_CAP)");
+                debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
+                debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                let w = desc8_pack_span(off as u32, body.len() as u16) | affine_flag;
+                if st.get_arr(self.rx_win_slot, idx) != w {
+                    if self.rx_affine {
+                        let tag = self.rx_affine_tag_for(body);
+                        st.set_affine_tag(self.rx_win_slot, idx, &tag);
+                    }
+                    st.set_arr(self.rx_win_slot, idx, w);
+                    self.rx_fixes += 1;
+                }
+                self.next_span += 1;
+                self.submit_rem -= 1;
+                i += 1;
+            }
+        }
+    }
+
     /// R23c/R24: resolve one span's affine tag — the RX producer's ledger
     /// first (the monotone pointer cursor, O(1) amortized; the pointer +
     /// length match proves the row is THIS body), the direct body scan as
@@ -3739,13 +3937,22 @@ impl<'a> Sink for HydraSpanSink<'a> {
                 }
             }
             Some(_) => {
-                for r in recs {
-                    self.submit_span(r.body);
-                    self.next_span += 1;
+                if self.rx.is_some() && self.batch_submit {
+                    // R25c: the batched array commit — one Arc clone, one
+                    // pace gate and one window check per batch; the
+                    // check-and-fix 8-wide. HFT_BATCH_SUBMIT=0 rolls back
+                    // to the per-span loop below.
+                    self.submit_span_batch_rx(recs);
+                } else {
+                    for r in recs {
+                        self.submit_span(r.body);
+                        self.next_span += 1;
+                    }
                 }
                 // R16b: NO publish here — the chunk-completion boundary
-                // inside submit_span_rx owns the cadence (per-CHUNK, the
-                // ring protocol's shape); end_pass/finish publish the tail.
+                // inside submit_span_rx / submit_span_batch_rx owns the
+                // cadence (per-CHUNK, the ring protocol's shape);
+                // end_pass/finish publish the tail.
             }
         }
     }
@@ -4447,8 +4654,21 @@ mod tests {
         transport: &mut nf_transport::pipeline::PipelinedReplayTransport,
         fabric: &HydraFabric,
     ) -> ((u64, u64, u64), u64, u64) {
+        hydra_pass_piped_mode(transport, fabric, true)
+    }
+
+    /// R25c: `hydra_pass_piped` with the commit-path mode pinned — the
+    /// batched array commit (true) or the per-span rollback shape
+    /// (false; `HFT_BATCH_SUBMIT=0`'s semantics, set directly on the
+    /// sink so the differential runs in ONE process).
+    fn hydra_pass_piped_mode(
+        transport: &mut nf_transport::pipeline::PipelinedReplayTransport,
+        fabric: &HydraFabric,
+        batch: bool,
+    ) -> ((u64, u64, u64), u64, u64) {
         let mut seq = Sequencer::new();
         let mut sink = HydraSpanSink::new(fabric);
+        sink.batch_submit = batch;
         let ladder = crate::soa::ladder8_best();
         while transport.next_batch() {
             seq.ingest_entries_ladder(transport.entries(), transport.now_ns(), &mut sink, ladder);
@@ -4592,6 +4812,165 @@ mod tests {
                 } // w
             }
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // R25c: the batched array commit (docs/40) — the differential suite
+    // ══════════════════════════════════════════════════════════════════
+
+    /// R25c: the batched commit path's two differential cells, per
+    /// schedule shape × res format:
+    ///
+    /// (a) THE LAW CELL (deterministic, assist disabled —
+    ///     `rx_assist_wm = 0`, single-threaded transport): every array
+    ///     entry written by the SINK's own fix path (no prefill), both
+    ///     the warm-start hit and the cold fill exercised, the vector
+    ///     compare's mismatch lanes running the scalar fix verbatim.
+    ///     The tuple must equal the sequential reference AND the fix
+    ///     count must be EXACTLY the per-span mode's (the 8-wide
+    ///     compare is exactly as strong as eight scalar compares —
+    ///     the batch must fix precisely the same spans).
+    ///
+    /// (b) THE FULL-STACK CELL (pipelined + RX prefill, assists
+    ///     allowed): both modes reproduce the sequential reference —
+    ///     the fold order + inline routing invariants hold under
+    ///     timing-dependent assist decisions (assist counts may differ
+    ///     between the two runs; the tuple may not).
+    #[test]
+    fn t_r25c_batch_submit_parity() {
+        let gt = load_mini();
+        for chaos in [false, true] {
+            let cfg = if chaos {
+                ReplayConfig {
+                    seed_a: 0xCAFE_0000_1111_2222,
+                    seed_b: 0xBEEF_3333_4444_5555,
+                    msgs_per_packet: Packetize::MtuBound(1200),
+                    loss: [
+                        LossModel::Bernoulli { p_pm: 80 },
+                        LossModel::Bernoulli { p_pm: 140 },
+                    ],
+                    delay: [
+                        DelayModel::GaussianApprox {
+                            mean_ns: 20_000,
+                            sigma_ns: 6_000,
+                        },
+                        DelayModel::GaussianApprox {
+                            mean_ns: 45_000,
+                            sigma_ns: 18_000,
+                        },
+                    ],
+                    guarantee_coverage: true,
+                    session_change_at_msg: Some(200_000),
+                    ..Default::default()
+                }
+            } else {
+                ReplayConfig {
+                    msgs_per_packet: Packetize::MtuBound(1400),
+                    guarantee_coverage: true,
+                    ..Default::default()
+                }
+            };
+            let sched = build_schedule(&gt, &cfg);
+            let sess = if chaos {
+                *b"R25CBATCHC"
+            } else {
+                *b"R25CBATCHS"
+            };
+            let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+            let want = seq_pass(&mut t0, sess);
+            assert_eq!(want.0, 505_849, "coverage must hold (chaos={chaos})");
+
+            for comp in [true, false] {
+                // (a) the law cell: pipelined transport WITHOUT the rxdesc
+                // attach (no prefill — every array entry written by the
+                // sink's own fix path), assists disabled — deterministic.
+                // The ladder feeds on_span_batch (the batch commit's entry
+                // point), unlike the classic per-frame path. Each mode gets
+                // a FRESH fabric (a shared one warm-starts the second run
+                // from the first's writes — the fix counts would not be
+                // comparable).
+                let mut results = Vec::new();
+                for batch in [true, false] {
+                    let fabric =
+                        HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp);
+                    let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                        &gt,
+                        sched.clone(),
+                        sess,
+                        128,
+                    );
+                    t.reset(sess);
+                    let mut seq = Sequencer::new();
+                    let mut sink = HydraSpanSink::new(&fabric);
+                    sink.batch_submit = batch;
+                    sink.rx_assist_wm = 0; // no assists — deterministic fixes
+                    let ladder = crate::soa::ladder8_best();
+                    while t.next_batch() {
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                        sink.drain_ready();
+                    }
+                    sink.finish();
+                    results.push((
+                        (sink.count, sink.hash, sink.msg_hash),
+                        sink.rx_fixes(),
+                        sink.assist_chunks(),
+                    ));
+                }
+                let (got_b, fixes_b, assists_b) = results[0];
+                let (got_s, fixes_s, assists_s) = results[1];
+                assert_eq!(
+                    got_b, want,
+                    "R25c law cell diverged (batch, chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    got_s, want,
+                    "R25c law cell diverged (per-span, chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    fixes_b, fixes_s,
+                    "R25c fix-count divergence: the 8-wide compare must fix exactly the \
+                     per-span mode's spans (chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    assists_b, 0,
+                    "R25c law cell must take no assist chunks (chaos={chaos}, comp={comp})"
+                );
+                assert_eq!(
+                    assists_s, 0,
+                    "R25c law cell must take no assist chunks (per-span, chaos={chaos}, comp={comp})"
+                );
+
+                // (b) the full-stack cell: pipelined + the RX PREFILL
+                // attached (set_rxdesc — the sustained arm's exact shape)
+                // + assists allowed. Both modes must reproduce the
+                // sequential reference; assist counts may differ with
+                // timing, the tuple may not. One shared fabric here —
+                // the prefill + warm start carry the entries across the
+                // two modes (the sustained arm's own shape).
+                let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp);
+                let mut t3 = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                    &gt,
+                    sched.clone(),
+                    sess,
+                    128,
+                );
+                if let Some(st) = fabric.rxdesc_state() {
+                    assert!(t3.set_rxdesc(st), "set_rxdesc must attach once");
+                }
+                t3.reset(sess);
+                let (got3, _f3, _a3) = hydra_pass_piped_mode(&mut t3, &fabric, true);
+                assert_eq!(
+                    got3, want,
+                    "R25c pipelined batch diverged (chaos={chaos}, comp={comp})"
+                );
+                t3.reset(sess);
+                let (got4, _f4, _a4) = hydra_pass_piped_mode(&mut t3, &fabric, false);
+                assert_eq!(
+                    got4, want,
+                    "R25c pipelined per-span diverged (chaos={chaos}, comp={comp})"
+                );
+            } // comp
+        } // chaos
     }
 
     /// The sustained shape: pipelined + AUTO-ADVANCE + ONE sink wrapping
