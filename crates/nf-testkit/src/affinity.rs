@@ -341,7 +341,10 @@ impl TopologyVerdict {
 pub fn verify_pair_topology(main_cpu: usize, rx_cpu: usize) -> TopologyVerdict {
     if main_cpu == rx_cpu {
         return TopologyVerdict::Violated(format!(
-            "main and rx both on cpu{main_cpu} (same core, no pipeline overlap)"
+            "main and rx both on cpu{main_cpu} (R25b scalars-stacked — the \
+             intentional 2-worker 2-core SMT shape: the RX leaves worker 1's \
+             sibling at the cost of pipeline overlap; docs/39 §4. \
+             HFT_FABRIC_PLACE=distinct restores the Task-4 overlap)"
         ));
     }
     // Distinct physical cores: rx must not sit in main's SMT sibling group.
@@ -691,10 +694,13 @@ mod fabric_placement_tests {
     #[test]
     fn t_fabric_placement_no_worker_on_main_sibling_when_possible() {
         let (main, rx, workers) = fabric_placement(2);
-        if let (Some(m), Some(r)) = (main, rx) {
-            assert_ne!(m, r);
-        }
-        // On multi-core hosts, workers must not land on main's cpu.
+        // R25b: on the 2-worker 2-core SMT shape the scalar threads
+        // STACK (rx == main by design — the RX leaves worker 1's
+        // sibling; see `fabric_placement_scalars_stacked`). The
+        // invariant that still matters on EVERY shape: no worker
+        // pinned on the main thread's own cpu when the topology has
+        // room for separation.
+        let _ = rx;
         if let Some(m) = main {
             for w in &workers {
                 if crate::affinity::cpu_order().len() > 2 {
