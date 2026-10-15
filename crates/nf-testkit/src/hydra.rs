@@ -182,11 +182,26 @@ fn desc8_unpack(w: u64) -> (u32, u16, bool) {
 /// Worker → main result: the exact `span_crc32c_8lane` value of that body.
 /// 16 bytes. `span_id` is asserted on fold — a mis-ordered fold is a
 /// fail-stop condition, never a silent wrong answer.
+///
+/// R25a — DUAL INTERPRETATION (one 16-byte slot layout, protocol-owned):
+/// * **ring path + per-span rollback** — `{span_id, aux=0, value}`: one
+///   slot per span (the R23 shape; `HFT_RXDESC=0` or
+///   `HFT_COMPOSITE_FOLD=0`).
+/// * **array path composite** — `{first_span, aux=k, value=B}`: ONE
+///   slot per SEGMENT (≤ 64 spans breaking at grid-chunk ends, batch
+///   ends and pass boundaries): `B` is the composed XOR tree
+///   (`sink::fold_compose_b`), `k` the segment length; the consumer
+///   applies it as `rotl(h, 13k) ^ B` (`sink::fold_compose_apply`).
+///   Result-ring traffic and the consumer's fold work drop by the
+///   segment length (up to 64×); the consumer's per-record cost is two
+///   dependent ops.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Res {
     span_id: u32,
-    _pad: u32,
+    /// Composite mode: the segment's span count k (1..=64). Per-span
+    /// mode: always 0.
+    aux: u32,
     value: u64,
 }
 
@@ -201,6 +216,69 @@ struct Res {
 //     footprint at the word level, never a struct-level 128B blob.
 const _: () = assert!(std::mem::size_of::<Res>() == 16);
 const _: () = assert!(std::mem::size_of::<u64>() == 8);
+
+/// R25a: the worker-side composite segment accumulator — the fold's
+/// algebraic re-association made structural. Spans stream in
+/// (`push`); the segment breaks at grid-chunk ends (the lane grid
+/// switches there), at batch/frontier publishes (the resume starts a
+/// fresh segment), and at pass-start records (the consumer snapshots +
+/// re-seeds the chain at the boundary — a composite may never
+/// straddle it). At each break, `flush` composes the buffered terms
+/// into ONE 16-byte record: `B = ⊕ rotl(u_i, 13(k−1−i))`, each term
+/// rotated by its distance from the segment END — independent RORX+XOR
+/// pairs, throughput-bound, never a latency chain (the per-span path's
+/// serial rotl⊕IMUL chain — the consumer-side strangler the R25
+/// diagnosis pinned — is gone from BOTH cores).
+struct SegAcc {
+    /// First span id of the in-flight segment (valid when `len > 0`).
+    first: u64,
+    /// Spans buffered (0..=64).
+    len: u32,
+    /// The premultiplied terms `u_i = v_i·P` (`sink::fold_term`),
+    /// segment-order (i = 0 is the segment's first span).
+    buf: [u64; 64],
+}
+
+impl SegAcc {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            first: 0,
+            len: 0,
+            buf: [0; 64],
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, gid: u64, v: u64) {
+        if self.len == 0 {
+            self.first = gid;
+        }
+        self.buf[self.len as usize] = crate::sink::fold_term(v);
+        self.len += 1;
+    }
+
+    /// Compose + emit ONE composite record (no-op when empty).
+    /// SAFETY (caller's contract): slots `[rhead + *nres, +1)` are this
+    /// worker's (the batch space check bounded the run).
+    #[inline]
+    #[allow(clippy::similar_names)]
+    fn flush(&mut self, res_slots: &mut [Res; RES_CAP], rhead: u64, nres: &mut u64) {
+        if self.len == 0 {
+            return;
+        }
+        let k = self.len;
+        let b = crate::sink::fold_compose_b(&self.buf[..k as usize]);
+        debug_assert!(k as u64 <= CHUNK, "segment exceeds the chunk grid");
+        res_slots[((rhead + *nres) & RES_MASK) as usize] = Res {
+            span_id: self.first as u32,
+            aux: k,
+            value: b,
+        };
+        *nres += 1;
+        self.len = 0;
+    }
+}
 
 /// One pass's deferred-result record (GIGAHFT Lever 4). `count`/`msg_hash`
 /// are captured synchronously at `end_pass`; `hash` is captured when the
@@ -255,6 +333,14 @@ impl std::ops::Deref for Pad {
 /// and the submitting sink guarantees via `finish()` that all descriptors
 /// are consumed before the owning pass ends (transport reset/drop). Workers
 /// only dereference the pointer between submit and the matching fold drain.
+///
+/// R25a: 128-byte alignment — the res ring's segment records (16 B each,
+/// one per ≤64-span segment) and the desc word stream both start on full
+/// cacheline-pair boundaries, so the worker's record writes and the
+/// consumer's record pulls never straddle a line the other side touched
+/// half of (the false-sharing cadence is bounded by the composite's 64×
+/// traffic collapse; the alignment removes the residue).
+#[repr(align(128))]
 pub struct HydraLane {
     /// Descriptor slots as a raw word array (see the Desc doc for the two
     /// formats: legacy 16 B/desc at words [(i & 2047)*2, +1], compact
@@ -298,7 +384,7 @@ impl HydraLane {
             res: UnsafeCell::new(Box::new(
                 [Res {
                     span_id: 0,
-                    _pad: 0,
+                    aux: 0,
                     value: 0,
                 }; RES_CAP],
             )),
@@ -870,7 +956,7 @@ fn lane_worker(
             let emit = |res_slots: &mut [Res], nres: &mut u64, span_id: u32, value: u64| {
                 res_slots[((rhead + *nres) & RES_MASK) as usize] = Res {
                     span_id,
-                    _pad: 0,
+                    aux: 0,
                     value,
                 };
                 *nres += 1;
@@ -1025,6 +1111,7 @@ fn lane_worker_rxdesc(
     rx: Arc<RxdescState>,
     lane_idx: u64,
     n_lanes: u64,
+    composite: bool,
 ) {
     stats
         .cpu
@@ -1068,20 +1155,34 @@ fn lane_worker_rxdesc(
     // span (one cached load + 3 compares; the line is worker-shared
     // read-only). The sink publishes a window's record BEFORE any of its
     // spans, so every span below `ready` is covered by a published
-    // record — the probe cannot miss.
+    // record — the probe cannot miss. R25a: returns the pass-start flag
+    // of the record the walk landed on (composite segments split there).
     #[inline(always)]
-    fn resolve_rec(rx: &RxdescState, gen: u64, slot: &mut u8, base: &mut u64, gid: u64) {
+    fn resolve_rec(
+        rx: &RxdescState,
+        gen: u64,
+        slot: &mut u8,
+        base: &mut u64,
+        gid: u64,
+    ) -> bool {
+        let mut is_pass = false;
         loop {
             let s = (*slot + 1) % RX_NARR as u8;
-            let (rg, rb) = rx.read_record(s);
+            let (rg, rb, rf) = rx.read_record(s);
             if rg == gen && rb > *base && rb <= gid {
                 *slot = s;
                 *base = rb;
+                is_pass = rf;
             } else {
-                return;
+                return is_pass;
             }
         }
     }
+
+    // R25a: the composite segment accumulator (flushed at every batch
+    // end — this worker re-enters the outer loop at the frontier, so
+    // publish points and segment breaks coincide).
+    let mut seg = SegAcc::new();
 
     loop {
         let (g, ready) = rx.load_ready();
@@ -1095,7 +1196,7 @@ fn lane_worker_rxdesc(
             blob_base = 0;
             let mut found = false;
             for s in 0..RX_NARR as u8 {
-                let (rg, rb) = rx.read_record(s);
+                let (rg, rb, _rf) = rx.read_record(s);
                 if rg == gen && rb == 0 {
                     rec_slot = s;
                     found = true;
@@ -1253,7 +1354,15 @@ fn lane_worker_rxdesc(
                         }
                     }
                 }
-                resolve_rec(&rx, gen, &mut rec_slot, &mut rec_base, gid);
+                // R25a: the per-span resolve — a pass-start landing
+                // splits the in-flight segment (composites never
+                // straddle a pass boundary; the split at any other
+                // landing point is merely an extra record — the
+                // composition law is exact for every k).
+                let is_pass = resolve_rec(&rx, gen, &mut rec_slot, &mut rec_base, gid);
+                if composite && is_pass {
+                    seg.flush(res_slots, rhead, &mut nres);
+                }
                 let w = rx.get_arr(rec_slot, (gid - rec_base) as usize);
                 let (off, dlen) = rxdesc_unpack_span(w);
                 // SAFETY: the entry was published by the sink's ready
@@ -1287,14 +1396,25 @@ fn lane_worker_rxdesc(
                     }
                 };
                 debug_assert!(gid <= u32::MAX as u64, "span id exceeds u32");
-                res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
-                    span_id: gid as u32,
-                    _pad: 0,
-                    value,
-                };
-                nres += 1;
+                // R25a: composite mode buffers the term (per-span mode
+                // emits the R23 shape verbatim — the rollback).
+                if composite {
+                    seg.push(gid, value);
+                } else {
+                    res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
+                        span_id: gid as u32,
+                        aux: 0,
+                        value,
+                    };
+                    nres += 1;
+                }
                 gid += 1;
                 n_total += 1;
+            }
+            // R25a: a FULLY-consumed grid chunk ends the segment (the
+            // fold's lane grid switches at exactly this span).
+            if composite && gid == (chunk + 1) * CHUNK {
+                seg.flush(res_slots, rhead, &mut nres);
             }
             // Advance: the resume position is `gid` — a batch-limited
             // stop mid-chunk resumes IN PLACE (advancing to chunk_hi
@@ -1316,6 +1436,13 @@ fn lane_worker_rxdesc(
         stats
             .eval_ns
             .fetch_add(t_eval.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // R25a: the batch's tail segment — compose + emit before the
+        // publish (the next batch/wake starts a fresh segment at its
+        // resume point; this worker's outer loop re-entry IS the publish
+        // boundary).
+        if composite {
+            seg.flush(res_slots, rhead, &mut nres);
+        }
         // SAFETY: slots [rhead, rhead+nres) fully written before this
         // Release store; the fold Acquires it and owns them after.
         lane.res_head.store(rhead + nres, Ordering::Release);
@@ -1380,6 +1507,7 @@ fn lane_worker_rxdesc_diet(
     rx: Arc<RxdescState>,
     lane_idx: u64,
     n_lanes: u64,
+    composite: bool,
 ) {
     stats
         .cpu
@@ -1432,20 +1560,35 @@ fn lane_worker_rxdesc_diet(
     let mut pf_base: u64 = 0;
     let mut pf_wb: u64;
     let mut backoff: u32 = 0;
+    // R25a: the composite segment accumulator (per-LANE lifetime; every
+    // publish point flushes it, so it is always empty at generation
+    // changes — the old gen's records drain via the old sink's
+    // finish()). `HFT_COMPOSITE_FOLD=0` (the rollback) keeps the per-span
+    // Res emission verbatim.
+    let mut seg = SegAcc::new();
 
     // Per-span pass-record resolution (identical semantics to the
     // pre-diet worker's probe; the diet calls it per boundary crossing
-    // instead of per span).
+    // instead of per span). R25a: returns the pass-start flag of the
+    // record the walk landed on — the composite segments split there.
     #[inline(always)]
-    fn resolve_rec(rx: &RxdescState, gen: u64, slot: &mut u8, base: &mut u64, gid: u64) {
+    fn resolve_rec(
+        rx: &RxdescState,
+        gen: u64,
+        slot: &mut u8,
+        base: &mut u64,
+        gid: u64,
+    ) -> bool {
+        let mut is_pass = false;
         loop {
             let s = (*slot + 1) % RX_NARR as u8;
-            let (rg, rb) = rx.read_record(s);
+            let (rg, rb, rf) = rx.read_record(s);
             if rg == gen && rb > *base && rb <= gid {
                 *slot = s;
                 *base = rb;
+                is_pass = rf;
             } else {
-                return;
+                return is_pass;
             }
         }
     }
@@ -1456,7 +1599,7 @@ fn lane_worker_rxdesc_diet(
     #[inline(always)]
     fn probe_wb(rx: &RxdescState, gen: u64, slot: u8, base: u64) -> u64 {
         let s = (slot + 1) % RX_NARR as u8;
-        let (rg, rb) = rx.read_record(s);
+        let (rg, rb, _rf) = rx.read_record(s);
         if rg == gen && rb > base {
             rb
         } else {
@@ -1479,7 +1622,7 @@ fn lane_worker_rxdesc_diet(
             // below overwrites both before any read.)
             let mut found = false;
             for s in 0..RX_NARR as u8 {
-                let (rg, rb) = rx.read_record(s);
+                let (rg, rb, _rf) = rx.read_record(s);
                 if rg == gen && rb == 0 {
                     rec_slot = s;
                     found = true;
@@ -1569,6 +1712,12 @@ fn lane_worker_rxdesc_diet(
             if eval >= ready {
                 // STRAND A — the frontier hit: publish the partial run
                 // FIRST (liveness), then wait at the frontier hot.
+                // R25a: flush the in-flight segment — the resume (this
+                // batch or the next wake) starts a fresh one; a
+                // composite record may never span a publish boundary.
+                if composite {
+                    seg.flush(res_slots, rhead, &mut nres);
+                }
                 if nres > 0 {
                     std::hint::black_box(&res_slots[(rhead & RES_MASK) as usize]);
                     // SAFETY: slots [rhead, rhead+nres) fully written
@@ -1649,9 +1798,23 @@ fn lane_worker_rxdesc_diet(
                 // STRAND B: the boundary crossing — one register compare
                 // per span; the resolve (with re-probe) only at crossings.
                 if gid >= next_wb {
-                    resolve_rec(&rx, gen, &mut rec_slot, &mut rec_base, gid);
+                    let is_pass =
+                        resolve_rec(&rx, gen, &mut rec_slot, &mut rec_base, gid);
                     next_wb = probe_wb(&rx, gen, rec_slot, rec_base);
                     idx = (gid - rec_base) as usize;
+                    // R25a: the record covering this span opens a pass —
+                    // split the segment here (spans at and above its base
+                    // fold into the NEXT pass's chain; the consumer
+                    // snapshots + re-seeds exactly there, so a composite
+                    // may never straddle it). The walk fires exactly at
+                    // the boundary span (next_wb == the pass-start
+                    // record's base), and a split at any OTHER point is
+                    // merely an extra record — the composition law is
+                    // exact for every k, so this is fail-safe, not
+                    // fail-loud.
+                    if composite && is_pass {
+                        seg.flush(res_slots, rhead, &mut nres);
+                    }
                 }
                 // STRAND C: the spray — per-chunk sections, division-free.
                 if pf.lines > 0 && pf.burst > 0 {
@@ -1753,15 +1916,31 @@ fn lane_worker_rxdesc_diet(
                     }
                 };
                 debug_assert!(gid <= u32::MAX as u64, "span id exceeds u32");
-                res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
-                    span_id: gid as u32,
-                    _pad: 0,
-                    value,
-                };
-                nres += 1;
+                // R25a: composite mode buffers the premultiplied term
+                // (an 8-byte L1 store; the record lands once per SEGMENT
+                // at the flush points) — per-span mode emits the R23
+                // shape verbatim (the HFT_COMPOSITE_FOLD=0 rollback).
+                if composite {
+                    seg.push(gid, value);
+                } else {
+                    res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
+                        span_id: gid as u32,
+                        aux: 0,
+                        value,
+                    };
+                    nres += 1;
+                }
                 gid += 1;
                 n_total += 1;
                 idx += 1;
+            }
+            // R25a: a FULLY-consumed grid chunk ends the segment here —
+            // the fold's lane grid switches at exactly this span, so the
+            // consumer's fold_rem bookkeeping requires the record to end
+            // with the chunk (a partial, ready-limited chunk keeps the
+            // segment open: the resume continues it in place).
+            if composite && gid == chunk_lo + CHUNK {
+                seg.flush(res_slots, rhead, &mut nres);
             }
             // Advance: a batch-limited stop mid-chunk resumes IN PLACE; a
             // fully-consumed chunk moves to this lane's NEXT grid chunk
@@ -1787,6 +1966,12 @@ fn lane_worker_rxdesc_diet(
             Ordering::Relaxed,
         );
         stats.frontier_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        // R25a: the batch's tail segment — compose + emit before the
+        // publish (the next batch starts a fresh segment at its resume
+        // point).
+        if composite {
+            seg.flush(res_slots, rhead, &mut nres);
+        }
         // SAFETY: slots [rhead, rhead+nres) fully written before this
         // Release store; the fold Acquires it and owns them after.
         if nres > 0 {
@@ -1825,6 +2010,14 @@ pub struct HydraFabric {
     /// sustained default is the RING + distinct placement; rxdesc stays
     /// merged as the armed attribution arm. Per-run constant, like `desc8`.
     pub rxdesc: Option<Arc<RxdescState>>,
+    /// R25a: the composite-fold res-ring format (per-run constant — the
+    /// sink's consumer loop and every array worker read THIS flag, so
+    /// one run never mixes interpretations). `true` (the default,
+    /// `HFT_COMPOSITE_FOLD=0` is the rollback, CI arm 11y): one 16-byte
+    /// composite record per SEGMENT (≤64 spans). `false`: the R23
+    /// per-span Res shape. Only meaningful with `rxdesc` armed — the
+    /// ring path always emits per-span (its rollback semantics).
+    pub composite_res: bool,
 }
 
 impl HydraFabric {
@@ -1859,7 +2052,14 @@ impl HydraFabric {
         // pre-diet rxdesc worker verbatim). Read once here, outside every
         // window (law #9: env parsing is allocation).
         let diet = std::env::var("HFT_RXDIET").as_deref() != Ok("0");
-        Self::spawn_pinned_full(workers, worker_cpus, desc8, rxdesc, diet)
+        // R25a: the chunk-composite fold — ONE res record per segment
+        // (≤64 spans) instead of one per span. The default IS the
+        // composite; `HFT_COMPOSITE_FOLD=0` is the rollback (CI arm 11y —
+        // the per-span emission + per-span consumer fold, attribution
+        // for the composite's contribution). Read once here, outside
+        // every window (law #9: env parsing is allocation).
+        let composite = rxdesc && std::env::var("HFT_COMPOSITE_FOLD").as_deref() != Ok("0");
+        Self::spawn_pinned_full(workers, worker_cpus, desc8, rxdesc, diet, composite)
     }
 
     /// R12: `spawn_pinned` with an explicit descriptor format (the
@@ -1867,12 +2067,14 @@ impl HydraFabric {
     /// serves CI sweeps). The R16b rxdesc path stays OFF in this form —
     /// the legacy ring path is what the existing parity suite pins.
     pub fn spawn_pinned_desc8(workers: usize, worker_cpus: &[usize], desc8: bool) -> Box<Self> {
-        Self::spawn_pinned_full(workers, worker_cpus, desc8, false, true)
+        Self::spawn_pinned_full(workers, worker_cpus, desc8, false, true, false)
     }
 
     /// R16b: the full-control spawn (descriptor format + submission path).
     /// R16e: + the diet flag (the rxdesc worker-eval shape; `false` = the
     /// pre-diet worker verbatim — the parity suite pins both shapes).
+    /// R25a: + the composite-fold flag (the res-ring record format; the
+    /// parity suite pins both shapes).
     /// All allocation (rings, arrays, threads) happens here — outside
     /// every measurement window.
     pub fn spawn_pinned_full(
@@ -1881,6 +2083,7 @@ impl HydraFabric {
         desc8: bool,
         rxdesc: bool,
         diet: bool,
+        composite: bool,
     ) -> Box<Self> {
         let kernel = CrcKernel::detect();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1911,6 +2114,7 @@ impl HydraFabric {
             let rxs = rxdesc_state.clone();
             let lane_idx = i as u64;
             let n_lanes = lanes.len() as u64;
+            let comp = composite;
             let h = std::thread::Builder::new()
                 .stack_size(512 * 1024)
                 .name("hydra-worker".to_string())
@@ -1922,10 +2126,12 @@ impl HydraFabric {
                         Some(rx) => {
                             if diet {
                                 lane_worker_rxdesc_diet(
-                                    lane, sd, kern, stats, rx, lane_idx, n_lanes,
+                                    lane, sd, kern, stats, rx, lane_idx, n_lanes, comp,
                                 )
                             } else {
-                                lane_worker_rxdesc(lane, sd, kern, stats, rx, lane_idx, n_lanes)
+                                lane_worker_rxdesc(
+                                    lane, sd, kern, stats, rx, lane_idx, n_lanes, comp,
+                                )
                             }
                         }
                         None => lane_worker(lane, sd, kern, stats, fmt8),
@@ -1944,6 +2150,7 @@ impl HydraFabric {
             kernel,
             desc8,
             rxdesc: rxdesc_state,
+            composite_res: composite,
         })
     }
 
@@ -2226,6 +2433,12 @@ pub struct HydraSpanSink<'a> {
     /// frame order; the forward scan is O(1) amortized; reset at
     /// generation changes).
     rx_affine_cursor: usize,
+    /// R25a: the current pass's first span id (u64::MAX = no
+    /// begin_pass'd pass — the burst shape). A window opening EXACTLY
+    /// here is a pass-start window: its record carries the pass flag so
+    /// the composite-fold workers split their segment at the boundary
+    /// (the consumer snapshots + re-seeds the chain there).
+    pass_start_span: u64,
 }
 
 impl<'a> HydraSpanSink<'a> {
@@ -2323,6 +2536,7 @@ impl<'a> HydraSpanSink<'a> {
             rx_assist_wm: Self::assist_watermark(),
             rx_affine,
             rx_affine_cursor: 0,
+            pass_start_span: u64::MAX,
         };
         // R21 (Task 2, the fused arm's flip-validation instrument): prove
         // the fused shape armed — printed ONCE per process at the first
@@ -2408,6 +2622,10 @@ impl<'a> HydraSpanSink<'a> {
         // fresh generation's spans revisit the blob's frames from the
         // first row).
         self.rx_affine_cursor = 0;
+        // R25a: no pass is open after a reset (the next begin_pass sets
+        // it; a burst-shaped run never does — MAX means "no pass
+        // boundary flag on window opens").
+        self.pass_start_span = u64::MAX;
         // Chunk 0 → lane 0; advance on chunk completion (after-use).
         self.submit_rem = CHUNK;
         self.fold_rem = CHUNK;
@@ -2426,6 +2644,10 @@ impl<'a> HydraSpanSink<'a> {
     /// overlaps pass N's tail fold).
     pub fn begin_pass(&mut self) {
         assert!(!self.pass_open, "begin_pass while a pass is open");
+        // R25a: the pass's first span — a window opening exactly here is
+        // a pass-start window (its record carries the flag; the
+        // composite-fold workers split their segment at this span).
+        self.pass_start_span = self.next_span;
         // Ring capacity: one slot must remain free for this record.
         assert_ne!(
             (self.pass_head + 1) % PASS_RING,
@@ -2546,11 +2768,14 @@ impl<'a> HydraSpanSink<'a> {
         k
     }
 
-    /// The per-span fold — EXACTLY `SpanConformanceSink::on_span`'s mix.
+    /// The per-span fold — EXACTLY `SpanConformanceSink::on_span`'s mix
+    /// (R25a: the composable law `h ← rotl(h,13) ^ (v·P)`, reassociated
+    /// from the R23 `h ← (rotl(h,13) ^ v)·P` so that chunk segments
+    /// compose — see `sink::fold_compose_b`/`fold_compose_apply`; the
+    /// per-span form stays the reference and the rollback path).
     #[inline(always)]
     fn fold_value(&mut self, v: u64) {
-        self.hash = self.hash.rotate_left(13) ^ v;
-        self.hash = self.hash.wrapping_mul(0x9e3779b97f4a7c15);
+        self.hash = crate::sink::fold_step(self.hash, v);
     }
 
     /// R16b: publish the span-count cursor — the ONE Release store that
@@ -2612,7 +2837,14 @@ impl<'a> HydraSpanSink<'a> {
         // schedule + immutable blob bodies), so steady passes find the
         // tag correct and the check stays the ONE word compare.
         st.copy_tags(prev_slot as u8, slot, st.last_window_count());
-        st.publish_record(slot, self.rx_gen, self.next_span);
+        // R25a: the pass-start flag — a window opening exactly at the
+        // current pass's first span is a pass boundary (begin_pass's
+        // eager open, or the lazy open firing on the pass's first
+        // submit). The composite-fold workers split their segment at
+        // the record's base; per-span spans cross the boundary in the
+        // consumer's cap logic as before (both modes stay bit-exact).
+        let pass_start = self.next_span == self.pass_start_span;
+        st.publish_record(slot, self.rx_gen, self.next_span, pass_start);
         self.rx_win_slot = slot;
         self.rx_win_base = self.next_span;
         self.rx_win_open = true;
@@ -3150,6 +3382,77 @@ impl<'a> HydraSpanSink<'a> {
             if tail == head {
                 break; // this lane's next batch isn't ready — order is strict
             }
+            // R25a: THE COMPOSITE DRAIN — one 16-byte record per SEGMENT
+            // (≤ CHUNK spans, ending at grid-chunk ends / batch publishes
+            // / pass boundaries by the worker's break discipline). The
+            // per-record cost is TWO dependent ops (`rotl` + `xor` —
+            // `sink::fold_compose_apply`); the per-span Res load, the
+            // span_id assert and the serial rotl⊕IMUL chain are all gone
+            // — this is the loop the Run 500+ diagnosis pinned as the
+            // consumer-side strangler. Records never straddle a pending
+            // pass boundary (the worker splits at pass-start records),
+            // so the boundary cap drops to the debug assert; records end
+            // at grid-chunk ends, so `k ≤ fold_rem` always holds and the
+            // lane switch fires exactly at record boundaries.
+            if fabric.composite_res {
+                // SAFETY: slots [tail & RES_MASK, +count) published by the
+                // worker's Release store to res_head (loaded Acquire
+                // above) and owned by main until the res_tail Release
+                // store below. Per-slot masking handles the ring wrap.
+                let slots = lane.res_slots_read();
+                let mut consumed: u64 = 0;
+                while tail + consumed < head {
+                    let r = &slots[((tail + consumed) & RES_MASK) as usize];
+                    let k = r.aux as u64;
+                    debug_assert!(
+                        k >= 1 && k <= self.fold_rem,
+                        "composite record k={k} exceeds fold_rem={} at span {}",
+                        self.fold_rem,
+                        r.span_id
+                    );
+                    debug_assert_eq!(
+                        r.span_id as u64,
+                        self.fold_pos,
+                        "hydra composite fold-order violation: got span {}, expected {}",
+                        r.span_id,
+                        self.fold_pos
+                    );
+                    if self.pass_tail != self.pass_head {
+                        let rec = &self.passes[self.pass_tail];
+                        debug_assert!(
+                            rec.done
+                                || rec.end_span == u64::MAX
+                                || self.fold_pos + k <= rec.end_span,
+                            "composite record straddled a pass boundary ({}+{} > {})",
+                            self.fold_pos,
+                            k,
+                            rec.end_span
+                        );
+                    }
+                    // THE APPLICATION: h ← rotl(h, 13k) ^ B.
+                    self.hash =
+                        crate::sink::fold_compose_apply(self.hash, k as u32, r.value);
+                    self.fold_pos += k;
+                    self.fold_rem -= k;
+                    consumed += 1;
+                    if self.fold_rem == 0 {
+                        self.fold_rem = CHUNK;
+                        self.fold_lane = if self.fold_lane + 1 == self.n_lanes {
+                            0
+                        } else {
+                            self.fold_lane + 1
+                        };
+                        // The lane's later chunks (its ring may hold more
+                        // of them) wait their grid turn — the ORDER LAW.
+                        break;
+                    }
+                    // A record ending exactly at a boundary snapshots now.
+                    self.complete_boundaries();
+                }
+                lane.res_tail.store(tail + consumed, Ordering::Release);
+                self.complete_boundaries();
+                continue;
+            }
             // Never fold past the end of fold_pos's chunk (lane changes there).
             let mut n = (head - tail).min(self.fold_rem);
             // GIGAHFT Lever 4: never fold past the oldest pending pass
@@ -3536,6 +3839,72 @@ mod tests {
         (sink.count, sink.hash, sink.msg_hash)
     }
 
+    /// R25a: the composite-fold law's differential — the algebraic heart
+    /// of the chunk-composite path. For every segment length k (1..=64,
+    /// all residues hitting the 13k mod 64 rotation table), the
+    /// step-by-step reference (one `fold_step` per span — the law
+    /// `h ← rotl(h,13) ^ (v·P)`) must equal ONE composite application
+    /// (`fold_compose_apply(h, k, B)` with `B = fold_compose_b(terms)`)
+    /// — 10,000 random vectors. The SPLIT variant pins the pass-boundary
+    /// discipline: a segment split at ANY interior point m composes into
+    /// the same chain as the unsplit segment (the worker's split at
+    /// pass-start records and batch ends is exactly this shape, and the
+    /// consumer applies the two records in sequence).
+    #[test]
+    fn t_r25_composite_law() {
+        use crate::sink::{fold_compose_apply, fold_compose_b, fold_step, fold_term};
+        let mut rng = 0x0DDB_1A5C_0FF5_0001u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut splits_checked = 0u32;
+        for _ in 0..10_000 {
+            let k = 1 + next() % 64;
+            let h0 = next();
+            let vals: Vec<u64> = (0..k).map(|_| next() | 1).collect();
+            // (a) step-by-step reference.
+            let mut h_step = h0;
+            for &v in &vals {
+                h_step = fold_step(h_step, v);
+            }
+            // (b) one composite application.
+            let terms: Vec<u64> = vals.iter().map(|&v| fold_term(v)).collect();
+            let b = fold_compose_b(&terms);
+            let h_comp = fold_compose_apply(h0, k as u32, b);
+            assert_eq!(
+                h_step, h_comp,
+                "composite diverged from step fold (k={k}) — the composition law broke"
+            );
+            // (c) split at an interior point m — the boundary/batch split
+            // discipline (two records in sequence == one record).
+            if k > 1 {
+                let m = 1 + next() % (k - 1);
+                let b1 = fold_compose_b(&terms[..m as usize]);
+                let b2 = fold_compose_b(&terms[m as usize..]);
+                let h_split = fold_compose_apply(
+                    fold_compose_apply(h0, m as u32, b1),
+                    (k - m) as u32,
+                    b2,
+                );
+                assert_eq!(
+                    h_step, h_split,
+                    "split composite diverged (k={k}, m={m}) — segment splits are not compositional"
+                );
+                splits_checked += 1;
+            }
+        }
+        assert!(splits_checked > 9_000, "split coverage too thin");
+        // (d) the k=64 identity rotation: 13·64 ≡ 0 (mod 64) — a full
+        // chunk applies as a pure XOR (the fast path's shape).
+        let terms: Vec<u64> = (0..64).map(|_| next() | 1).map(fold_term).collect();
+        let b = fold_compose_b(&terms);
+        let h0 = next();
+        assert_eq!(fold_compose_apply(h0, 64, b), h0 ^ b);
+    }
+
     /// R23c: the affine-tag protocol's end-to-end bit-parity — the rxdesc
     /// array path with the tag sidecar armed, LEDGER-LESS (the sink's cold
     /// fill scans the bodies — the fallback), two generations (the second
@@ -3555,7 +3924,7 @@ mod tests {
         let sess = *b"AFFINEHYDR";
         // The fabric with the array path + diet worker (the CI 11ab arm's
         // shape). No transport attachment — the LEDGER-LESS fill.
-        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true);
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true);
         let mut t1 = ReplayTransport::new(&gt, sched.clone(), sess);
         let mut t2 = ReplayTransport::new(&gt, sched.clone(), sess);
 
@@ -3612,7 +3981,7 @@ mod tests {
         };
         let sched = build_schedule(&gt, &cfg);
         let sess = *b"AFFPIPELIN";
-        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true);
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true);
         let mut piped = nf_transport::pipeline::PipelinedReplayTransport::new(&gt, sched.clone(), sess);
         // R23c: the attach BEFORE the first reset — arms the RX ledger.
         if let Some(st) = fabric.rxdesc_state() {
@@ -4155,7 +4524,10 @@ mod tests {
                     if !diet && w != 2 {
                         continue; // the pre-diet pin covers the essential shape only
                     }
-                    let fabric = HydraFabric::spawn_pinned_full(w, &[], true, true, diet);
+                    // R25a: BOTH res-ring formats — the composite default
+                    // and the per-span rollback (the 11y arm's parity).
+                    for comp in [true, false] {
+                    let fabric = HydraFabric::spawn_pinned_full(w, &[], true, true, diet, comp);
 
                     // (a) the check+fix path (single-threaded transport: no
                     // prefill — every array entry written by the sink itself).
@@ -4163,7 +4535,7 @@ mod tests {
                     let got = hydra_pass(&mut t1, sess, &fabric);
                     assert_eq!(
                         got, want,
-                        "rxdesc check+fix diverged (chaos={chaos}, w={w}, diet={diet})"
+                        "rxdesc check+fix diverged (chaos={chaos}, w={w}, diet={diet}, comp={comp})"
                     );
 
                     // (b) forced-inline (every chunk on the submitting core;
@@ -4172,7 +4544,7 @@ mod tests {
                     let got_force = assist_pass(&mut t2, sess, &fabric);
                     assert_eq!(
                         got_force, want,
-                        "rxdesc forced-inline diverged (chaos={chaos}, w={w}, diet={diet})"
+                        "rxdesc forced-inline diverged (chaos={chaos}, w={w}, diet={diet}, comp={comp})"
                     );
 
                     // (c) the full stack: pipelined transport + the
@@ -4193,7 +4565,7 @@ mod tests {
                     let (got3, _fixes, assists1) = hydra_pass_piped(&mut t3, &fabric);
                     assert_eq!(
                         got3, want,
-                        "rxdesc pipelined diverged (chaos={chaos}, w={w}, diet={diet})"
+                        "rxdesc pipelined diverged (chaos={chaos}, w={w}, diet={diet}, comp={comp})"
                     );
                     // Determinism + the warm start's fast path (a fresh sink
                     // — the generation re-anchor — warm-started from the
@@ -4202,7 +4574,7 @@ mod tests {
                     let (got4, fixes2, assists2) = hydra_pass_piped(&mut t3, &fabric);
                     assert_eq!(
                         got4, want,
-                        "rxdesc pipelined determinism diverged (chaos={chaos}, w={w}, diet={diet})"
+                        "rxdesc pipelined determinism diverged (chaos={chaos}, w={w}, diet={diet}, comp={comp})"
                     );
                     if !chaos && assists1 + assists2 == 0 {
                         // The warm start's FAST PATH: with no assist chunks
@@ -4212,11 +4584,12 @@ mod tests {
                         // correct: zero stores on the submitting core.
                         assert_eq!(
                         fixes2, 0,
-                        "steady second pass needed check-and-fix corrections (w={w}, diet={diet}) — \
+                        "steady second pass needed check-and-fix corrections (w={w}, diet={diet}, comp={comp}) — \
                          the warm start missed entries"
                     );
                     }
-                }
+                    } // comp
+                } // w
             }
         }
     }
@@ -4276,9 +4649,16 @@ mod tests {
         // slot-cycling scale: the reuse gate, the straddling boundaries,
         // the frontier waits' partial publishes and the boundary cache's
         // mid-chunk crossings all under load).
+        // R25a: BOTH res-ring formats under the 400-pass straddle soak —
+        // the composite default and the per-span rollback (the pass-start
+        // record flags + segment splits get hammered here: 7903 spans per
+        // pass, 7903 mod 64 = 47, so ~every pass boundary straddles a grid
+        // chunk mid-chunk).
         for diet in [true, false] {
             let label = if diet { "diet" } else { "pre-diet" };
-            let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, diet);
+            for comp in [true, false] {
+            let label = if comp { format!("{label}+comp") } else { format!("{label}+perspan") };
+            let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, diet, comp);
             let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto(
                 &gt,
                 sched.clone(),
@@ -4336,6 +4716,7 @@ mod tests {
             let expect: Vec<(u64, u64, u64)> =
                 (2..=400u64).map(|p| want[((p - 1) % 4) as usize]).collect();
             assert_eq!(got, expect, "rxdesc sustained multipass diverged ({label})");
-        }
+            } // comp
+        } // diet
     }
 }

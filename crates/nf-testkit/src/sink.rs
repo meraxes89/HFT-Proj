@@ -61,6 +61,75 @@ pub(crate) fn fast_hash_bytes(h: u64, bytes: &[u8]) -> u64 {
     fnv_bytes(h, bytes)
 }
 
+/// R25a: the per-span ordered-fold law's premultiply constant. The fold
+/// `h ← rotl(h,13) ^ (v·P)` is the COMPOSABLE re-derivation of the
+/// R23 law `h ← (rotl(h,13) ^ v)·P` — same three mixing primitives
+/// (rotate, XOR, golden-ratio multiply), reassociated so the multiply
+/// rides the INDEPENDENT span values instead of the serial chain.
+///
+/// **The composition law** (the whole point): over `k` consecutive spans
+/// with values `v_1..v_k`, writing `u_i = v_i·P`,
+///
+/// ```text
+/// H_k = rotl(H_0, 13k mod 64) ^ ⊕_{i=1..k} rotl(u_i, 13(k−i) mod 64)
+/// ```
+///
+/// Induction: the i-th premultiplied value enters with a rotation that
+/// depends ONLY on its distance from the segment end — every term is
+/// independently computable, so a worker can fold a whole 64-span chunk
+/// into ONE 16-byte composite record `(k, B)` and the consumer applies
+/// it in two instructions (`rotl` + `xor`) instead of k serial
+/// rotl⊕mul chains. The old law's trailing `·P` made the composition
+/// non-expressible (integer multiply does not distribute over XOR),
+/// which is precisely why the consumer had to fold span-by-span.
+/// Both mixers stay: the multiply still avalanches every value before
+/// it enters the XOR tree, and the rotation keeps the chain
+/// position-sensitive (a duplicate at distance 64k still cannot cancel
+/// — its `u` differs by the P-avalanche; sequence-continuity asserts
+/// remain the primary order/dup detector, as before).
+pub const FOLD_MIX_P: u64 = 0x9e3779b97f4a7c15;
+
+/// R25a: the fold's rotation amount.
+pub const FOLD_ROT: u32 = 13;
+
+/// R25a: the per-span contribution entering the composite XOR tree —
+/// the premultiplied value `u_i = v_i·P`.
+#[inline(always)]
+pub fn fold_term(v: u64) -> u64 {
+    v.wrapping_mul(FOLD_MIX_P)
+}
+
+/// R25a: the composite constant of a segment. `terms` are the segment's
+/// `u_i` in span order (i = 0 is the FIRST span of the segment);
+/// `B = ⊕_i rotl(u_i, 13·(k−1−i) mod 64)` — each term's rotation
+/// depends only on its distance from the segment END, so the loop is
+/// throughput-bound (independent RORX + XOR), never latency-bound.
+#[inline]
+pub fn fold_compose_b(terms: &[u64]) -> u64 {
+    let k = terms.len() as u32;
+    let mut b = 0u64;
+    for (i, &u) in terms.iter().enumerate() {
+        b ^= u.rotate_left((FOLD_ROT * (k - 1 - i as u32)) % 64);
+    }
+    b
+}
+
+/// R25a: apply a composite record `(k, B)` to the running hash — the
+/// consumer's whole per-segment cost (two dependent ops per segment
+/// where the per-span path spent k×(rotl⊕xor+IMUL) serial cycles).
+#[inline(always)]
+pub fn fold_compose_apply(h: u64, k: u32, b: u64) -> u64 {
+    h.rotate_left((FOLD_ROT * k) % 64) ^ b
+}
+
+/// R25a: one step of the fold (the reference law, bit-exact with the
+/// composite by the composition identity above — pinned by
+/// `t_r25_composite_law`'s differential).
+#[inline(always)]
+pub fn fold_step(h: u64, v: u64) -> u64 {
+    h.rotate_left(FOLD_ROT) ^ fold_term(v)
+}
+
 /// Folds all emitted messages into the canonical golden FNV-1a-64 hash (doc 04 §8).
 #[derive(Debug, Clone, Copy)]
 pub struct HashSink {
@@ -703,8 +772,7 @@ impl Sink for SpanConformanceSink {
         }
         self.last_seq = first_seq + count as u64 - 1;
         let span = span_crc32c_8lane(body);
-        self.hash = self.hash.rotate_left(13) ^ span;
-        self.hash = self.hash.wrapping_mul(0x9e3779b97f4a7c15);
+        self.hash = self.hash.rotate_left(13) ^ span.wrapping_mul(FOLD_MIX_P);
         self.count += count as u64;
     }
 }

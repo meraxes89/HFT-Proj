@@ -401,6 +401,43 @@ grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_affine.txt
 grep "R23B_AFFINE_VERDICT arm=sustained" /tmp/bench_affine.txt | head -1
 grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_affine.txt | head -1
 
+echo "=== 11comp. R25a: Chunk-Composite Fold ROLLBACK (attribution) ==="
+# THE R25a SHIP (docs/39): the consumer's per-span serial fold loop
+# (hydra.rs fold_available — rotl(13) ^ v then *P per span, one Res
+# record per span, the loop the Run 500+ diagnosis pinned as the
+# consumer-side strangler) is replaced by the algebraic composite: the
+# fold law re-associated to h <- rotl(h,13) ^ (v*P) (composable), the
+# array workers fold each <=64-span segment into ONE 16-byte composite
+# record (B = XOR of independently-rotated premultiplied terms), and
+# the consumer applies it as rotl(h,13k) ^ B — two dependent ops per
+# SEGMENT. Result-ring traffic drops ~46x (res records per pass:
+# ~3.9k -> ~85 per lane). THIS arm is the rollback: the per-span Res
+# emission + per-span consumer fold verbatim under the NEW law (the
+# law change is not a knob — bit-parity is its gate; the composite is
+# the perf shape). The verdict line stays the instrument; same-draw
+# delta 11ab - 11comp = the composite's contribution.
+HFT_RXDESC=1 HFT_COMPOSITE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_compoff.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_compoff.txt
+grep -q "allocs=0" /tmp/bench_compoff.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_compoff.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_compoff.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_compoff.txt | head -1
+
+echo "=== 11smt. R25b: Scalars-Stacked Placement ROLLBACK (attribution) ==="
+# THE R25b FLIP: the default placement for the 2-worker 2-core SMT
+# shape is now scalars_stacked (main+rx BOTH on cpu1, worker 1's
+# sibling idle — the RX ingest thread no longer shares issue ports
+# and L1/L2 with the worker on cpu2; run 38683262938 pinned the theft:
+# rx_actual_cpu=3, worker 1 lagging all window). THIS arm is the
+# rollback: the R16d "distinct" layout (main 1, rx 3) verbatim.
+# Same-draw delta 11ab - 11smt = the SMT-interference theft the
+# Run 500+ diagnosis priced.
+HFT_RXDESC=1 HFT_FABRIC_PLACE=distinct cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_smtback.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_smtback.txt
+grep -q "allocs=0" /tmp/bench_smtback.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_smtback.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_smtback.txt | head -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median

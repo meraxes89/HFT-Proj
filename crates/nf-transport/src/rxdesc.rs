@@ -466,6 +466,39 @@ pub fn rx_unpack_u64(w: u64) -> (u64, u64) {
     (w >> 48, w & 0xFFFF_FFFF_FFFF)
 }
 
+/// R25a: the window-record pass-start flag — bit 47 of the packed
+/// record word. Set on the record of a window that opens EXACTLY at a
+/// pass boundary (`begin_pass`'s eager open), so the composite-fold
+/// workers know where to split a segment: spans at and above a
+/// pass-start record's base fold into the NEXT pass's chain (the
+/// consumer snapshots and re-seeds there), so a composite record may
+/// never straddle the base. Base spans stay 47-bit-safe (a sustained
+/// run's global span ids are bounded by spans/s × runtime — decades
+/// of headroom; `debug_assert`ed at pack time).
+pub const RX_REC_PASS_BIT: u64 = 1 << 47;
+const RX_REC_BASE_MASK: u64 = (1 << 47) - 1;
+
+/// R25a: pack a window record `(gen, base_span, pass_start)`.
+#[inline(always)]
+pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool) -> u64 {
+    debug_assert!(gen < (1 << 16) && base_span < (1 << 47));
+    (gen << 48) | if pass_start {
+        RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
+    } else {
+        base_span & RX_REC_BASE_MASK
+    }
+}
+
+/// R25a: unpack a window record — `(gen, base_span, pass_start)`.
+#[inline(always)]
+pub fn rx_unpack_record(w: u64) -> (u64, u64, bool) {
+    (
+        w >> 48,
+        w & RX_REC_BASE_MASK,
+        w & RX_REC_PASS_BIT != 0,
+    )
+}
+
 /// Compact 8-byte span descriptor: `offset:u32 | len:u16` (flags in the
 /// high 16 bits, currently zero). Identical formula to the R12 Desc8 ring
 /// packing — one format across rings and arrays.
@@ -698,13 +731,17 @@ impl RxdescState {
     }
 
     /// Publish the window's record (sink, at window open — AFTER the
-    /// reuse gate and the warm start): `records[slot] = (gen, base_span)`
-    /// and `last_slot = slot`.
+    /// reuse gate and the warm start): `records[slot] = (gen, base_span,
+    /// pass_start)` and `last_slot = slot`. R25a: `pass_start` marks a
+    /// window opening exactly at a pass boundary — the composite-fold
+    /// workers split their segment there (the consumer snapshots +
+    /// re-seeds the chain at that span, so composites never straddle
+    /// it).
     #[inline]
-    pub fn publish_record(&self, slot: u8, gen: u64, base_span: u64) {
+    pub fn publish_record(&self, slot: u8, gen: u64, base_span: u64, pass_start: bool) {
         self.records[slot as usize]
             .0
-            .store(rx_pack_u64(gen, base_span), Ordering::Release);
+            .store(rx_pack_record(gen, base_span, pass_start), Ordering::Release);
         self.last_slot.store(slot, Ordering::Relaxed);
     }
 
@@ -762,10 +799,12 @@ impl RxdescState {
         }
     }
 
-    /// Read a pass record (worker, during the record walk).
+    /// Read a pass record (worker, during the record walk) —
+    /// `(gen, base_span, pass_start)` (R25a: the flag is part of the
+    /// walk's boundary bookkeeping).
     #[inline]
-    pub fn read_record(&self, slot: u8) -> (u64, u64) {
-        rx_unpack_u64(self.records[slot as usize].0.load(Ordering::Acquire))
+    pub fn read_record(&self, slot: u8) -> (u64, u64, bool) {
+        rx_unpack_record(self.records[slot as usize].0.load(Ordering::Acquire))
     }
 
     /// Publish the span-count cursor (sink, after array fixes — the
