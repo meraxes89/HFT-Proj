@@ -2631,6 +2631,25 @@ pub struct HydraSpanSink<'a> {
     /// window's count — `last_window_count` at open; the epoch's count
     /// stability check AND the per-fix guard's lagging-reader bound).
     rx_win_count0: u64,
+    /// R29: the ZERO-THREAD INGEST is ON (HFT_SELF_SERVE=0 is the
+    /// documented rollback — the full submission cadence, the exact
+    /// pre-R29 shape). Per-run constant, read at construction.
+    rx_selfserve: bool,
+    /// R29: the CURRENT window is self-serve — the window's whole span
+    /// range was pre-published at open (`spans_ready = base + count0`);
+    /// the workers ingest directly from the frozen array while the main
+    /// core's scan walks the sequencer ladder only (the commit path —
+    /// chunk-open assists, the vector check, the publish cadence — is
+    /// skipped for the window's steady batches).
+    rx_win_ss: bool,
+    /// R29: the current self-serve window's pre-published frontier (the
+    /// ready cursor's floor while the window is open — publications
+    /// clamp to `max(next_span, rx_win_pre)` so the cursor never moves
+    /// backward, and the close reconciles to the actual end).
+    rx_win_pre: u64,
+    /// R29: the self-serve engagement telemetry (windows armed; read
+    /// post-run by the verdict lines).
+    rx_ss_wins: u64,
 }
 
 impl<'a> HydraSpanSink<'a> {
@@ -2739,6 +2758,10 @@ impl<'a> HydraSpanSink<'a> {
             rx_ever_opened: false,
             rx_win_fix0: 0,
             rx_win_count0: 0,
+            rx_selfserve: std::env::var("HFT_SELF_SERVE").as_deref() != Ok("0"),
+            rx_win_ss: false,
+            rx_win_pre: 0,
+            rx_ss_wins: 0,
         };
         // R21 (Task 2, the fused arm's flip-validation instrument): prove
         // the fused shape armed — printed ONCE per process at the first
@@ -2828,6 +2851,9 @@ impl<'a> HydraSpanSink<'a> {
         self.rx_ever_opened = false;
         self.rx_win_fix0 = 0;
         self.rx_win_count0 = 0;
+        self.rx_win_ss = false;
+        self.rx_win_pre = 0;
+        // (rx_ss_wins is run-lifetime telemetry — not reset.)
         // R23c: the ledger cursor restarts with the span sequence (the
         // fresh generation's spans revisit the blob's frames from the
         // first row).
@@ -2952,6 +2978,11 @@ impl<'a> HydraSpanSink<'a> {
             self.rx_win_open = false;
         }
         self.rx_publish_ready();
+        // R29: the self-serve window's close — the publish above
+        // reconciled the frontier (max(actual, pre); equal in the steady
+        // law) and the window's mode retires.
+        self.rx_win_ss = false;
+        self.rx_win_pre = 0;
         self.complete_boundaries();
     }
 
@@ -3013,7 +3044,18 @@ impl<'a> HydraSpanSink<'a> {
     #[inline]
     fn rx_publish_ready(&mut self) {
         if let Some(st) = &self.rx {
-            st.publish_ready(self.rx_gen, self.next_span);
+            // R29: the self-serve window's frontier never moves backward —
+            // the open pre-published `base + count0`, and any intermediate
+            // publish (a cold frame's per-span path, an assist's chunk
+            // completion) clamps to the floor. The close reconciles to the
+            // actual end (== the floor in the steady law; a divergent
+            // window's tuple assert is the loud failure).
+            let v = if self.rx_win_ss {
+                self.next_span.max(self.rx_win_pre)
+            } else {
+                self.next_span
+            };
+            st.publish_ready(self.rx_gen, v);
         }
     }
 
@@ -3158,6 +3200,41 @@ impl<'a> HydraSpanSink<'a> {
         // window's actual count).
         self.rx_win_fix0 = self.rx_fixes;
         self.rx_win_count0 = st.last_window_count() as u64;
+        // R29: THE ZERO-THREAD INGEST arm — the deep-steady epoch (two
+        // clean windows at the same count) proves the frozen slot's
+        // words AND tags are the invariant tape, so the window's whole
+        // span range can publish NOW: `spans_ready = base + count0`.
+        // The workers self-serve every span from the frozen array the
+        // moment the record lands; the main core's scan reduces to the
+        // sequencer ladder (session/seq verification + counters + the
+        // count bookkeeping — the emission words still flow, the commit
+        // path does not); the fold consumes the workers' results as
+        // they stream. The submission funnel — the single-threaded
+        // commit cadence that pegged the main core at the 4.3B decode
+        // ceiling — is deleted for the window. Guards: a straddling
+        // inline continuation must run the classic path (the marked
+        // chunk's remainder values come from the inline ring — the
+        // sink must claim them); force_inline is the deterministic
+        // assist-mode shape (every chunk inline by construction).
+        let straddle_inline = self.submit_rem != CHUNK
+            && st.is_inline(self.next_span / CHUNK);
+        self.rx_win_ss = self.rx_selfserve
+            && self.batch_submit
+            && tor
+            && self.rx_steady_epoch >= 2
+            && self.rx_win_count0 > 0
+            && !straddle_inline
+            && !self.force_inline;
+        if self.rx_win_ss {
+            self.rx_win_pre = self.next_span + self.rx_win_count0;
+            // The record's Release above orders the (already-exact)
+            // array content before this frontier store — the workers'
+            // Acquire sees the whole window at once.
+            st.publish_ready(self.rx_gen, self.rx_win_pre);
+            self.rx_ss_wins += 1;
+        } else {
+            self.rx_win_pre = 0;
+        }
         // An inline-claimed chunk STRADDLING the window boundary: the
         // sealed partial inline entry covered the pre-boundary spans, but
         // the whole-chunk mark makes the worker skip the remainder too —
@@ -3411,7 +3488,18 @@ impl<'a> HydraSpanSink<'a> {
                 }
                 true
             } else {
-                self.rx_assist_wm > 0
+                // R29: the SELF-SERVE window never takes new inline
+                // claims — its whole span range is already published
+                // (the open's pre-publish), so a mid-scan claim's mark
+                // would land AFTER the workers entered the chunk: both
+                // sides evaluate it and the lane ring carries a
+                // duplicate the fold's order law rejects (the classic
+                // protocol's own law — the mark precedes the
+                // spans_ready store that exposes the chunk — cannot be
+                // restored once the exposure is up-front). The workers
+                // own the ingest; the pace gate stays the flow control.
+                !self.rx_win_ss
+                    && self.rx_assist_wm > 0
                     && self.pending() > self.rx_assist_wm
                     && self.try_claim_inline()
             };
@@ -3579,6 +3667,27 @@ impl<'a> HydraSpanSink<'a> {
             }
         }
         let affine_flag: u64 = if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
+        // R29: the self-serve skip (SpanRec form) — same law as the packed
+        // path's (see `submit_packed_batch_rx`'s R29 block): cursor
+        // arithmetic only, the commit path deleted for the window.
+        if self.rx_win_ss && self.cur_inline.is_none() {
+            let mut i = 0usize;
+            while i < recs.len() {
+                let run = (self.submit_rem as usize).min(recs.len() - i);
+                i += run;
+                self.next_span += run as u64;
+                self.submit_rem -= run as u64;
+                if self.submit_rem == 0 {
+                    self.submit_rem = CHUNK;
+                    self.submit_lane = if self.submit_lane + 1 == self.n_lanes {
+                        0
+                    } else {
+                        self.submit_lane + 1
+                    };
+                }
+            }
+            return;
+        }
         let mut i = 0usize;
         while i < recs.len() {
             // Chunk-open: the assist decision — submit_span_rx's grid
@@ -3912,10 +4021,40 @@ impl<'a> HydraSpanSink<'a> {
             let mut sb = 0u32;
             while self.pending() > Self::RX_PACE {
                 self.fold_available();
+                if sb > 2_000_000 { eprintln!("R29DBG PACE-SPIN pending={} fold_pos={} next_span={} fold_lane={} fold_rem={} cur_inline={:?}", self.pending(), self.fold_pos, self.next_span, self.fold_lane, self.fold_rem, self.cur_inline); }
                 crate::affinity::polite_spin_deep(&mut sb);
             }
         }
         let affine_flag: u64 = if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
+        // R29: the self-serve window's steady batches — the commit path is
+        // DELETED for this window (the whole span range is already
+        // published; the workers own the ingest). The scan's words flow
+        // through the count bookkeeping only: the cursors advance by the
+        // run arithmetic (chunk-boundary cadence kept exact for the next
+        // window's straddle logic), no inline claims, no vector check,
+        // no per-chunk publish. An ACTIVE inline chunk (a mid-window
+        // assist claimed before the arm, or the straddle continuation)
+        // still routes through the classic path below — its values come
+        // from the inline ring and the publication clamp keeps the
+        // frontier monotone.
+        if self.rx_win_ss && self.cur_inline.is_none() {
+            let mut i = 0usize;
+            while i < words.len() {
+                let run = (self.submit_rem as usize).min(words.len() - i);
+                i += run;
+                self.next_span += run as u64;
+                self.submit_rem -= run as u64;
+                if self.submit_rem == 0 {
+                    self.submit_rem = CHUNK;
+                    self.submit_lane = if self.submit_lane + 1 == self.n_lanes {
+                        0
+                    } else {
+                        self.submit_lane + 1
+                    };
+                }
+            }
+            return;
+        }
         // R28: the batch-constant translation — batch-relative offsets to
         // blob-global (the array words' low 32 bits). One value per batch.
         let delta = (base_ptr as u64).wrapping_sub(self.blob_base as u64);
@@ -4288,6 +4427,20 @@ impl<'a> HydraSpanSink<'a> {
                     break;
                 }
             }
+            // R29: THE DERIVED GRID — `fold_lane`/`fold_rem` re-derived
+            // from `fold_pos` at every loop top (drift-immune). The
+            // pre-R29 accumulators (decrement per record, switch at zero)
+            // were correct for the submission-bounded protocol, but the
+            // self-serve shape adds three new park/resume edges (the
+            // frontier cap, mid-chunk pass-boundary records, assist
+            // straddles) — any accumulated-cursor slip desyncs the lane
+            // from the chunk grid and the fold drains the WRONG lane's
+            // ring, silently consuming out-of-order spans in release
+            // (the 512-span drift class). Deriving from the position
+            // makes the class structurally impossible; one shift + one
+            // mod at the consumer's loop edge.
+            self.fold_lane = ((self.fold_pos / CHUNK) % self.n_lanes as u64) as usize;
+            self.fold_rem = CHUNK - (self.fold_pos % CHUNK);
             // H6: `fold_lane` tracks the chunk containing `fold_pos` — no
             // division in the hot path (advance after chunk completion).
             let lane = &fabric.lanes[self.fold_lane];
@@ -4318,18 +4471,44 @@ impl<'a> HydraSpanSink<'a> {
                 while tail + consumed < head {
                     let r = &slots[((tail + consumed) & RES_MASK) as usize];
                     let k = r.aux as u64;
-                    debug_assert!(
+                    // R29: THE FRONTIER CAP — the fold never consumes
+                    // spans the scan has not emitted. The self-serve
+                    // workers run AHEAD of the scan (the whole window is
+                    // pre-published), so their results can end beyond
+                    // `next_span`; such records stay buffered in the ring
+                    // until the scan (and the pass's boundary stamp at
+                    // end_pass) advances past them. Without the cap the
+                    // fold crosses the pending pass boundary BEFORE its
+                    // `end_span` is stamped — complete_boundaries breaks
+                    // on the unstamped record, the next pass's values
+                    // fold into THIS pass's chain, and the boundary
+                    // snapshot lands on the contaminated hash (the
+                    // deterministic pass-4 divergence). The cap also
+                    // restores the pre-R29 invariant verbatim: results
+                    // were never consumable past the submission frontier.
+                    if (r.span_id as u64) + k > self.next_span {
+                        // R29: PARK — release the consumed prefix and
+                        // return. The outer loop's condition
+                        // (`fold_pos < next_span`) stays true while this
+                        // record is capped, so a plain `break` + `continue`
+                        // would spin on it; parking defers to the next
+                        // drain call (the scan advances `next_span` by
+                        // then — the SS batches are 32 spans, the records
+                        // 64).
+                        lane.res_tail.store(tail + consumed, Ordering::Release);
+                        self.complete_boundaries();
+                        return;
+                    }
+                    assert!(
                         k >= 1 && k <= self.fold_rem,
                         "composite record k={k} exceeds fold_rem={} at span {}",
                         self.fold_rem,
                         r.span_id
                     );
-                    debug_assert_eq!(
-                        r.span_id as u64,
-                        self.fold_pos,
-                        "hydra composite fold-order violation: got span {}, expected {}",
-                        r.span_id,
-                        self.fold_pos
+                    assert_eq!(
+                        r.span_id as u64, self.fold_pos,
+                        "hydra composite fold-order violation: got span {}, expected {} (lane {}, tail {}, head {})",
+                        r.span_id, self.fold_pos, self.fold_lane, tail, head
                     );
                     if self.pass_tail != self.pass_head {
                         let rec = &self.passes[self.pass_tail];
@@ -4368,7 +4547,13 @@ impl<'a> HydraSpanSink<'a> {
                 continue;
             }
             // Never fold past the end of fold_pos's chunk (lane changes there).
-            let mut n = (head - tail).min(self.fold_rem);
+            // R29: and never past the scan's frontier (`next_span`) — the
+            // self-serve workers' results may end beyond it; the excess
+            // stays buffered until the scan advances (same law as the
+            // composite drain's cap above).
+            let mut n = (head - tail)
+                .min(self.fold_rem)
+                .min(self.next_span - self.fold_pos);
             // GIGAHFT Lever 4: never fold past the oldest pending pass
             // boundary — the chain must snapshot + reset exactly there.
             if self.pass_tail != self.pass_head {
@@ -4384,12 +4569,16 @@ impl<'a> HydraSpanSink<'a> {
             let slots = lane.res_slots_read();
             for i in 0..n as usize {
                 let r = &slots[((tail + i as u64) & RES_MASK) as usize];
-                debug_assert_eq!(
+                assert_eq!(
                     r.span_id as u64,
                     self.fold_pos + i as u64,
-                    "hydra fold-order violation: got span {}, expected {}",
+                    "hydra fold-order violation: got span {}, expected {} (lane {}, tail {}, head {}, n {})",
                     r.span_id,
-                    self.fold_pos + i as u64
+                    self.fold_pos + i as u64,
+                    self.fold_lane,
+                    tail,
+                    head,
+                    n
                 );
                 let v = r.value;
                 self.fold_value(v);
@@ -4452,6 +4641,10 @@ impl<'a> HydraSpanSink<'a> {
                 self.rx_win_open = false;
             }
             self.rx_publish_ready();
+            // R29: the self-serve window's close (the burst shape's
+            // finish — same reconcile-then-retire law as end_pass).
+            self.rx_win_ss = false;
+            self.rx_win_pre = 0;
             let mut fb = 0u32;
             while self.fold_pos < self.next_span {
                 if self.fold_available_once_or_spin() {
@@ -4480,7 +4673,11 @@ impl<'a> HydraSpanSink<'a> {
     /// including the unpublished partial chunk.
     #[inline]
     pub fn pending(&self) -> u64 {
-        self.next_span - self.fold_pos
+        // R29: saturating — the self-serve fold legitimately runs AHEAD of
+        // the scan (it consumes the workers' pre-published results while
+        // the sequencer ladder still walks); a raw subtract would wrap to
+        // ~u64::MAX in release and livelock the pace gate.
+        self.next_span.saturating_sub(self.fold_pos)
     }
 
     /// R8 phase-5 telemetry: chunks taken through the assist path.
@@ -4495,6 +4692,14 @@ impl<'a> HydraSpanSink<'a> {
     #[inline]
     pub fn rx_fixes(&self) -> u64 {
         self.rx_fixes
+    }
+
+    /// R29 telemetry: self-serve windows armed (the zero-thread ingest's
+    /// engagement counter — 0 means the epoch never reached the deep-steady
+    /// threshold, the classic commit cadence ran instead).
+    #[inline]
+    pub fn selfserve_wins(&self) -> u64 {
+        self.rx_ss_wins
     }
 }
 
@@ -6344,6 +6549,112 @@ mod tests {
             "R27c hole-free: the toroidal epoch never engaged (epoch={})",
             sink.rx_steady_epoch
         );
+    }
+
+    /// R29: the ZERO-THREAD INGEST parity — the self-serve window's
+    /// law. The deep-steady epoch (two clean windows at the same count)
+    /// proves the frozen slot's words and tags are the invariant tape,
+    /// so the window's open pre-publishes the WHOLE span range
+    /// (`spans_ready = base + count0`) and the steady batches' commit
+    /// path (chunk-open assists, the vector check, the per-chunk
+    /// publish cadence) is deleted — the scan walks the sequencer
+    /// ladder only, the workers ingest directly from the frozen array,
+    /// the fold consumes their streamed results. The law cell: ten
+    /// passes of the deterministic sustained shape (drain per batch —
+    /// the harness's exact cadence) over comp × self-serve cells, every
+    /// record bit-exact vs the sequential reference; the engagement
+    /// cell asserts the arm fired (windows 4+: the cold fill, the first
+    /// clean verify, the toroidal verify, THEN self-serve); the
+    /// rollback cell (HFT_SELF_SERVE=0's in-process form) asserts zero
+    /// engagement and the same bit-exact records.
+    #[test]
+    fn t_r29_selfserve_parity() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let sess = *b"R29SELF\0\0\0";
+        let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+        let want = seq_pass(&mut t0, sess);
+        assert_eq!(want.0, 505_849, "coverage must hold");
+        const PASSES: u64 = 10;
+        for comp in [true, false] {
+            for ss in [true, false] {
+                let fabric =
+                    HydraFabric::spawn_pinned_full(2, &[], true, true, true, comp, true);
+                let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                    &gt,
+                    sched.clone(),
+                    sess,
+                    128,
+                );
+                if let Some(st) = fabric.rxdesc_state() {
+                    assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+                }
+                t.reset(sess);
+                let mut seq = Sequencer::new();
+                let mut sink = HydraSpanSink::new(&fabric);
+                sink.rx_selfserve = ss;
+                let ladder = crate::soa::ladder8_best();
+                for _pass in 0..PASSES {
+                    t.reset(sess);
+                    *seq = Sequencer::new_unboxed();
+                    sink.begin_pass();
+                    while t.next_batch() {
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                        sink.drain_ready();
+                    }
+                    sink.end_pass();
+                }
+                sink.finish();
+                let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+                let mut got = Vec::new();
+                let mut n = sink.harvest_completed(&mut harvested);
+                while n > 0 {
+                    for rec in &harvested[..n] {
+                        got.push(*rec);
+                    }
+                    n = sink.harvest_completed(&mut harvested);
+                }
+                assert_eq!(
+                    got.len() as u64,
+                    PASSES,
+                    "R29 records (comp={comp}, ss={ss})"
+                );
+                for (k, rec) in got.iter().enumerate() {
+                    assert_eq!(
+                        *rec, want,
+                        "R29 pass {k} diverged (comp={comp}, ss={ss}) — the self-serve window's fold-order law"
+                    );
+                }
+                if ss {
+                    // The engagement law: pass 1 cold-fills (dirty, assists
+                    // mark straddling chunks), pass 2 verifies clean (epoch
+                    // 1), pass 3 verifies toroidal (epoch 2) — the early
+                    // passes' straddle marks disarm one extra window —
+                    // passes 5+ self-serve; 6 of 10 windows here.
+                    assert!(
+                        sink.selfserve_wins() >= PASSES - 4,
+                        "R29 self-serve never engaged (comp={comp}, wins={})",
+                        sink.selfserve_wins()
+                    );
+                    assert!(
+                        sink.rx_steady_epoch >= 4,
+                        "R29 epoch collapsed under self-serve (comp={comp}, epoch={})",
+                        sink.rx_steady_epoch
+                    );
+                } else {
+                    assert_eq!(
+                        sink.selfserve_wins(),
+                        0,
+                        "R29 rollback cell armed self-serve (comp={comp})"
+                    );
+                }
+            } // ss
+        } // comp
     }
 
     /// R28: the fused packed ladder-commit parity — the steady ladder's

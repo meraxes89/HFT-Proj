@@ -741,9 +741,10 @@ fn run_hydra_sustained_5s(
         nf_protocol::gates::evaluate_pr1_r16_full_verify(sustained_rate).as_str()
     );
     println!(
-        "R16B_RXDESC_VERDICT rx_fixes={} assist_chunks={} (array-driven submission telemetry; fixes=0 means every RX prefill entry was already exact)",
+        "R16B_RXDESC_VERDICT rx_fixes={} assist_chunks={} selfserve={} (array-driven submission telemetry; fixes=0 means every RX prefill entry was already exact; selfserve = R29 zero-thread-ingest windows)",
         sink.rx_fixes(),
-        sink.assist_chunks()
+        sink.assist_chunks(),
+        sink.selfserve_wins()
     );
     // R23c: the sustained arm's affine verdict — the zero-payload-reads
     // claim's measured counters + the R23 gate (2.5B REPORTED, the
