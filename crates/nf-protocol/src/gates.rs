@@ -224,6 +224,31 @@ pub fn evaluate_pr1_r23_pure_ingest(rate_msg_per_sec: u64) -> GateVerdict {
     }
 }
 
+// R29: the zero-thread-ingest program (docs/42 — the 64-deep record ring
+// R27c + the self-serve pre-publish R29 + the vectorized header twin
+// R30). REPORTED per draw (non-asserting until the median healthy draw
+// crosses it — the same elevation protocol the R16/R23 gates used).
+
+/// R29: the 10B msg/s sustained full-verification target — the
+/// zero-thread ingest's milestone: the workers self-serve the whole
+/// window from the frozen array (the main core's commit funnel deleted),
+/// the record ring's watermark depth sits beyond every reachable lead
+/// (reset_ms -> 0), and the fold's derived grid holds the order law at
+/// the new park/resume edges. The 2B R16 gate remains the CI-hard floor;
+/// this verdict prices the R29 arm on every draw.
+pub const PR1_R29_SELF_SERVE_MIN_MSG_PER_SEC: u64 = 10_000_000_000;
+
+/// R29: the zero-thread-ingest sustained verdict (see
+/// PR1_R29_SELF_SERVE_MIN_MSG_PER_SEC).
+#[inline]
+pub fn evaluate_pr1_r29_self_serve(rate_msg_per_sec: u64) -> GateVerdict {
+    if rate_msg_per_sec >= PR1_R29_SELF_SERVE_MIN_MSG_PER_SEC {
+        GateVerdict::Pass
+    } else {
+        GateVerdict::Fail
+    }
+}
+
 #[inline]
 pub fn evaluate_pr2_p50(p50_cycles: u64) -> GateVerdict {
     if p50_cycles < PR2_TARGET_P50_CYCLES {
@@ -344,5 +369,12 @@ mod tests {
         assert_eq!(evaluate_pr1_r23_pure_ingest(14_999_999_999), GateVerdict::Fail);
         assert_eq!(evaluate_pr1_r23_pure_ingest(15_000_000_000), GateVerdict::Pass);
         assert_eq!(evaluate_pr1_r23_pure_ingest(20_000_000_000), GateVerdict::Pass);
+
+        // R29 tripwires: the 10B self-serve sustained verdict — FAIL
+        // below, PASS exactly at the threshold.
+        assert_eq!(evaluate_pr1_r29_self_serve(9_999_999_999), GateVerdict::Fail);
+        assert_eq!(evaluate_pr1_r29_self_serve(0), GateVerdict::Fail);
+        assert_eq!(evaluate_pr1_r29_self_serve(10_000_000_000), GateVerdict::Pass);
+        assert_eq!(evaluate_pr1_r29_self_serve(12_000_000_000), GateVerdict::Pass);
     }
 }

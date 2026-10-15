@@ -746,6 +746,15 @@ fn run_hydra_sustained_5s(
         sink.assist_chunks(),
         sink.selfserve_wins()
     );
+    // R29: the 10B milestone's verdict line — the zero-thread ingest's
+    // pricing row (REPORTED per draw, non-asserting until the median
+    // healthy draw crosses it — the R16/R23 elevation protocol).
+    println!(
+        "PR1_R29_SELF_SERVE_VERDICT rate={} target={} -> {} (R29: 10B msg/s sustained full verification — the zero-thread ingest program, docs/42: self-serve windows + the 64-deep record ring + the vectorized header twin)",
+        sustained_rate,
+        nf_protocol::gates::PR1_R29_SELF_SERVE_MIN_MSG_PER_SEC,
+        nf_protocol::gates::evaluate_pr1_r29_self_serve(sustained_rate).as_str()
+    );
     // R23c: the sustained arm's affine verdict — the zero-payload-reads
     // claim's measured counters + the R23 gate (2.5B REPORTED, the
     // directive's 2.5–3.0B+ milestone band; non-asserting until the

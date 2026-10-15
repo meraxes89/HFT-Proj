@@ -519,6 +519,27 @@ grep -q "allocs=0" /tmp/bench_pk_off.txt
 grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_pk_off.txt
 grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_pk_off.txt | head -1
 
+# ── 11s. R29: the ZERO-THREAD INGEST rollback (attribution) ─────────────
+# The self-serve pre-publish arms when the toroidal epoch reaches the
+# deep-steady threshold (two clean windows at the same count — the R27c
+# hole-free law): the window's open publishes the WHOLE span range
+# (spans_ready = base + count0), the workers self-serve from the frozen
+# array, and the main core's scan walks the sequencer ladder only (the
+# commit path — chunk-open assists, the vector check, the publish
+# cadence — deleted). THE SUBMISSION FUNNEL (the 4.3B decode ceiling)
+# LEAVES the main core. THIS arm is the rollback: the full submission
+# cadence verbatim (HFT_SELF_SERVE=0's semantics). Same-draw delta
+# 11ab - 11s = the zero-thread ingest's contribution. The engagement
+# telemetry rides the R16B line (selfserve= — 0 on this arm, the
+# sustained window count on the default). The t_r29_selfserve_parity
+# cell pins the comp x ss law cells bit-exact.
+HFT_RXDESC=1 HFT_SELF_SERVE=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_ss_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_ss_off.txt
+grep -q "allocs=0" /tmp/bench_ss_off.txt
+grep -q "selfserve=0 " /tmp/bench_ss_off.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_ss_off.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_ss_off.txt | head -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
