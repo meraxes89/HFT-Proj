@@ -540,6 +540,45 @@ grep -q "selfserve=0 " /tmp/bench_ss_off.txt
 grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_ss_off.txt
 grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_ss_off.txt | head -1
 
+# ── 11rx. R31 candidate: the RX PASS-SUPPLY stack (attribution) ─────────
+# The R29 draw's own telemetry: the self-serve arm doubled the pass
+# cadence (passes 41.8K vs 16.5K) and the wall MOVED — reset_ms 1502 ms
+# (30% of the wall), the ADVANCE_DIAGNOSTIC's us_per_advance 35.8 (4.4x
+# the rollback's 8.1). The decomposition: the per-publication prepatch
+# budget (64, the R9c constant tuned for the CLASSIC render path's
+# ~24us publication period) drains only ~1.4K of the ~22K patchable
+# session sites per pass; the advance's synchronous tail patches the
+# remaining ~20.6K (~35.8us) ON the consumer's reset critical path. The
+# F-5 measurement: at budget 1024 the ~22 publications/pass absorb the
+# FULL patchable set during the pass and the advance tail EMPTIES. THIS
+# arm prices the flip on the R29 stack (same-draw delta 11ab - 11rx;
+# the advance_ms/us_per_advance lines carry the mechanism's proof).
+HFT_RXDESC=1 HFT_PREPATCH_BUDGET=1024 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_rxsup.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_rxsup.txt
+grep -q "allocs=0" /tmp/bench_rxsup.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_rxsup.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_rxsup.txt | head -1
+grep "DIAG rx sustained" /tmp/bench_rxsup.txt | tail -1
+grep "ADVANCE_DIAGNOSTIC sustained" /tmp/bench_rxsup.txt | tail -1
+grep "R16B_RXDESC_VERDICT" /tmp/bench_rxsup.txt | tail -1
+
+# ── 11vl. R31 candidate: the RX-supply stack + the VECTOR LADDER ────────
+# The R12 verdict priced the 8-entry SoA consumer group at -2..-3.6%
+# (decode-bound: the group body bloated the scan loop past the uop
+# cache) — measured on the PRE-R29 consumer. The R29 SS skip DELETED
+# the commit path from the steady batches; the scan's uop budget
+# changed shape, so the group path is priceable again. THIS arm: the
+# 11rx stack + HFT_VEC_LADDER=1 (the consumer group + the RX-side elig
+# compute). Same-draw delta 11rx - 11vl = the ladder's contribution on
+# the post-R29 consumer.
+HFT_RXDESC=1 HFT_PREPATCH_BUDGET=1024 HFT_VEC_LADDER=1 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_vl.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_vl.txt
+grep -q "allocs=0" /tmp/bench_vl.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_vl.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_vl.txt | head -1
+grep "LADDER_DIAGNOSTIC" /tmp/bench_vl.txt | tail -1
+grep "R16B_RXDESC_VERDICT" /tmp/bench_vl.txt | tail -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
