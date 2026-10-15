@@ -5764,6 +5764,16 @@ mod tests {
                     let mut seq = Sequencer::new();
                     let mut sink = HydraSpanSink::new(&fabric);
                     sink.rx_toroidal = tor;
+                    // The DETERMINISTIC law-cell shape (the R25c/R28
+                    // discipline): assists disabled — an assist chunk's
+                    // spans go INLINE (never checked/written into the
+                    // array), and the TIMING-dependent assist pattern
+                    // would leave a different set of holes every pass —
+                    // the next window's check-and-fix repairs them (at a
+                    // fix cost, exactly the production semantics) but the
+                    // epoch's engagement becomes timing-dependent, which
+                    // belongs on the FLEET arms (11t), not a parity cell.
+                    sink.rx_assist_wm = 0;
                     let ladder = crate::soa::ladder8_best();
                     let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
                     let mut got = Vec::new();
