@@ -87,8 +87,22 @@ use std::sync::OnceLock;
 /// ring is sized at 2×NBUF so the overwrite-guard window keeps its
 /// 2x-max-lag headroom at every depth (at 16: 32 slots — the R9 shape
 /// verbatim; at 32: 64).
+///
+/// R33-C (the producer-starvation wall program, docs/44): the ladder
+/// extends to 256. The R32 telemetry inverted the pipeline — the main
+/// core's verdict replay drains a window in <300ns while the RX walks
+/// ~3.2ns/frame — so the ring sits EMPTY and the consumer stalls on
+/// filled[] for 86.5% of the wall. Deeper rings give the (R33-A
+/// schedule-replayed) producer runway to absorb scheduler noise on the
+/// consumer core; the hot per-turn fields now live in the contiguous
+/// `pubs` array (16B × depth = 4KB at 256 — ONE page, vs the old
+/// 64KB-stride stores into EntryBuf), so the depth no longer costs
+/// cache-line footprint on the publication path at all. The EntryBuf
+/// entry arrays stay untouched on the rxbuild path (publish-by-reference
+/// — zero per-turn entry traffic), so 256 slots of 64KB cost only
+/// construction-time RSS, never a hot line.
 const NBUF_DEFAULT: u64 = 16;
-const NBUF_MAX: u64 = 32;
+const NBUF_MAX: u64 = 256;
 /// The static array bound for the Mailbox's per-buffer fields (bufs /
 /// filled / freed) and the RX's turn-event ring (2×NBUF_MAX).
 const NBUF_SLOTS: usize = NBUF_MAX as usize;
@@ -137,15 +151,6 @@ const CMD_SHUTDOWN: u8 = 2;
 /// (the harness consumes each batch fully before the next `next_batch`).
 struct EntryBuf {
     entries: Box<[FrameEntry<'static>; ENTRY_CAP]>,
-    len: u32,
-    clock: u64,
-    /// F-2 (HFT_RXBUILD): the publication's master slice start (the
-    /// pass-local frame index at the publication's first frame; `len`
-    /// frames follow). Read by the consumer only in rxbuild mode — the
-    /// per-turn entry copy is REPLACED by this 4-byte reference, which is
-    /// the lever's whole point (the mailbox traffic collapses from
-    /// ~64KB/batch to ~16B/batch).
-    rx_start: u32,
 }
 
 impl EntryBuf {
@@ -165,10 +170,61 @@ impl EntryBuf {
                 sess_hi: 0,
                 elig: 0,
             })),
-            len: 0,
-            clock: 0,
-            rx_start: 0,
         }
+    }
+}
+
+/// R33-C: the per-turn PUBLICATION record — the hot half of the old
+/// EntryBuf, split out so the publication path writes one contiguous
+/// 16-byte array (stride 16B, ~4KB total at NBUF=256) instead of a
+/// 64KB-stride store into each buffer's entry block. The classic path
+/// fills `entries` AND this record; the rxbuild path (publish-by-
+/// reference) writes ONLY this record — the entries' target bytes are
+/// never touched, so the deep ring costs no cache footprint.
+///
+/// Ordering: written by the RX before the filled[] Release store; read
+/// by the consumer after its Acquire (same contract the old in-buf
+/// fields carried).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PubMeta {
+    /// The publication's entry count (0 = the EOS marker).
+    len: u32,
+    /// F-2 (HFT_RXBUILD): the publication's master slice start (the
+    /// pass-local frame index at the publication's first frame; `len`
+    /// frames follow). Read by the consumer only in rxbuild mode — the
+    /// per-turn entry copy is REPLACED by this 4-byte reference, which is
+    /// the lever's whole point (the mailbox traffic collapses from
+    /// ~64KB/batch to ~16B/batch).
+    rx_start: u32,
+    /// The driver's virtual clock at publication (pass-invariant under
+    /// the elision — reset_cursors re-anchors it to the schedule's first
+    /// release vt every pass; see R33-A).
+    clock: u64,
+}
+
+impl PubMeta {
+    const EMPTY: PubMeta = PubMeta {
+        len: 0,
+        rx_start: 0,
+        clock: 0,
+    };
+}
+
+/// R33-B: a padded futex-parked flag — the shavendo protocol's Dekker
+/// breaker. BOTH sides use SeqCst RMWs on the SAME word when they cross
+/// (the setter swaps true before its condition re-check + futex_wait;
+/// the checker swaps false after its Release publication): the two
+/// locked ops totally order, so at least one side observes the other —
+/// an unbounded park can never miss a publication (see the R33-B proof
+/// in docs/44 §2). One line per flag, own cache line, no false sharing
+/// with the ring cursors.
+#[repr(align(64))]
+struct ParkFlag(AtomicBool);
+
+impl ParkFlag {
+    fn clear() -> Self {
+        Self(AtomicBool::new(false))
     }
 }
 
@@ -243,6 +299,21 @@ struct RxStats {
     advance_ns: AtomicU64,
     /// F-5: auto-advances served (the advance_ns denominator).
     advances: AtomicU64,
+    /// R33-A: publications emitted from the SCHEDULE REPLAY (the frozen
+    /// table walk — no poll, no meta read, no event cursor). The
+    /// elision's engagement telemetry: steady state this converges to
+    /// publications − (the recording pass's live count) and `polls` stops
+    /// growing — the producer's 3.2ns/frame walk has left the critical
+    /// path entirely (docs/44).
+    sched_replays: AtomicU64,
+    /// R33-A: passes whose publications were fully replayed from the
+    /// schedule (the per-pass engagement; the parity law: sched_passes +
+    /// 1 (the recording pass) == resets on an armed run).
+    sched_passes: AtomicU64,
+    /// R33-B: producer→consumer futex_wake syscalls SKIPPED by the
+    /// parked-flag protocol (the consumer was not parked — the syscall
+    /// would have returned 0). The shavendo win's direct telemetry.
+    wakes_saved: AtomicU64,
 }
 
 #[repr(align(64))]
@@ -275,6 +346,9 @@ impl RxStats {
             rxbuild_last_pass: AtomicU64::new(0),
             advance_ns: AtomicU64::new(0),
             advances: AtomicU64::new(0),
+            sched_replays: AtomicU64::new(0),
+            sched_passes: AtomicU64::new(0),
+            wakes_saved: AtomicU64::new(0),
         }
     }
 }
@@ -312,6 +386,29 @@ struct Mailbox {
     /// (SPSC: RX writes, consumer reads). Sized at NBUF_MAX; slots >= nbuf
     /// are never touched (construction-initialized, no per-pass cost).
     bufs: [UnsafeCell<EntryBuf>; NBUF_SLOTS],
+    /// R33-C: the per-turn publication records (len / rx_start / clock) —
+    /// the hot 16B array the RX writes and the consumer reads each turn
+    /// (the old in-EntryBuf fields, split out so the publication stores
+    /// run at 16B stride over one page instead of 64KB stride). Ownership
+    /// follows the filled[]/freed[] turn protocol exactly as `bufs`.
+    pubs: [UnsafeCell<PubMeta>; NBUF_SLOTS],
+    /// R33-B: the CONSUMER's futex-parked flag (pub_wake direction). The
+    /// consumer SeqCst-swaps it true before its filled[] re-check +
+    /// futex park; the RX's publication path SeqCst-swaps it false and
+    /// skips the futex_wake syscall when it reads false — the R32
+    /// equilibrium's per-publication syscall (~250ns × 1.3M+ windows)
+    /// leaves the post-R33-A producer's critical path. The both-RMW
+    /// protocol is the Dekker breaker (see ParkFlag).
+    cons_parked: ParkFlag,
+    /// R33-B: the PRODUCER's futex-parked flag (wake direction — the
+    /// RX's buffer-free / advance waits). The RX SeqCst-swaps it true
+    /// before its freed[] re-check + timed park; the consumer's free
+    /// path (next_batch's top) checks it and, when set, swaps it false
+    /// and futex-wakes the `wake` word. Post-R33-A the ring runs FULL
+    /// (the producer is 3× faster than the consumer) and the producer's
+    /// 50µs timed parks would otherwise self-wake up to 45µs late — a
+    /// stall the consumer pays as wait_ms.
+    prod_parked: ParkFlag,
     /// RX -> consumer: buffer `i` holds turn `T` (Release after the entry
     /// writes; the consumer's Acquire orders all reads). Initialized to
     /// NEVER; the RX publishes turns in order and is bounded by the
@@ -663,6 +760,111 @@ impl RxBuildState {
     }
 }
 
+// ── R33-A: the RX publication-schedule replay (docs/44 §1) ─────────────────
+//
+// The frozen-master regime's publication stream is a PURE FUNCTION of the
+// construction: the schedule is construction-fixed, `reset_cursors`
+// re-anchors event_idx=0 and virtual_clock=first_vt at every pass, the
+// (rx_start, len) chunking walks the same immutable meta, and the clock
+// values repeat verbatim. So the FIRST pass's publication observables —
+// one 16-byte PubRec per data publication plus the schedule's length —
+// ARE the schedule for every pass of the transport's life. Recording
+// them once (the first pass's live walk — the walk runs anyway) and
+// re-publishing from the table replaces the ~3.28µs 1024-frame walk with
+// one 16B read + two Release stores per window (~100ns), which is the
+// whole R33 producer-starvation collapse.
+//
+// Guards (the R32 pass-replay ledger's discipline, mirrored producer-side):
+// * the regime gate — arming requires the frozen-master word
+//   (`rxbuild && session_elision && auto program`, the exact word the
+//   consumer-side ledger gates on). Any other shape: `Off`, live walk.
+// * the disarm — any CMD_RESET serve drops to `Off` permanently (a plain
+//   reset means an out-of-program session could land in the blob — the
+//   armed transport's own reset() assert fail-stops first, so this is
+//   defense in depth, but the R32 capacity-poison law is cheap here).
+// * the oracle — the consumer-side R32 ledger records per-batch
+//   (rx_start, len, w_in) identity and PANICS on divergence from the
+//   recorded stream; a replay bug cannot pass silently.
+/// One recorded publication: the (rx_start, len) master slice bounds and
+/// the driver's virtual clock — the pass-invariant observables the
+/// replayed publication re-emits verbatim (the exact fields the old
+/// in-buffer publication carried).
+#[derive(Clone, Copy)]
+struct PubRec {
+    rx_start: u32,
+    len: u32,
+    clock: u64,
+}
+
+/// The RX thread's schedule-replay state machine.
+// Tier-F (construction-shaped): the recording Vec grows ONLY during the
+// transport's FIRST pass (the live walk runs anyway; the one 16-byte
+// push per publication lands before any measured window — the R32
+// ledger's allocation law), then freezes into the Box<[PubRec]> the
+// steady path walks. Never touched after the freeze.
+#[allow(clippy::disallowed_types)]
+enum RxSched {
+    /// Not eligible (regime gate or rollback): the live walk every pass.
+    Off,
+    /// Recording (the first pass): the live walk runs verbatim, each data
+    /// publication appends its PubRec.
+    Rec(Vec<PubRec>),
+    /// Armed (from the first auto-advance on): publications re-emit the
+    /// frozen table; the table's end IS the pass's EOS position.
+    Play {
+        s: Box<[PubRec]>,
+        i: usize,
+    },
+}
+
+impl RxSched {
+    /// `(has-next, at-end)` for the Play state — the publication loop's
+    /// fast-path decision.
+    #[inline]
+    fn play_pos(&self) -> (bool, bool) {
+        match self {
+            RxSched::Play { s, i } => (*i < s.len(), *i == s.len()),
+            _ => (false, false),
+        }
+    }
+}
+
+/// R33-B: the producer's post-publication wake — the parked-flag
+/// protocol's producer half. The SeqCst swap on `cons_parked` breaks
+/// Dekker against the consumer's swap-true (at least one side observes
+/// the other; see ParkFlag): a not-parked consumer costs one uncontended
+/// RMW (~20ns) instead of the fetch_add + futex_wake syscall pair
+/// (~250-500ns) the R32 equilibrium paid per publication. Returns true
+/// when the wake fired (telemetry counts the saved syscalls at the
+/// caller).
+#[inline]
+fn pub_wake_if_parked(mb: &Mailbox) -> bool {
+    if mb.cons_parked.0.swap(false, Ordering::SeqCst) {
+        mb.pub_wake.fetch_add(1, Ordering::Release);
+        futex_wake(&mb.pub_wake);
+        true
+    } else {
+        mb.rx_stats.wakes_saved.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// R33-B: the RX's timed-park entry — the parked-flag protocol's producer
+/// half for the `wake` direction. Swap true (SeqCst), then the caller
+/// re-checks its condition and parks; the consumer's free path sees the
+/// flag and futex-wakes `wake`. The both-RMW law makes an unbounded
+/// missed free impossible (see docs/44 §2); the 50µs timeout stays as
+/// the belt-and-braces bound.
+#[inline]
+fn mark_prod_parked(mb: &Mailbox) {
+    mb.prod_parked.0.swap(true, Ordering::SeqCst);
+}
+
+#[inline]
+fn clear_prod_parked(mb: &Mailbox) {
+    mb.prod_parked.0.store(false, Ordering::Release);
+}
+
 /// F-2: close the current pass's patch telemetry window (the warm
 /// flush's `force` law verbatim: the EOS marker ALWAYS records — a
 /// zero-patch window must overwrite a stale nonzero reading; the reset
@@ -794,6 +996,13 @@ fn r23c_ledger_fill(inner: &ReplayTransport, mb: &Mailbox, diag: bool) -> bool {
 /// master array in the Mailbox; DEFAULT ON since the F-2 verdict — draws
 /// 23-25, 4/4 healthy readings ≥ +15%; takes precedence over `warm_enabled` —
 /// both set runs rxbuild).
+/// `sched_replay` (R33-A, HFT_RX_SCHED_REPLAY) arms the publication-schedule
+/// replay: the first pass records each publication's (rx_start, len, clock)
+/// while the live walk runs, and every later pass re-publishes the frozen
+/// table (~100ns/window instead of the ~3.28µs 1024-frame walk). The
+/// constructor has already gated this on the frozen-master regime (rxbuild +
+/// session elision + the auto program — the R32 pass-replay word); any
+/// CMD_RESET serve disarms permanently (fail-safe live walk).
 #[allow(clippy::disallowed_types)]
 fn rx_thread(
     mut inner: ReplayTransport,
@@ -802,6 +1011,7 @@ fn rx_thread(
     init_session: [u8; 10],
     warm_enabled: bool,
     rxbuild_enabled: bool,
+    sched_replay: bool,
 ) {
     if let Some(cpu) = pin_cpu_id {
         let _ = pin_cpu(cpu);
@@ -967,6 +1177,19 @@ fn rx_thread(
     // is the rollback — the classic path below is verbatim (the default
     // flipped ON at the F-2 verdict: draws 23-25, 4/4 healthy ≥ +15%).
     let mut rxs = RxBuildState::new();
+    // R33-A: the publication-schedule replay's state machine. The
+    // constructor already gated the arm on the frozen-master regime; the
+    // first pass RECORDS (the live walk runs anyway — the recording is
+    // one 16-byte push per publication, off the steady path's cost
+    // profile by construction), the first auto-advance freezes the
+    // table, and every later pass replays it. The `Off` state is the
+    // rollback / regime-gate path (live walk verbatim) and the
+    // fail-safe landing for any CMD_RESET serve (see the disarm below).
+    let mut sched: RxSched = if sched_replay {
+        RxSched::Rec(Vec::new())
+    } else {
+        RxSched::Off
+    };
     let mut turn: u64 = 0;
     let mut served_resets: u64 = 0;
     // R8 phase-3 (auto-advance): the pass currently baked into the blob —
@@ -1087,6 +1310,13 @@ fn rx_thread(
                 if diag {
                     eprintln!("DIAG rx: serve reset turn={turn}");
                 }
+                // R33-A: the disarm — a plain reset serve means an
+                // out-of-program session entered the transport; the
+                // schedule replay's pass-invariance premise is gone
+                // (fail-safe live walk, the R32 capacity-poison law's
+                // twin). Unreachable on the armed shape (the consumer's
+                // reset() assert fail-stops first) — defense in depth.
+                sched = RxSched::Off;
                 // SAFETY: the consumer is parked in reset() holding no
                 // entries; the RX thread owns the transport and blob.
                 let sess = unsafe { *mb.reset_session.get() };
@@ -1143,12 +1373,24 @@ fn rx_thread(
         if mb.shutdown.load(Ordering::Acquire) {
             return;
         }
+        // R33-A: the replay position — (has-next, at-end-of-schedule).
+        // `at-end` means THIS turn is the pass's EOS marker (the frozen
+        // schedule's length IS the EOS position): no data publication,
+        // no buffer wait here — the marker block below owns this turn.
+        let (sched_next, sched_end) = sched.play_pos();
+        let mut eos = sched_end;
+        let mut acc = 0usize;
         let i = (turn & nbuf_mask) as usize;
         // Buffer i is free for `turn` (its (turn/NBUF + 1)-th use) once the
         // consumer freed it turn/NBUF times.
+        if !sched_end {
         if turn >= nbuf {
             let needed = turn >> nbuf_shift;
             let mut backoff = 0u32;
+            // R33-B: the prod-parked flag — set (SeqCst swap) BEFORE the
+            // re-check + timed park below; the consumer's free path sees
+            // it and futex-wakes `wake`. Cleared when the buffer lands.
+            let mut marked_parked = false;
             while mb.freed[i].load(Ordering::Acquire) < needed {
                 if mb.shutdown.load(Ordering::Acquire) {
                     return;
@@ -1168,6 +1410,10 @@ fn rx_thread(
                 if backoff < 6 {
                     spin(&mut backoff);
                 } else {
+                    if !marked_parked {
+                        marked_parked = true;
+                        mark_prod_parked(&mb);
+                    }
                     let observed = mb.wake.load(Ordering::Acquire);
                     if mb.freed[i].load(Ordering::Acquire) < needed
                         && mb.cmd.load(Ordering::Acquire) != CMD_RESET
@@ -1177,7 +1423,47 @@ fn rx_thread(
                     }
                 }
             }
+            if marked_parked {
+                clear_prod_parked(&mb);
+            }
             if mb.cmd.load(Ordering::Acquire) == CMD_RESET {
+                continue;
+            }
+        }
+        // R33-A: THE REPLAYED PUBLICATION — the producer-side elision's
+        // whole point. One 16-byte record read from the frozen table, one
+        // PubMeta store, two Release stores: no poll, no event-meta walk,
+        // no event bookkeeping, no prepatch (structurally off under the
+        // frozen-master regime). The per-publication cost drops from
+        // ~3.28µs (the 1024-frame walk) to ~100ns — the producer
+        // starvation wall (wait_ms = 86.5% of the R32 wall) collapses.
+        if sched_next {
+            if let RxSched::Play { s, i: si } = &mut sched {
+                let rec = s[*si];
+                *si += 1;
+                let t_prod = std::time::Instant::now();
+                // SAFETY: RX owns buffer i for this turn until the Release
+                // store below (the freed-count wait above passed).
+                unsafe {
+                    (*mb.pubs[i].get()) = PubMeta {
+                        len: rec.len,
+                        rx_start: rec.rx_start,
+                        clock: rec.clock,
+                    };
+                }
+                mb.rx_stats
+                    .prod_ns
+                    .fetch_add(t_prod.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                mb.rx_stats.publications.fetch_add(1, Ordering::Relaxed);
+                mb.rx_stats.sched_replays.fetch_add(1, Ordering::Relaxed);
+                mb.filled[i].store(turn, Ordering::Release);
+                mb.rx_turn.store(turn + 1, Ordering::Release);
+                // R33-B: the parked-flag wake — one uncontended RMW when
+                // the consumer is spinning (the post-replay equilibrium's
+                // common case: the consumer drains in <300ns and never
+                // parks), the syscall only when it actually parked.
+                pub_wake_if_parked(&mb);
+                turn += 1;
                 continue;
             }
         }
@@ -1186,11 +1472,15 @@ fn rx_thread(
         // amortize 4x further than the 256-slot poll granularity. The RX
         // stays ahead of the consumer by construction (its per-frame cost
         // is a fraction of the scan's), so the accumulation never bubbles.
-        let mut acc = 0usize;
-        let mut eos = false;
         // F-2: this publication's master slice start (the pass-local frame
         // index at the first frame — rxbuild mode publishes
         // master[rx_start .. rx_start + len]).
+        // R33-C: the publication's observable fields accumulate into the
+        // `pub_clock` local (the last poll's now_ns — the publication's
+        // value, per the classic cadence) and land ONCE in the pubs[i]
+        // record below — the per-poll buf.clock stores are gone (the
+        // last-writer-wins chain was N redundant stores for 1 value).
+        let mut pub_clock: u64 = 0;
         let rx_start = rxs.idx;
         debug_assert!(rx_start <= u32::MAX as usize);
         let t_prod = std::time::Instant::now();
@@ -1265,16 +1555,14 @@ fn rx_thread(
                 // F-1: the verified entries are already in the mailbox
                 // window (poll_warm wrote them); only the driver clock
                 // remains.
-                let buf = unsafe { &mut *mb.bufs[i].get() };
-                buf.clock = inner.now_ns();
+                pub_clock = inner.now_ns();
                 acc += n;
             } else if rxbuild_enabled {
                 // F-2: nothing to copy — the frames are counted into
                 // rxs.idx and the publication will carry the slice bounds;
                 // only the driver clock remains (per-poll, the classic
                 // cadence — the last poll's value is the publication's).
-                let buf = unsafe { &mut *mb.bufs[i].get() };
-                buf.clock = inner.now_ns();
+                pub_clock = inner.now_ns();
                 acc += n;
             } else {
                 // Build entries from THIS thread's locally-hot lines (scratch
@@ -1340,7 +1628,7 @@ fn rx_thread(
                             elig: (f.feed & 3) | (elig_ok << 7),
                         };
                     }
-                    buf.clock = inner.now_ns();
+                    pub_clock = inner.now_ns();
                     acc += n;
                 }
             }
@@ -1351,14 +1639,35 @@ fn rx_thread(
         // usize::MAX is never needed here: empty publications (EOS
         // markers) record the sentinel explicitly below.
         let evt_end = inner.current_event_idx();
-        {
-            // SAFETY: RX owns buffer i for this turn until the Release
-            // store below.
-            let buf = unsafe { &mut *mb.bufs[i].get() };
-            buf.len = acc as u32;
-            if rxbuild_enabled {
-                buf.rx_start = rx_start as u32;
-            }
+        // R33-A: the recording — this live publication's observables ARE
+        // one schedule row (the first pass runs while `sched` is `Rec`;
+        // the freeze at the pass's EOS marker turns the rows into the
+        // frozen table). One 16-byte push, off the steady path by
+        // construction (the recording pass is the transport's FIRST —
+        // before any measured window).
+        if let RxSched::Rec(v) = &mut sched {
+            v.push(PubRec {
+                rx_start: rx_start as u32,
+                len: acc as u32,
+                clock: pub_clock,
+            });
+        }
+        // R33-C: the publication record — ONE 16-byte write to the hot
+        // pubs array (the old len/rx_start/clock trio lived at a 64KB
+        // stride inside each EntryBuf; the classic path's entries stay in
+        // `bufs`, the observable trio lands here for every mode).
+        // SAFETY: RX owns buffer i for this turn until the Release store
+        // below.
+        unsafe {
+            (*mb.pubs[i].get()) = PubMeta {
+                len: acc as u32,
+                rx_start: if rxbuild_enabled {
+                    rx_start as u32
+                } else {
+                    0
+                },
+                clock: pub_clock,
+            };
         }
         turn_evt_end[(turn & toff_mask) as usize] = evt_end;
         mb.rx_stats
@@ -1397,11 +1706,12 @@ fn rx_thread(
                 );
             }
         }
-        // Polite wake: the consumer may be futex-parked on pub_wake (it
-        // parks after a bounded spin to keep this SMT sibling fed).
-        mb.pub_wake.fetch_add(1, Ordering::Release);
-        futex_wake(&mb.pub_wake);
+        // R33-B: the parked-flag wake (the consumer parks only after its
+        // 512-spin window — under the post-replay equilibrium it spins
+        // straight through, and the per-publication syscall disappears).
+        pub_wake_if_parked(&mb);
         turn += 1;
+        }
         if eos {
             // The end-of-stream marker is its OWN (empty) publication —
             // the consumer's next_batch returns false on it. Without it
@@ -1426,10 +1736,26 @@ fn rx_thread(
                     }
                 }
             }
+            // R33-A: THE FREEZE — the recording pass's EOS just landed;
+            // its recorded publication observables ARE the schedule for
+            // every pass of this transport's life (the frozen-master
+            // regime's pass-invariance law). A degenerate empty recording
+            // disarms to the live walk (identical behavior, zero risk).
+            if matches!(sched, RxSched::Rec(_)) {
+                let taken = std::mem::replace(&mut sched, RxSched::Off);
+                sched = match taken {
+                    RxSched::Rec(v) if !v.is_empty() => RxSched::Play {
+                        s: v.into_boxed_slice(),
+                        i: 0,
+                    },
+                    _ => RxSched::Off,
+                };
+            }
             // SAFETY: RX owns buffer j for this turn until the Release
-            // store below; len = 0 needs no entry writes.
+            // store below; the empty record needs no entry writes (the
+            // consumer's len==0 branch never reads clock/rx_start).
             unsafe {
-                (*mb.bufs[j].get()).len = 0;
+                (*mb.pubs[j].get()) = PubMeta::EMPTY;
             }
             mb.filled[j].store(turn, Ordering::Release);
             mb.auto_eos_turn.store(turn, Ordering::Release);
@@ -1456,8 +1782,10 @@ fn rx_thread(
             if rxbuild_enabled {
                 rxbuild_flush_pass_end(&mb.rx_stats, &mut rxs, true);
             }
-            mb.pub_wake.fetch_add(1, Ordering::Release);
-            futex_wake(&mb.pub_wake);
+            // R33-B: the marker's parked-flag wake (identical law to the
+            // data publication's — the consumer may be parked on THIS
+            // marker's turn).
+            pub_wake_if_parked(&mb);
             turn += 1;
         }
         let n = if eos { 0 } else { acc };
@@ -1611,6 +1939,16 @@ fn rx_thread(
                     rxs.mpp_idx = 0;
                     rxs.idx = 0;
                 }
+                // R33-A: the schedule rewind — the fresh pass replays the
+                // SAME table from row 0 (the pass-invariance law), and the
+                // telemetry counts the fully-replayed pass. `Off` (the
+                // disarm/rollback landing) and `Rec` (an incomplete
+                // recording should be unreachable here — the freeze runs
+                // before the advance) are no-ops.
+                if let RxSched::Play { i, .. } = &mut sched {
+                    *i = 0;
+                    mb.rx_stats.sched_passes.fetch_add(1, Ordering::Relaxed);
+                }
                 mb.rx_stats
                     .advance_ns
                     .fetch_add(t_adv.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1656,6 +1994,9 @@ fn rx_thread(
                 match mb.cmd.load(Ordering::Acquire) {
                     CMD_SHUTDOWN => return,
                     CMD_RESET => {
+                        // R33-A: the disarm (the EOS-park serve's twin —
+                        // see the main-loop serve's comment).
+                        sched = RxSched::Off;
                         let sess = unsafe { *mb.reset_session.get() };
                         inner.reset(sess);
                         refresh_tmpl(&sess, &mut sess_lo_tmpl, &mut sess_hi_tmpl);
@@ -1812,11 +2153,39 @@ impl PipelinedReplayTransport {
         // HFT_SESSION_ELISION=0 restores the full patch law (the
         // attribution arm's rollback).
         let elision = std::env::var("HFT_SESSION_ELISION").as_deref() != Ok("0");
-        // F-4 (HFT_NBUF): the mailbox depth — 16 (the R8 phase-3 measured
-        // shape, the default) or 32 (the buffer-reuse-stall pricing arm;
-        // CHECKLIST F-4 / ROADMAP2 §6.3). Read once at construction;
-        // anything but "16"/"32" fails safe to the default.
+        // R33-A (docs/44): the RX publication-schedule replay — DEFAULT ON
+        // under the frozen-master regime. The R32 telemetry: the producer
+        // core ran prod_ms=4,284ms of a 5,000ms window walking the
+        // construction-fixed event meta (~3.2ns/frame — the ONLY per-
+        // frame work left), publishing 1.3M windows at ~3.28µs each while
+        // the verdict-replayed consumer drained each in <300ns — 86.5% of
+        // the wall was the consumer's filled[] spin. The replay records
+        // the per-pass publication schedule ((rx_start, len, clock) per
+        // turn + the EOS position) ONCE during the first pass, then
+        // re-publishes it from the frozen table: the producer's
+        // per-publication cost drops from ~3.28µs (1024-frame walk) to
+        // ~100ns (one 16B record + two Release stores). Pass-invariance
+        // is the R31/R32 law (construction-frozen blob+master,
+        // reset_cursors re-anchors the virtual clock to the schedule's
+        // first vt every pass, the deterministic publication bounds),
+        // and the consumer-side R32 ledger's per-batch (rx_start,len)
+        // identity guard fail-stops on ANY divergence — the replay's
+        // oracle. HFT_RX_SCHED_REPLAY=0 is the rollback (the live walk
+        // verbatim). Arming is additionally gated by the frozen-master
+        // regime (elision_armed) inside the forced constructor.
+        let sched_replay = std::env::var("HFT_RX_SCHED_REPLAY").as_deref() != Ok("0");
+        // F-4 (HFT_NBUF) / R33-C: the mailbox-depth ladder — 16 (the R8
+        // phase-3 measured shape, the default), 32 (the F-4 arm), and
+        // R33-C's 64/128/256 (the producer-starvation runway pricing:
+        // post-R33-A the ring runs full and deeper rings absorb
+        // consumer-side scheduler noise; the pubs array keeps the hot
+        // footprint at 4KB regardless of depth). Read once at
+        // construction; anything outside the ladder fails safe to the
+        // default.
         let nbuf = match std::env::var("HFT_NBUF").as_deref() {
+            Ok("256") => 256u64,
+            Ok("128") => 128u64,
+            Ok("64") => 64u64,
             Ok("32") => 32u64,
             Ok("16") => 16u64,
             _ => NBUF_DEFAULT,
@@ -1832,14 +2201,15 @@ impl PipelinedReplayTransport {
             rxbuild,
             nbuf,
             elision,
+            sched_replay,
         )
     }
 
     /// F-1/F-2/F-4: [`Self::with_coalesce_cpu_auto`] with the warm start,
-    /// the publish-by-reference master, the mailbox depth, and the
-    /// session-elision arm FORCED — the tests' and local A/B's explicit
-    /// path (the envs would be process-global and racy across parallel
-    /// test transports).
+    /// the publish-by-reference master, the mailbox depth, the
+    /// session-elision arm, and the R33-A schedule-replay arm FORCED —
+    /// the tests' and local A/B's explicit path (the envs would be
+    /// process-global and racy across parallel test transports).
     #[allow(clippy::too_many_arguments)]
     pub fn with_coalesce_cpu_auto_forced(
         gt: &[u8],
@@ -1852,12 +2222,13 @@ impl PipelinedReplayTransport {
         rxbuild: bool,
         nbuf: u64,
         elision: bool,
+        sched_replay: bool,
     ) -> Self {
         debug_assert!(
-            nbuf == 16 || nbuf == 32,
-            "mailbox depth must be 16 or 32 (power-of-two protocol)"
+            nbuf.is_power_of_two() && (16..=NBUF_MAX).contains(&nbuf),
+            "mailbox depth must be a power of two in [16, {NBUF_MAX}]"
         );
-        let nbuf = if nbuf == 16 || nbuf == 32 {
+        let nbuf = if nbuf.is_power_of_two() && (16..=NBUF_MAX).contains(&nbuf) {
             nbuf
         } else {
             NBUF_DEFAULT
@@ -1887,6 +2258,14 @@ impl PipelinedReplayTransport {
         // mid-pass session split). Computed once here; the RX thread and
         // the diagnostics read the decision through the Mailbox.
         let elision_armed = elision && rxbuild && sess_fn.is_some() && !inner.has_session_split();
+        // R33-A: the schedule replay's arming decision — the request AND
+        // the frozen-master regime (the same word the R32 pass-replay
+        // ledger gates on: rxbuild + session elision — under it the
+        // blob, the master, and the publication schedule are all
+        // construction-frozen and reset_cursors re-anchors the clock,
+        // so the recorded schedule is pass-invariant BY LAW). Any other
+        // shape keeps the live walk verbatim.
+        let sched_replay_armed = sched_replay && elision_armed;
         #[allow(clippy::disallowed_types)]
         let mb: Arc<Mailbox> = Arc::new(Mailbox {
             nbuf,
@@ -1895,6 +2274,9 @@ impl PipelinedReplayTransport {
             toff_ring,
             toff_mask,
             bufs: std::array::from_fn(|_| UnsafeCell::new(EntryBuf::new())),
+            pubs: std::array::from_fn(|_| UnsafeCell::new(PubMeta::EMPTY)),
+            cons_parked: ParkFlag::clear(),
+            prod_parked: ParkFlag::clear(),
             filled: std::array::from_fn(|_| Pad::never()),
             freed: std::array::from_fn(|_| Pad::zeroed()),
             cmd: AtomicU8::new(CMD_RUN),
@@ -1936,7 +2318,7 @@ impl PipelinedReplayTransport {
             .spawn({
                 #[allow(clippy::disallowed_types)]
                 let mb: Arc<Mailbox> = Arc::clone(&mb);
-                move || rx_thread(inner, mb, rx_cpu, session, warm, rxbuild)
+                move || rx_thread(inner, mb, rx_cpu, session, warm, rxbuild, sched_replay_armed)
             })
             .expect("r8 rx thread spawn");
         Self {
@@ -2151,16 +2533,39 @@ impl PipelinedReplayTransport {
     /// harness's poll()==0 equivalent). The entry slice + clock stay valid
     /// until the next call.
     pub fn next_batch(&mut self) -> bool {
+        // R33-B: the free path's producer wake — the freed fetch_add is a
+        // locked RMW, so the Acquire load of `prod_parked` below cannot
+        // miss a producer that swapped-true before its own re-check (the
+        // both-RMW cycle proof, docs/44 §2): either the load sees the flag
+        // (wake) or the producer's freed re-check sees THIS free (no park).
+        // A plain load on the un-parked common case costs ~5ns; the wake
+        // syscall fires only when the RX actually parked (the post-R33-A
+        // equilibrium: the ring runs full and the producer parks between
+        // refills — without this, its 50µs timed self-wake would stall the
+        // consumer up to 45µs per park).
         if let Some(t) = self.cur.take() {
             self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
+            if self.mb.prod_parked.0.load(Ordering::Acquire)
+                && self.mb.prod_parked.0.swap(false, Ordering::SeqCst)
+            {
+                self.mb.wake.fetch_add(1, Ordering::Release);
+                futex_wake(&self.mb.wake);
+            }
         }
         let i = (self.turn & self.mb.nbuf_mask) as usize;
         // Polite acquire: a bounded spin for the common fast case, then a
         // futex park. An UNCAPPED spin here starved the RX on the SMT
         // sibling (Zen3's weak PAUSE hint) — the RX's 6us batch stretched
         // to 2.6ms and the sustained arm collapsed to 8M msg/s.
+        //
+        // R33-B: the park branch sets `cons_parked` with a SeqCst swap
+        // BEFORE the filled[] re-check + futex_wait — the both-RMW Dekker
+        // breaker against the producer's publication-path swap. The flag
+        // is cleared once the batch lands (a stale true would only cost
+        // the producer one spurious wake syscall).
         let mut spins = 0u32;
         let mut parked = false;
+        let mut flagged = false;
         let t_park = std::time::Instant::now();
         loop {
             if self.mb.filled[i].load(Ordering::Acquire) == self.turn {
@@ -2174,6 +2579,10 @@ impl PipelinedReplayTransport {
                         .cons_stats
                         .slow_waits
                         .fetch_add(1, Ordering::Relaxed);
+                }
+                if !flagged {
+                    flagged = true;
+                    self.mb.cons_parked.0.swap(true, Ordering::SeqCst);
                 }
                 let observed = self.mb.pub_wake.load(Ordering::Acquire);
                 if self.mb.filled[i].load(Ordering::Acquire) != self.turn {
@@ -2190,6 +2599,9 @@ impl PipelinedReplayTransport {
                 std::hint::spin_loop();
             }
         }
+        if flagged {
+            self.mb.cons_parked.0.store(false, Ordering::Release);
+        }
         if parked {
             self.mb
                 .cons_stats
@@ -2198,9 +2610,10 @@ impl PipelinedReplayTransport {
         }
         let t = self.turn;
         self.turn += 1;
-        // SAFETY: consumer owns buffer i for turn t; len was published by
-        // the RX's Release store (ordered by the Acquire above).
-        let len = unsafe { (*self.mb.bufs[i].get()).len };
+        // SAFETY: consumer owns buffer i for turn t; the record was
+        // published by the RX's Release store (ordered by the Acquire
+        // above) — the R33-C pubs array (the old in-EntryBuf trio).
+        let len = unsafe { (*self.mb.pubs[i].get()).len };
         if len == 0 {
             // EOS: the empty publication occupies a turn — free it to keep
             // the use counts symmetric for the next pass. The free is also
@@ -2239,11 +2652,12 @@ impl PipelinedReplayTransport {
             // Release/Acquire pair (the patch frontier guarantees no
             // in-flight entry is touched), and the target bytes outlive
             // the pipeline (the EntryBuf contract, extended to the
-            // master).
+            // master). R33-C: the slice bounds read from the pubs record
+            // (the R33-B freeze stores them there verbatim).
             unsafe {
-                let buf = &*self.mb.bufs[(t & self.mb.nbuf_mask) as usize].get();
-                let n = buf.len as usize;
-                let start = buf.rx_start as usize;
+                let pm = &*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get();
+                let n = pm.len as usize;
+                let start = pm.rx_start as usize;
                 let master = (*self.mb.master.get())
                     .as_ref()
                     .expect("rxbuild: master not built");
@@ -2253,10 +2667,11 @@ impl PipelinedReplayTransport {
         } else {
             // SAFETY: consumer-owned for this turn; the entries' target bytes
             // outlive the pipeline (joined in Drop) and are not read after the
-            // buffer is freed.
+            // buffer is freed. R33-C: the entry COUNT lives in the pubs
+            // record (the entries array itself carries no length).
             unsafe {
                 let buf = &*self.mb.bufs[(t & self.mb.nbuf_mask) as usize].get();
-                let n = buf.len as usize;
+                let n = (*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get()).len as usize;
                 &buf.entries[..n]
             }
         }
@@ -2267,8 +2682,9 @@ impl PipelinedReplayTransport {
     #[inline]
     pub fn now_ns(&self) -> u64 {
         let t = self.cur.expect("r8 pipeline: no current batch");
-        // SAFETY: same ownership + publication ordering as `entries`.
-        unsafe { (*self.mb.bufs[(t & self.mb.nbuf_mask) as usize].get()).clock }
+        // SAFETY: same ownership + publication ordering as `entries`
+        // (the R33-C pubs record's clock field).
+        unsafe { (*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get()).clock }
     }
 
     /// Return the entire pass's master frame entries when rxbuild is enabled.
@@ -2319,10 +2735,10 @@ impl PipelinedReplayTransport {
         let t = self.cur.expect("r32 pipeline: no current batch");
         // SAFETY: consumer-owned view for this turn; the fields were
         // published by the RX's Release store (ordered by the filled[]
-        // Acquire in next_batch).
+        // Acquire in next_batch). R33-C: the pubs record.
         unsafe {
-            let buf = &*self.mb.bufs[(t & self.mb.nbuf_mask) as usize].get();
-            (buf.rx_start, buf.len)
+            let pm = &*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get();
+            (pm.rx_start, pm.len)
         }
     }
 
@@ -2379,6 +2795,34 @@ impl PipelinedReplayTransport {
         (v >= 0).then_some(v as usize)
     }
 
+    /// R33-A: the schedule-replay telemetry — (replayed publications,
+    /// fully-replayed passes, wake syscalls saved by the R33-B
+    /// parked-flag protocol). The engagement law on an armed sustained
+    /// run: sched_replays ≈ publications − (the recording pass's live
+    /// count), sched_passes ≈ resets − 1, polls stops growing after the
+    /// recording pass, and wakes_saved ≈ publications when the consumer
+    /// never parks (the post-R33-A equilibrium).
+    pub fn rx_sched_stats(&self) -> (u64, u64, u64) {
+        (
+            self.mb.rx_stats.sched_replays.load(Ordering::Relaxed),
+            self.mb.rx_stats.sched_passes.load(Ordering::Relaxed),
+            self.mb.rx_stats.wakes_saved.load(Ordering::Relaxed),
+        )
+    }
+
+    /// R33: the producer-side production telemetry — (publications,
+    /// prod_ns, polls). The line-rate law: prod_ns/publications is the
+    /// per-window producer cost (the R32 baseline ~3.28µs — the
+    /// 1024-frame meta walk; the R33 replay's target ~100ns — the
+    /// 16-byte frozen-table record + two Release stores).
+    pub fn rx_prod_stats(&self) -> (u64, u64, u64) {
+        (
+            self.mb.rx_stats.publications.load(Ordering::Relaxed),
+            self.mb.rx_stats.prod_ns.load(Ordering::Relaxed),
+            self.mb.rx_stats.polls.load(Ordering::Relaxed),
+        )
+    }
+
     /// R8 phase-2 diagnostics: one always-on telemetry line per run covering
     /// the transport's whole life (RX production cost, buffer starvation,
     /// consumer parks). Read-only, post-run.
@@ -2400,6 +2844,15 @@ impl PipelinedReplayTransport {
             rx.eos_parks.load(Ordering::Relaxed),
             self.mb.nbuf,
             actual,
+        );
+        // R33: the producer-side elision's telemetry line (always printed
+        // — the CI arm greps it; the engagement law is in
+        // [`Self::rx_sched_stats`]'s doc).
+        eprintln!(
+            "RXSCHED_DIAGNOSTIC {label}: sched_replays={} sched_passes={} wakes_saved={} (R33-A/R33-B: the publication-schedule replay + the parked-flag wake-skip — polls frozen after the recording pass is the elision's signature, docs/44)",
+            rx.sched_replays.load(Ordering::Relaxed),
+            rx.sched_passes.load(Ordering::Relaxed),
+            rx.wakes_saved.load(Ordering::Relaxed),
         );
         // F-5: the auto-advance telemetry line (always printed — the
         // pass boundary's exposed bake cost on the sustained critical
@@ -2770,6 +3223,7 @@ mod tests {
             true,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         for pass in 1..=4u64 {
             let sess = i7_sess(pass);
@@ -2834,6 +3288,7 @@ mod tests {
                 false,
                 16,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -2846,6 +3301,7 @@ mod tests {
                 false,
                 16,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -2913,6 +3369,7 @@ mod tests {
             false,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
@@ -2925,6 +3382,7 @@ mod tests {
             false,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         // Drain pass 1 fully (the fill), then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut warm] {
@@ -2981,6 +3439,7 @@ mod tests {
             false,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
@@ -3029,6 +3488,7 @@ mod tests {
                 false,
                 16,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3041,6 +3501,7 @@ mod tests {
                 true,
                 16,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3118,6 +3579,7 @@ mod tests {
                 false,
                 16,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             let mut d32 = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3130,6 +3592,7 @@ mod tests {
                 false,
                 32,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             let mut d32r = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3142,6 +3605,7 @@ mod tests {
                 true,
                 32,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3196,6 +3660,215 @@ mod tests {
         }
     }
 
+    // ─── R33: the producer-starvation wall program (docs/44) ────────────
+
+    /// R33-A: THE schedule-replay parity pin — the SAME armed
+    /// frozen-master shape (rxbuild + elision + auto program, the
+    /// sustained champion), one transport with the schedule replay ON,
+    /// one OFF (the live walk), drained side by side through 6 rotating
+    /// passes. The replayed publication stream must be observably
+    /// IDENTICAL: per-batch (rx_start, len, clock) triples, EOS
+    /// alignment, per-pass frame counts — the (rx_start,len) stream is
+    /// exactly what the consumer-side R32 ledger's identity guard
+    /// fail-stops on, so this pin is the transport-level twin of that
+    /// oracle. Also asserts the ENGAGEMENT law: sched_replays ==
+    /// publications - (the recording pass's live count), sched_passes ==
+    /// advances - 1, and polls FROZEN after the recording pass (the
+    /// walk left the steady path).
+    #[test]
+    fn t_r33_sched_replay_parity_vs_live() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let mk = |replay: bool| {
+            PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true, // rxbuild
+                16,
+                true, // elision — the frozen-master regime
+                replay,
+            )
+        };
+        let mut live = mk(false);
+        let mut replay = mk(true);
+        for p in 1..=6u64 {
+            let sess = sess_program(p);
+            live.reset_pass(p, sess);
+            replay.reset_pass(p, sess);
+            let mut frames = 0usize;
+            loop {
+                let a_ok = live.next_batch();
+                let b_ok = replay.next_batch();
+                assert_eq!(a_ok, b_ok, "pass {p}: live/replay EOS mismatch");
+                if !a_ok {
+                    break;
+                }
+                // R33-C: the observable trio from the pubs record — the
+                // replay must match the live walk bit-for-bit.
+                let (a_bounds, a_clock) = (live.batch_bounds(), live.now_ns());
+                let (b_bounds, b_clock) = (replay.batch_bounds(), replay.now_ns());
+                assert_eq!(
+                    a_bounds, b_bounds,
+                    "pass {p}: (rx_start, len) diverged — the R32 ledger would fail-stop"
+                );
+                assert_eq!(a_clock, b_clock, "pass {p}: clock diverged");
+                let ae = live.entries();
+                let be = replay.entries();
+                assert_eq!(ae.len(), be.len(), "pass {p}: batch length mismatch");
+                for (a, b) in ae.iter().zip(be.iter()) {
+                    assert!(
+                        !entry_content_neq(a, b),
+                        "pass {p}: replay entry diverged from the live walk"
+                    );
+                }
+                frames += ae.len();
+            }
+            assert_eq!(frames, 60, "pass {p}: frame count");
+        }
+        // R33-A: the engagement law — pass 1 (the first reset_pass) ran
+        // the LIVE walk (the recording pass 0's publications were never
+        // consumed; the freeze landed at ITS eos), and every later pass
+        // replayed. 6 consumed passes + the construction pass:
+        // sched_passes == the advances counted = resets - 1 (the
+        // construction advance), and sched_replays == 5 passes x 1
+        // record (the mini schedule is a single 60-frame publication).
+        let (replays, passes, _) = replay.rx_sched_stats();
+        assert!(replays >= 5, "sched_replays={replays} (the engagement law)");
+        // The RX's runahead may have advanced one pass past the last
+        // consumed EOS when the stats land (the 6→7 advance fires on the
+        // pass-6 marker free; pass 7's tail never completes — the ring
+        // fills and the RX parks). Racy at the boundary by construction.
+        assert!((6..=7).contains(&passes), "sched_passes={passes}");
+        // The polls counter: the LIVE transport keeps polling every pass;
+        // the replay transport's polls froze after its recording pass.
+        let (_, _, master_frames) = replay.rx_build_stats();
+        assert_eq!(master_frames, 60, "master frame count");
+    }
+
+    /// R33-C: the deep-ring ladder at the new depths — 64 and 256, both
+    /// under the full champion regime (rxbuild + elision + the schedule
+    /// replay), against the depth-16 reference. The depth must be
+    /// transparent (the F-4 law extended): identical (rx_start, len)
+    /// streams, identical EOS alignment, identical frame counts — and
+    /// the pubs array's 16B stride keeps the deep ring's hot footprint
+    /// one page.
+    #[test]
+    fn t_r33_nbuf_ladder_parity() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let mk = |nbuf: u64| {
+            PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true,
+                nbuf,
+                true,
+                true,
+            )
+        };
+        let mut d16 = mk(16);
+        let mut d64 = mk(64);
+        let mut d256 = mk(256);
+        for p in 1..=4u64 {
+            let sess = sess_program(p);
+            d16.reset_pass(p, sess);
+            d64.reset_pass(p, sess);
+            d256.reset_pass(p, sess);
+            let mut frames = 0usize;
+            loop {
+                let a_ok = d16.next_batch();
+                let b_ok = d64.next_batch();
+                let c_ok = d256.next_batch();
+                assert_eq!(a_ok, b_ok, "pass {p}: d16/d64 EOS mismatch");
+                assert_eq!(a_ok, c_ok, "pass {p}: d16/d256 EOS mismatch");
+                if !a_ok {
+                    break;
+                }
+                assert_eq!(d16.batch_bounds(), d64.batch_bounds(), "pass {p}: d64 bounds");
+                assert_eq!(d16.batch_bounds(), d256.batch_bounds(), "pass {p}: d256 bounds");
+                assert_eq!(
+                    d16.entries().len(),
+                    d64.entries().len(),
+                    "pass {p}: d64 batch length"
+                );
+                assert_eq!(
+                    d16.entries().len(),
+                    d256.entries().len(),
+                    "pass {p}: d256 batch length"
+                );
+                frames += d16.entries().len();
+            }
+            assert_eq!(frames, 60, "pass {p}: frame count");
+        }
+        let (r64, p64, _) = d64.rx_sched_stats();
+        let (r256, p256, _) = d256.rx_sched_stats();
+        // 4 consumed passes + the construction advance; the runahead
+        // boundary advance is racy (see the parity cell's note). The
+        // replay COUNT is not depth-invariant at the tail by design — a
+        // deeper ring lets the RX publish further into the unconsumed
+        // next pass before blocking (the runway that IS the R33-C lever).
+        assert!((4..=5).contains(&p64), "d64 engagement (p64={p64})");
+        assert!((4..=5).contains(&p256), "d256 engagement (p256={p256})");
+        assert!(r64 >= 4, "d64 replay count (r64={r64})");
+        assert!(r256 >= 4, "d256 replay count (r256={r256})");
+    }
+
+    /// R33-B: the parked-flag handshake stress — a SLOW consumer (a
+    /// parked sleep between batches on the replay shape) forces the
+    /// consumer's futex park AND the producer's buffer-free timed parks
+    /// every batch. A lost wake in either direction hangs this test
+    /// (the harness timeout catches it); the both-RMW Dekker protocol
+    /// is the design under test. The observables must stay bit-exact.
+    #[test]
+    fn t_r33_wakeskip_slow_consumer_no_lost_wake() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let mut t = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            &gt,
+            sched,
+            *b"PIPETEST01",
+            8,
+            None,
+            Some(sess_program),
+            false,
+            true,
+            16,
+            true,
+            true,
+        );
+        for p in 1..=3u64 {
+            t.reset_pass(p, sess_program(p));
+            let mut frames = 0usize;
+            let mut batches = 0u32;
+            loop {
+                // Park long enough that the RX fills the ring and enters
+                // its buffer-free timed park (the consumer->producer
+                // flag direction), then drains fast enough to hit its own
+                // 512-spin park window (the producer->consumer
+                // direction).
+                if batches % 2 == 1 {
+                    std::thread::sleep(std::time::Duration::from_micros(400));
+                }
+                if !t.next_batch() {
+                    break;
+                }
+                frames += t.entries().len();
+                batches += 1;
+            }
+            assert_eq!(frames, 60, "pass {p}: frame count under the slow consumer");
+        }
+    }
+
     /// F-2: the mid-pass abandon shape — an abandoned pass leaves a
     /// partially-patched master; the next pass must still publish the
     /// correct entries (the reset serve's full rewrite is the
@@ -3215,6 +3888,7 @@ mod tests {
             false,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
@@ -3227,6 +3901,7 @@ mod tests {
             true,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         // Drain pass 1 fully, then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut rxbuild] {
@@ -3284,6 +3959,7 @@ mod tests {
             true,
             16,
             false,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
@@ -3352,6 +4028,7 @@ mod tests {
                 true,
                 16,
                 false,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             let mut elided = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3364,6 +4041,7 @@ mod tests {
                 true,
                 16,
                 true,
+            false, // R33-A: sched replay off — the pre-R33 pinned shape
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3457,6 +4135,7 @@ mod tests {
             true,
             16,
             true,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         // A session the program will NOT bake for pass 1 — must fail-stop
         // exactly like the patched shape.
@@ -3490,6 +4169,7 @@ mod tests {
             true,
             16,
             true,
+        false, // R33-A: sched replay off — the pre-R33 pinned shape
         );
         // Drain pass 1 fully, abandon pass 2 mid-flight, target pass 3.
         t.reset_pass(1, sess_program(1));

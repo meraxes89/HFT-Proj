@@ -806,6 +806,7 @@ fn t_i7_prepatch_chaos_sustained_soak() {
         true,
         16,
         false,
+        false, // R33-A: off — the patch-law soak is not the frozen-master regime
     );
 
     // Deterministic LCG chaos — reproducible failure modes, no RNG dep.
@@ -940,6 +941,7 @@ fn t_f1_rxwarm_chaos_sustained_soak() {
         false,
         16,
         false,
+        false, // R33-A: off — the patch-law soak is not the frozen-master regime
     );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).
@@ -1081,6 +1083,7 @@ fn t_f2_rxbuild_chaos_sustained_soak() {
         true,
         16,
         false,
+        false, // R33-A: off — the patch-law soak is not the frozen-master regime
     );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).

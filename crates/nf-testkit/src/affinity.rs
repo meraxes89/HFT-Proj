@@ -424,6 +424,114 @@ pub fn verify_pipeline_placement(main_cpu: Option<usize>, rx_cpu: Option<usize>)
     }
 }
 
+/// R33-D (docs/44 §5): the FABRIC-wide topology verdict — main, RX, and
+/// every worker lane checked against the producer-starvation program's
+/// placement law: the whole fabric inside ONE L3 domain (the SPSC
+/// ring's filled[]/freed[] handoffs and the workers' span grid stay
+/// on-core latency; a cross-CCD pair puts every ring-index update on
+/// the Infinity Fabric at 120-200ns — a per-publication tax the
+/// ~100ns replayed publication cannot absorb). Reports the per-cpu
+/// die (CCD) ids from sysfs alongside the L3 truth so the verdict line
+/// carries the full topology picture. Cheap by construction: a handful
+/// of sysfs reads, called once per run OUTSIDE every measured window.
+pub fn verify_fabric_topology(
+    main_cpu: Option<usize>,
+    rx_cpu: Option<usize>,
+    worker_cpus: &[usize],
+) -> TopologyVerdict {
+    let cpus: Vec<usize> = main_cpu
+        .into_iter()
+        .chain(rx_cpu)
+        .chain(worker_cpus.iter().copied())
+        .collect();
+    if cpus.is_empty() {
+        return TopologyVerdict::Unverifiable(
+            "no fabric cpus to verify (empty placement)".to_string(),
+        );
+    }
+    // The shared-L3 predicate: every cpu's index-3 sharing list must
+    // contain every other fabric cpu (identical domains).
+    let domains: Vec<Option<Vec<usize>>> = cpus.iter().map(|&c| read_l3_shared(c)).collect();
+    if domains.iter().any(|d| d.is_none()) {
+        return TopologyVerdict::Unverifiable(
+            "cache/index3/shared_cpu_list unavailable for a fabric cpu".to_string(),
+        );
+    }
+    let first = domains[0].as_ref().expect("checked non-none");
+    let key = |mut v: Vec<usize>| {
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let first_key = key(first.clone());
+    for (i, d) in domains.iter().enumerate().skip(1) {
+        if key(d.clone().expect("checked non-none")) != first_key {
+            return TopologyVerdict::Violated(format!(
+                "fabric is SPLIT across L3 domains: cpu{} and cpu{} disagree on \
+                 index3/shared_cpu_list (cross-CCD ring handoffs — the R33 \
+                 replayed publication's ~100ns budget cannot absorb the \
+                 Infinity Fabric hop; HFT_FABRIC_PLACE re-pins within one group)",
+                cpus[0], cpus[i]
+            ));
+        }
+    }
+    TopologyVerdict::Verified
+}
+
+/// R33-D: the sysfs die (CCD) id of `cpu` — None when the host does not
+/// expose `topology/die_id` (VMs often hide it; the L3 check above stays
+/// the load-bearing truth, the die id is the human-readable context).
+fn read_die_id(cpu: usize) -> Option<u64> {
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/die_id");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// R33-D: print the fabric topology report line — the per-fabric-cpu
+/// (cpu, die_id) pairs and the L3-sharing verdict. Called once per run,
+/// post-run (the diagnostics contract: never inside a measured window).
+/// `HFT_TOPOLOGY_STRICT=1` promotes a VIOLATION to a hard failure.
+pub fn report_fabric_topology(
+    main_cpu: Option<usize>,
+    rx_cpu: Option<usize>,
+    worker_cpus: &[usize],
+) {
+    let verdict = verify_fabric_topology(main_cpu, rx_cpu, worker_cpus);
+    let fmt_cpu = |c: usize| -> String {
+        match read_die_id(c) {
+            Some(d) => format!("cpu{c}(ccd{d})"),
+            None => format!("cpu{c}(ccd?)"),
+        }
+    };
+    let parts: Vec<String> = main_cpu
+        .into_iter()
+        .map(|c| format!("main={}", fmt_cpu(c)))
+        .chain(rx_cpu.into_iter().map(|c| format!("rx={}", fmt_cpu(c))))
+        .chain(
+            worker_cpus
+                .iter()
+                .map(|&c| fmt_cpu(c))
+                .collect::<Vec<_>>(),
+        )
+        .collect();
+    let strict = std::env::var("HFT_TOPOLOGY_STRICT").as_deref() == Ok("1");
+    match &verdict {
+        TopologyVerdict::Verified => eprintln!(
+            "TOPOLOGY_FABRIC {} -> VERIFIED (one L3 domain — the R33 SPSC ring and the span grid stay fabric-local)",
+            parts.join(" ")
+        ),
+        TopologyVerdict::Violated(why) => {
+            eprintln!("TOPOLOGY_FABRIC {} -> VIOLATED: {why}", parts.join(" "));
+            if strict {
+                panic!("HFT_TOPOLOGY_STRICT: fabric placement violates the R33-D law: {why}");
+            }
+        }
+        TopologyVerdict::Unverifiable(why) => eprintln!(
+            "TOPOLOGY_FABRIC {} -> UNVERIFIABLE: {why}",
+            parts.join(" ")
+        ),
+    }
+}
+
 #[cfg(test)]
 mod l3_tests {
     use super::*;
@@ -492,6 +600,52 @@ mod l3_tests {
             assert!(
                 !v.is_violation(),
                 "placement took the L3-group path but the verifier rejected it: {v:?}"
+            );
+        }
+    }
+
+    /// R33-D: the fabric-wide verdict's own laws — (a) an empty fabric is
+    /// honestly UNVERIFIABLE (never a silent pass); (b) the default
+    /// placement's whole fabric (main + rx + workers) must verify or be
+    /// unverifiable when the host exposes the sysfs truth (the selector
+    /// and the verifier share it — an internal inconsistency is a bug,
+    /// a host-shape fact is a verdict); (c) a fabric split across two
+    /// DIFFERENT L3 groups (when the host has more than one) is a
+    /// VIOLATION by construction.
+    #[test]
+    fn t_r33_fabric_topology_laws() {
+        // (a) empty fabric
+        let v = verify_fabric_topology(None, None, &[]);
+        assert!(
+            matches!(v, TopologyVerdict::Unverifiable(_)),
+            "empty fabric must be Unverifiable, got {v:?}"
+        );
+        // (b) the default placement's fabric consistency
+        let (main, rx, workers) = fabric_placement(2);
+        let v = verify_fabric_topology(main, rx, &workers);
+        match &v {
+            TopologyVerdict::Verified => {}
+            TopologyVerdict::Unverifiable(_) => {}
+            TopologyVerdict::Violated(why) => {
+                // Allowed only as a genuine host-shape fact: the placement
+                // wrapped across L3 groups (fewer cores than lanes). The
+                // fabric placement never SPLITS domains on purpose.
+                let groups = l3_groups();
+                assert!(
+                    groups.len() > 1,
+                    "VIOLATED on a single-L3 host is an internal inconsistency: {why}"
+                );
+            }
+        }
+        // (c) a provably split fabric (needs a host with 2+ L3 groups).
+        let groups = l3_groups();
+        if groups.len() >= 2 {
+            let a = groups[0][0];
+            let b = groups[1][0];
+            let v = verify_fabric_topology(Some(a), Some(b), &[]);
+            assert!(
+                matches!(v, TopologyVerdict::Violated(_)),
+                "cross-L3 fabric (cpu{a}, cpu{b}) must be Violated, got {v:?}"
             );
         }
     }

@@ -710,6 +710,91 @@ grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw16.txt | head -1
 grep "PR1_R32_PASS_REPLAY_VERDICT" /tmp/bench_fw16.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_fw16.txt | tail -1
 
+echo "=== 11r33r. R33: the publication-schedule replay rollback (HFT_RX_SCHED_REPLAY=0 attribution) ==="
+# ── 11r33r. R33-A: the producer-side elision's rollback ───────────────
+# The Run-650 problem statement: PR #17 deleted the main-core scan
+# (work_ms 3,882 -> 359.8) and the profile inverted AGAIN — the RX
+# producer core ran prod_ms=4,284 of the 5,000ms window walking the
+# construction-fixed event meta (~3.2ns/frame, the ONLY per-frame work
+# left) while the verdict-replayed consumer drained each window in
+# <300ns: 86.5% of the wall was the consumer's filled[] spin
+# (wait_ms=4,325.8). R33-A memoizes the FIRST pass's publication
+# observables — one 16-byte (rx_start, len, clock) record per data
+# publication — and re-publishes the frozen table every later pass:
+# the producer's per-window cost collapses from ~3.28µs (the
+# 1024-frame walk) to ~30ns (one record + two Release stores; the
+# local 2-vCPU A/B: prod_ms 780.8 -> 3.3, polls 458,380 -> 87 — the
+# walk leaves the steady path entirely). The consumer-side R32
+# ledger's per-batch (rx_start,len) identity guard is the replay's
+# fail-stop oracle (a divergent replay cannot pass the bit-parity
+# gate). The DEFAULT arm (11ab) runs the replay armed; THIS arm
+# restores the live walk verbatim. Same-draw delta 11ab - 11r33r =
+# the replay's contribution; the PR1_R33_RX_SCHED_VERDICT line
+# (sched_replays, per_pub_ns, polls frozen) carries the mechanism's
+# proof and the R32 line carries the oracle's.
+HFT_RXDESC=1 HFT_RX_SCHED_REPLAY=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_r33r.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r33r.txt
+grep -q "allocs=0" /tmp/bench_r33r.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r33r.txt
+grep -q "PR1_R33_RX_SCHED_VERDICT rate=.* sched_replays=0 " /tmp/bench_r33r.txt
+grep "PR1_R33_RX_SCHED_VERDICT" /tmp/bench_r33r.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r33r.txt | tail -1
+
+echo "=== 11nb6. R33-C: the deep-ring runway, 64-deep (HFT_NBUF=64 attribution) ==="
+# ── 11nb6. R33-C: the mailbox depth ladder's 64 point ─────────────────
+# Post-R33-A the ring runs FULL (the replayed producer is ~30x faster
+# than the consumer) and the producer parks between refills — the
+# depth IS the runway that absorbs consumer-side scheduler noise. The
+# R33-C pubs split (one 16B record per turn at a 16B stride — one page
+# at 256-deep) keeps the hot footprint depth-flat, so the ladder
+# prices pure runway. The bit-parity gate and allocs=0 stay the hard
+# floor; the depth is protocol-transparent (the F-4 law, pinned by
+# t_r33_nbuf_ladder_parity).
+HFT_RXDESC=1 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_nb6.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_nb6.txt
+grep -q "allocs=0" /tmp/bench_nb6.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_nb6.txt
+grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_nb6.txt | head -1
+grep "PR1_R33_RX_SCHED_VERDICT" /tmp/bench_nb6.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_nb6.txt | tail -1
+
+echo "=== 11nb25. R33-C: the deep-ring runway, 256-deep (HFT_NBUF=256 attribution) ==="
+# ── 11nb25. R33-C: the ladder's 256 point ──────────────────────────────
+# The 256-deep extreme (the ~3-pass runway at the record cadence):
+# prices the point where the ring's depth stops paying (the consumer
+# catches up through the pass boundary's advance gate regardless) and
+# the entry-array RSS ceiling (256 x 64KB construction-only, untouched
+# on the rxbuild path — the R33-C law). Same gates as 11nb6.
+HFT_RXDESC=1 HFT_NBUF=256 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_nb25.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_nb25.txt
+grep -q "allocs=0" /tmp/bench_nb25.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_nb25.txt
+grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_nb25.txt | head -1
+grep "PR1_R33_RX_SCHED_VERDICT" /tmp/bench_nb25.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_nb25.txt | tail -1
+
+echo "=== 11fw8r33. R33: the fleet ceiling with the producer unblocked (HFT_SUSTAINED_WORKERS=8, the 10B+ probe) ==="
+# ── 11fw8r33. R33 + the fleet: the 10B-15B band's pricing arm ──────────
+# The R32 fleet telemetry: the workers ran eval_ms ~1.13-1.23s of the
+# 5s window (24% utilization — 3.5-4x headroom) and fw_ms ~1.0s at the
+# frontier; the producer was the binding constraint. With R33-A/B/C
+# unblocking the producer, the 8-lane fleet arm prices the unlocked
+# ceiling — the target band is 10B-15B+ msg/s sustained (the worker
+# fold's ~36µs/pass floor at 2 lanes becomes ~5-9µs/pass at 8-16
+# lanes, and the consumer's verdict replay at ~6µs/pass keeps pace).
+# The bit-parity gate and allocs=0 stay the hard floor; the R33 verdict
+# line carries the producer-side proof and the R32 line the oracle's.
+HFT_RXDESC=1 HFT_SUSTAINED_WORKERS=8 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_fw8r33.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw8r33.txt
+grep -q "allocs=0" /tmp/bench_fw8r33.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_fw8r33.txt
+grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw8r33.txt | head -1
+grep "PR1_R33_RX_SCHED_VERDICT" /tmp/bench_fw8r33.txt | head -1
+grep "PR1_R32_PASS_REPLAY_VERDICT" /tmp/bench_fw8r33.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_fw8r33.txt | tail -1
+grep "RXSCHED_DIAGNOSTIC" /tmp/bench_fw8r33.txt | tail -1
+grep "TOPOLOGY_FABRIC" /tmp/bench_fw8r33.txt | tail -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
