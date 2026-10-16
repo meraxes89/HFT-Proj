@@ -233,3 +233,39 @@ the consumed pass count`, `polls` frozen after the recording pass
 publications` while the consumer spins through. Rollback:
 `HFT_RX_SCHED_REPLAY=0` (arm `11r33r`); depth ladder: `HFT_NBUF=64/
 128/256` (arms `11nb6`/`11nb25`); strict topology: `HFT_TOPOLOGY_STRICT=1`.
+
+---
+
+## §8 The Fleet Verdict — 17.79 Billion msg/s Sustained (The Starvation Wall Demolished)
+
+**Run:** `38898937833` across AMD EPYC 9V45 bare-metal nodes.  
+**Peak Rate:** **`17,791,404,158 msg/s sustained`** (Shard 39, 11ab champion arm, workers=2).  
+**Scale:** **89,957,593,442 messages** processed and fully verified in 5.00 seconds with 0 allocations, 0 fallbacks, 100% bit-exact conformance.
+
+### The 9V45 Fleet Scoreboard
+
+| Shard | Silicon | 11ab (R33 Replay ON) | 11r33r (Rollback OFF) | Attribution Delta |
+| :---: | :--- | ---: | ---: | ---: |
+| **39** | AMD EPYC 9V45 | **17,791,404,158** | 7,272,517,671 | +10.5B (×2.45) |
+| **12** | AMD EPYC 9V45 | **17,652,291,637** | 6,629,538,550 | +11.0B (×2.66) |
+| **7** | AMD EPYC 9V45 | **17,191,283,189** | 6,991,405,170 | +10.2B (×2.46) |
+| **8** | AMD EPYC 9V45 | **16,938,479,841** | 7,216,690,589 | +9.7B (×2.35) |
+| **27** | AMD EPYC 9V45 | **16,704,568,501** | 7,131,125,701 | +9.6B (×2.34) |
+| **18** | AMD EPYC 9V45 | **16,635,840,179** | 6,355,787,178 | +10.3B (×2.62) |
+| **24** | AMD EPYC 9V45 | **16,539,446,106** | 6,752,384,993 | +9.8B (×2.45) |
+| **9** | AMD EPYC 9V45 | **16,540,103,906** | 6,974,416,766 | +9.6B (×2.37) |
+| **4** | Intel Xeon Platinum 8573C | **9,147,811,078** | 4,132,138,647 | +5.0B (×2.21) |
+
+### The Telemetry Before vs After (Shard 39)
+
+```
+Telemetry Metric         R32 Baseline (6.0B)    R33 Champion (17.8B)     Delta
+prod_ms (RX Publisher)   4,284.3 ms             87.2 ms                  49x reduction
+per_pub_ns               3,283 ns               23 ns                    143x faster
+wait_ms (Main Core Spin) 4,325.8 ms (86.5%)     594.6 ms (11.9%)         -86% spin wait
+wakes_saved              —                      4,044,656                syscall storm deleted
+Passes (5.0s)            59,309                 175,858                  x2.97
+Publications (5.0s)      1,304,858              3,868,936                x2.96
+Worker Utilization       ~24% (eval ~1.2s)      ~74% (eval ~3.8s)        x3 saturation
+Gate PR1_R29_SELF_SERVE  target=10,000,000,000  rate=17,791,404,158      PASS
+```
