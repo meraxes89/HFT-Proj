@@ -795,6 +795,29 @@ grep "DIAG sustained: passes" /tmp/bench_fw8r33.txt | tail -1
 grep "RXSCHED_DIAGNOSTIC" /tmp/bench_fw8r33.txt | tail -1
 grep "TOPOLOGY_FABRIC" /tmp/bench_fw8r33.txt | tail -1
 
+echo "=== 11r34. R34: the O(1) affine ingestion fold (the A5.0 collapse kernel + the fold-stage roofline) ==="
+# ── 11r34. R34: the math team's blueprint ported (docs/solution.md →
+# lobstate.rs) ──────────────────────────────────────────────────────────
+# The ITCH 5.0 fold algebra collapses to the commutative monoid A5.0 =
+# (Z^2,+) x (Tg, sqb_seq): the K-matrix chain is one OR bit (Thm 1), the
+# volume deltas are plain wrapping sums, and the price is a
+# last-writer-wins tagged max — 2 adds + 1 combine per BATCH, any
+# partition, any merge order (Thm 4). This arm lands the kernel
+# acceptance on target silicon: the lobstate differential cells (the
+# §4.5/§7.5 adversarial taxonomy — recency vs max-price, the T1/T3/T4
+# tie discipline, partition invariance at {1,16,64,256,512}, the
+# 2000-trial dual-path fuzz, the 500k pass with 977 chunks and the
+# 976-⊕ replay) in release mode, then the fold-stage roofline verdict
+# (sigbench: cyc/msg, the cold chunk-fold rate, the replay
+# msg/s-equivalent, bit-exact + dual-path asserted on the runner).
+cargo test --release -p nf-testkit lobstate 2>&1 | tee /tmp/test_r34.txt
+grep -q "test result: ok" /tmp/test_r34.txt
+cargo run --release -p nf-testkit --bin sigbench 2>&1 | tee /tmp/bench_r34.txt
+grep -q "PR1_R34_AFFINE_FOLD_VERDICT" /tmp/bench_r34.txt
+grep -q "bitexact=true" /tmp/bench_r34.txt
+grep -q "dual_path=true" /tmp/bench_r34.txt
+grep "PR1_R34_AFFINE_FOLD_VERDICT" /tmp/bench_r34.txt | head -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
