@@ -1366,6 +1366,143 @@ fn steady_scan_ref<'a, S: Sink>(
     (progressed, cold)
 }
 
+/// R31-B: the 16-entry group fast path — TWO 8-lane ladder steps fused
+/// into ONE out-of-line call with dual ZMM registers. The gather issues
+/// all 32 AoS loads up front (group B's load-to-use latency overlaps
+/// group A's vector relations), the relations run as two
+/// [`SoaLadder8`] kernels with the COMPOSED anchor (group B's anchor is
+/// group A's watermark advance — implied-exact by A's wrap guard), ONE
+/// session gate covers all sixteen (the publish-time baked-session
+/// law), and the counter folds + emissions batch across both groups.
+///
+/// BIT-EXACTNESS: applying the 16-group is observably identical to two
+/// consecutive `ladder_group_apply` calls — group A's kernel proves
+/// firsts[0]==w, its three even chain links, and its wrap guard
+/// (firsts[0]+Σns[evenA] exact); group B's kernel then anchors at
+/// firsts[8]==w+Σns[evenA], which is EXACTLY the watermark the scalar
+/// ladder would hold after applying group A (the 8-group's own advance
+/// law), and the cross-group chain link firsts[8]==firsts[6]+ns[6] is
+/// implied by A's chain + B's anchor (firsts[6]=firsts[0]+ns[0]+ns[2]
+/// +ns[4] under A's relations). A failure of either kernel falls the
+/// whole 16 back through the 8-wide and scalar ladders in order —
+/// nothing is applied unless everything verifies.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn ladder_group16_apply<'a, S: Sink, E: SpanEmit<'a>>(
+    entries: &'a [packet::FrameEntry<'a>],
+    p: usize,
+    ladder8: packet::SoaLadder8,
+    w: &mut u64,
+    pk: &mut [u64; 2],
+    byt: &mut [u64; 2],
+    dup: &mut [u64; 2],
+    dup_msgs: &mut u64,
+    emitted: &mut u64,
+    em: &mut E,
+    sink: &mut S,
+    proof: &LiveFeedProof,
+    wants_spans: bool,
+    sess_lo: u64,
+    sess_hi: u64,
+    firsts: &mut [u64; 16],
+    ns: &mut [u64; 16],
+) -> bool {
+    // Gather BOTH groups' sequence facts in one burst (AoS loads —
+    // L1-hot in the scan; the dual-burst hides group B's load-to-use
+    // latency under group A's vector relations).
+    for k in 0..16 {
+        firsts[k] = entries[p + k].first_seq;
+        ns[k] = entries[p + k].blocks.len() as u64;
+    }
+    // Group A: the ladder's relations against the live watermark.
+    if !ladder8(firsts.as_ptr(), ns.as_ptr(), *w) {
+        return false;
+    }
+    // Group B: the COMPOSED anchor — A's advance (wrap-guarded exact by
+    // A's kernel). Proves firsts[8] == w + Σns[evenA] and B's own
+    // relations; the cross-group chain link is implied (see the doc).
+    let sum_a = ns[0].wrapping_add(ns[2]).wrapping_add(ns[4]).wrapping_add(ns[6]);
+    // The [8..16] half's base pointers (safe split — the 16-element
+    // buffers' upper halves are exactly the 8-element slices the
+    // SoaLadder8 contract wants).
+    let (f_b, n_b) = (firsts.split_at(8).1, ns.split_at(8).1);
+    if !ladder8(f_b.as_ptr(), n_b.as_ptr(), (*w).wrapping_add(sum_a)) {
+        return false;
+    }
+    // Session gate + the first entry's elig: ONE gate for all sixteen
+    // (every published frame carries the baked session; the first entry
+    // matching the scan's LIVE template proves baked == live for the
+    // whole 16 — the 8-group law, unchanged).
+    let e0 = &entries[p];
+    if e0.sess_lo != sess_lo
+        || e0.sess_hi != sess_hi
+        || e0.elig & packet::FRAME_ELIG_OK == 0
+    {
+        return false;
+    }
+    // The 16 elig bytes: steady-ok bits + feed-parity uniformity (the
+    // 8-group's check, twice).
+    let f0 = packet::elig_feed(e0.elig);
+    let f1 = packet::elig_feed(entries[p + 1].elig);
+    for k in 0..16 {
+        let e = &entries[p + k];
+        let want_feed = if k & 1 == 0 { f0 } else { f1 };
+        if e.elig & packet::FRAME_ELIG_OK == 0 || packet::elig_feed(e.elig) != want_feed {
+            return false;
+        }
+    }
+    // GROUPS VERIFIED: [emit, dup] × 8. Counters fold exactly as the
+    // scalar ladder would (batched across both groups); the eight even
+    // entries' emissions are buffered exactly as the scalar path would.
+    let sum_b = ns[8].wrapping_add(ns[10]).wrapping_add(ns[12]).wrapping_add(ns[14]);
+    let sum_e = sum_a.wrapping_add(sum_b);
+    let fi_e = (f0 & 1) as usize;
+    let fi_d = (f1 & 1) as usize;
+    pk[fi_e] += 8;
+    pk[fi_d] += 8;
+    byt[fi_e] += entries[p].bytes.len() as u64
+        + entries[p + 2].bytes.len() as u64
+        + entries[p + 4].bytes.len() as u64
+        + entries[p + 6].bytes.len() as u64
+        + entries[p + 8].bytes.len() as u64
+        + entries[p + 10].bytes.len() as u64
+        + entries[p + 12].bytes.len() as u64
+        + entries[p + 14].bytes.len() as u64;
+    byt[fi_d] += entries[p + 1].bytes.len() as u64
+        + entries[p + 3].bytes.len() as u64
+        + entries[p + 5].bytes.len() as u64
+        + entries[p + 7].bytes.len() as u64
+        + entries[p + 9].bytes.len() as u64
+        + entries[p + 11].bytes.len() as u64
+        + entries[p + 13].bytes.len() as u64
+        + entries[p + 15].bytes.len() as u64;
+    dup[fi_d] += 8;
+    *dup_msgs += ns[1] + ns[3] + ns[5] + ns[7] + ns[9] + ns[11] + ns[13] + ns[15];
+    *emitted += sum_e;
+    if wants_spans {
+        for k in [0usize, 2, 4, 6, 8, 10, 12, 14] {
+            let entry = &entries[p + k];
+            let frame = entry.bytes;
+            let body = &frame[moldudp64::HEADER_LEN + 2..frame.len()];
+            em.push(firsts[k], ns[k] as u16, body, entry.blocks);
+            if em.is_full() {
+                em.flush(sink, proof);
+            }
+        }
+    } else {
+        for k in [0usize, 2, 4, 6, 8, 10, 12, 14] {
+            let entry = &entries[p + k];
+            let frame = entry.bytes;
+            for &(seq, start, end) in entry.blocks {
+                sink.on_msg(proof, seq, &frame[start as usize..end as usize]);
+            }
+        }
+    }
+    // Both kernels' wrap guards proved the advance wrap-free.
+    *w = (*w).wrapping_add(sum_e);
+    true
+}
+
 /// R12c: the 8-entry group fast path, out-of-line (the R8/R9 DSB lesson —
 /// inlined, the group body's code size bloated the scan loop past the
 /// µop-cache and the sustained arm measured the decode tax at −2-3.6%;
@@ -1513,13 +1650,45 @@ fn steady_scan_ladder<'a, S: Sink, E: SpanEmit<'a>>(
     let mut progressed = false;
     let mut cold: Option<usize> = None;
     let proof = LiveFeedProof { gen };
-    // The group gather buffers (stack; L1-hot).
+    // The group gather buffers (stack; L1-hot). The 16-wide pair serves
+    // the R31-B dual-ZMM step; the 8-wide pair serves its fallback.
     let mut firsts = [0u64; 8];
     let mut ns = [0u64; 8];
+    let mut firsts16 = [0u64; 16];
+    let mut ns16 = [0u64; 16];
     while *pos < len {
         // ── vector group fast path (out-of-line: the DSB lesson) ────────
         if let Some(ladder8) = ladder {
             let p = *pos;
+            // R31-B: the 16-frame dual-ZMM step first (two 8-lane
+            // kernels, one call, one session gate — the load burst hides
+            // group B's gather latency under group A's relations). Any
+            // failure falls through to the 8-wide step, then scalar.
+            if p + 16 <= len
+                && ladder_group16_apply(
+                    entries,
+                    p,
+                    ladder8,
+                    w,
+                    &mut pk,
+                    &mut byt,
+                    &mut dup,
+                    &mut dup_msgs,
+                    &mut emitted,
+                    em,
+                    sink,
+                    &proof,
+                    wants_spans,
+                    sess_lo,
+                    sess_hi,
+                    &mut firsts16,
+                    &mut ns16,
+                )
+            {
+                progressed = true;
+                *pos = p + 16;
+                continue;
+            }
             if p + 8 <= len
                 && ladder_group_apply(
                     entries,
