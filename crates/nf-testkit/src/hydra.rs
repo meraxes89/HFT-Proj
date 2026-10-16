@@ -7127,4 +7127,278 @@ mod tests {
             } // comp
         } // diet
     }
+
+    // ─── R32: the pass-replay ledger pins (Run 625) ───────────────────
+
+    /// The R32 sustained shape's session program (the 4-session rotation,
+    /// the elided auto-advance). Construction = sessions[0].
+    fn r32_prog(pass: u64) -> [u8; 10] {
+        const S: [[u8; 10]; 4] = [
+            *b"R32REPLA01",
+            *b"R32REPLA02",
+            *b"R32REPLA03",
+            *b"R32REPLA04",
+        ];
+        if pass == 0 {
+            S[0]
+        } else {
+            S[((pass - 1) % 4) as usize]
+        }
+    }
+
+    /// Drive the R32 sustained shape (elided auto-advance + the hydra
+    /// sink + the pass-replay ledger) for `passes` measured passes and
+    /// return `(harvested tuples in order, the final sequencer state
+    /// (watermark, counters, progress_vt), the ledger stats)`. The
+    /// ledger is FORCED on/off by the caller (the env is process-global
+    /// and racy across parallel test transports).
+    fn r32_drive(
+        gt: &[u8],
+        sched: &nf_transport::sched_types::ReplaySchedule,
+        replay_on: bool,
+        passes: u64,
+    ) -> (
+        Vec<(u64, u64, u64)>,
+        (u64, nf_arbitrator::Counters, u64),
+        (u64, u64, u64, u64),
+    ) {
+        let construction = r32_prog(0);
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true, true);
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            gt,
+            sched.clone(),
+            construction,
+            128,
+            None,
+            Some(r32_prog),
+            false,
+            true,
+            16,
+            true,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        let ladder = crate::soa::ladder8_best();
+        let mut replay = crate::passreplay::PassReplay::new_forced(replay_on);
+        let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+        let mut got = Vec::new();
+        // The ref pass (pass 1) runs live with a separate sink — the
+        // sustained bench's shape (also the generation boundary).
+        t.reset_pass(1, r32_prog(1));
+        {
+            let mut rseq = Sequencer::new_unboxed();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            while t.next_batch() {
+                rseq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+        }
+        let mut final_state = (0u64, nf_arbitrator::Counters::default(), 0u64);
+        for pass in 2..=passes + 1 {
+            t.reset_pass(pass, r32_prog(pass));
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            replay.begin_pass();
+            while t.next_batch() {
+                if !replay.try_replay(&t, &mut seq, &mut sink) {
+                    replay.begin_record(&t, &seq);
+                    {
+                        let mut rec_sink = replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(
+                            t.entries(),
+                            t.now_ns(),
+                            &mut rec_sink,
+                            ladder,
+                        );
+                    }
+                    replay.seal_batch(&seq);
+                }
+                sink.drain_ready();
+            }
+            replay.note_pass_end();
+            final_state = (seq.watermark(), seq.counters(), seq.progress_vt());
+            sink.end_pass();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+        }
+        sink.finish();
+        let n = sink.harvest_completed(&mut harvested);
+        for rec in &harvested[..n] {
+            got.push(*rec);
+        }
+        (got, final_state, replay.stats())
+    }
+
+    /// R32: the pass-replay ledger's BIT-EXACTNESS law — the elided
+    /// frozen-master regime replays the recorded pass surface (every
+    /// sink call, the counters, the watermark, the progress clock) and
+    /// the harvested tuples + the final sequencer state are IDENTICAL to
+    /// the un-replayed live scan. The engagement law: exactly ONE
+    /// live-recorded pass (the first measured pass) — every later pass
+    /// replays (replay_passes = passes - 1, re_records = 0).
+    #[test]
+    fn t_r32_pass_replay_parity_vs_live() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        // Per-session sequential references (the 4-session rotation).
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        const PASSES: u64 = 12;
+        let (got_live, state_live, stats_live) = r32_drive(&gt, &sched, false, PASSES);
+        let (got_rp, state_rp, stats_rp) = r32_drive(&gt, &sched, true, PASSES);
+        // The tuple law: both arms produce the identical in-order pass
+        // sequence, each equal to its session's sequential reference.
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(got_live, expect, "R32 live arm diverged");
+        assert_eq!(got_rp, expect, "R32 replay arm diverged — the verdict replay must stay bit-exact");
+        // The sequencer-state law: the replay lands the sequencer in the
+        // exact recorded post-batch state (watermark, counters, clock).
+        assert_eq!(
+            state_live, state_rp,
+            "R32 sequencer state diverged — the recorded counters/watermark/clock law"
+        );
+        // The engagement law: one live-recorded pass, the rest replayed.
+        assert_eq!(stats_live, (0, 0, 0, 0), "R32 disabled arm must be a no-op");
+        let (rp_batches, rp_live, rp_passes, rp_rerecords) = stats_rp;
+        assert!(rp_live > 0, "R32 never live-recorded a template");
+        assert!(
+            rp_batches > rp_live * 4,
+            "R32 replay never dominated (batches {rp_batches}, live {rp_live})"
+        );
+        assert_eq!(
+            rp_passes,
+            PASSES - 1,
+            "R32 engagement: exactly the first measured pass runs live (passes {rp_passes})"
+        );
+        assert_eq!(rp_rerecords, 0, "R32 re-records in the steady regime (rerecords {rp_rerecords})");
+    }
+
+    /// R32: the MASTER WRITE BARRIER's reaction — a foreign version bump
+    /// (any master write's signature) must truncate the template and
+    /// force the next pass back to the LIVE scan (re-record under the new
+    /// version), after which the replay re-engages; the tuples stay
+    /// bit-exact throughout (the barrier is the anti-stale-replay proof,
+    /// the re-record is the recovery).
+    #[test]
+    fn t_r32_pass_replay_barrier_injection() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        const PASSES: u64 = 10;
+        const BUMP_AFTER: u64 = 5; // passes 2..=6 normal, bump, 7..=11 after
+        let construction = r32_prog(0);
+        let fabric = HydraFabric::spawn_pinned_full(2, &[], true, true, true, true, true);
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            &gt,
+            sched.clone(),
+            construction,
+            128,
+            None,
+            Some(r32_prog),
+            false,
+            true,
+            16,
+            true,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        let ladder = crate::soa::ladder8_best();
+        let mut replay = crate::passreplay::PassReplay::new_forced(true);
+        let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+        let mut got = Vec::new();
+        // The ref pass (live, separate sink).
+        t.reset_pass(1, r32_prog(1));
+        {
+            let mut rseq = Sequencer::new_unboxed();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            while t.next_batch() {
+                rseq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+        }
+        for pass in 2..=PASSES + 1 {
+            // The foreign-master-write injection: bump AFTER a clean pass
+            // boundary (the consumer is parked in reset_pass's wait — the
+            // same visibility point a real RX-side bake would have).
+            if pass == BUMP_AFTER + 2 {
+                t.r32_debug_bump_master_version();
+            }
+            t.reset_pass(pass, r32_prog(pass));
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            replay.begin_pass();
+            while t.next_batch() {
+                if !replay.try_replay(&t, &mut seq, &mut sink) {
+                    replay.begin_record(&t, &seq);
+                    {
+                        let mut rec_sink = replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(
+                            t.entries(),
+                            t.now_ns(),
+                            &mut rec_sink,
+                            ladder,
+                        );
+                    }
+                    replay.seal_batch(&seq);
+                }
+                sink.drain_ready();
+            }
+            replay.note_pass_end();
+            sink.end_pass();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+        }
+        sink.finish();
+        let n = sink.harvest_completed(&mut harvested);
+        for rec in &harvested[..n] {
+            got.push(*rec);
+        }
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(got, expect, "R32 barrier arm diverged — a version bump must re-record, never replay stale");
+        let (rp_batches, rp_live, rp_passes, rp_rerecords) = replay.stats();
+        assert_eq!(
+            rp_rerecords, 1,
+            "the injected bump must fire exactly one re-record (rerecords {rp_rerecords})"
+        );
+        // Two live passes total (the first record + the post-bump
+        // re-record); the rest replayed.
+        assert_eq!(
+            rp_passes,
+            PASSES - 2,
+            "engagement after the barrier recovery (passes {rp_passes}, batches {rp_batches}, live {rp_live})"
+        );
+    }
 }

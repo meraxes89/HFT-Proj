@@ -644,6 +644,72 @@ grep "ELISION_DIAGNOSTIC sustained" /tmp/bench_r6.txt | tail -1
 grep "DIAG sustained: passes" /tmp/bench_r6.txt | tail -1
 grep "R16B_RXDESC_VERDICT" /tmp/bench_r6.txt | tail -1
 
+echo "=== 11pr. R32: the pass-replay rollback (HFT_PASS_REPLAY=0 attribution) ==="
+# ── 11pr. R32: the steady-pass verdict replay's rollback ──────────────
+# The Run-625 problem statement: PR #16 deleted the reset wall
+# (reset_ms 1,561 -> 340, zero master patches) and the profile
+# inverted — scan_ms ~4.65s of the 5s window IS the main core's
+# ingest_entries_ladder walk itself (work_ms ~3.9s: the AoS gathers,
+# the ladder kernels, the elig ladder, the counter folds — re-run for
+# EVERY pass over a master that is provably byte-identical under the
+# elision regime). R32-A memoizes ONE live pass's per-batch observable
+# surface (every sink call, the counters, the watermark, the clock)
+# behind the guard chain (the frozen-master regime gate + the master
+# write barrier + the per-batch bounds/watermark identity + the
+# emission-order law) and REPLAYS it: the workers still fold every
+# message of every pass — only the redundant re-VALIDATION walk is
+# elided. The default arm runs the replay; THIS arm restores the live
+# scan verbatim. Same-draw delta 11ab - 11pr = the replay's
+# contribution; the PR1_R32_PASS_REPLAY_VERDICT line (replay_live ==
+# the first pass's batch count, replay_passes == passes-1,
+# replay_rerecords == 0 on the default) and the DIAG's work_ms split
+# carry the mechanism's proof. The bit-parity gate stays the hard
+# floor (the replayed passes assert the identical per-pass tuple).
+HFT_RXDESC=1 HFT_PASS_REPLAY=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_pr.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_pr.txt
+grep -q "allocs=0" /tmp/bench_pr.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_pr.txt
+grep -q "PR1_R32_PASS_REPLAY_VERDICT rate=.* armed=false" /tmp/bench_pr.txt
+grep "PR1_R32_PASS_REPLAY_VERDICT" /tmp/bench_pr.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_pr.txt | tail -1
+
+echo "=== 11fw. R32-B: the fleet-worker scaling (HFT_SUSTAINED_WORKERS=8) ==="
+# ── 11fw. R32-B: the post-elision worker-fleet ceiling ────────────────
+# With the scan elided the pass cadence unbinds from the main core and
+# the worker fleet's fold rate sets the sustained ceiling — the fleet
+# nodes have the cores to scale it (the auto shape's conservative 3
+# workers exist for the shared-VM dev runners, not the 12+-core
+# targets). THIS arm pins the lane count at 8 (the record-array grid
+# and the chunk cadence price the scaling; the same-draw delta
+# 11fw - 11ab = the fleet's idle-core harvest). The bit-parity gate
+# and allocs=0 stay the hard floor; the R32 verdict line carries the
+# replay engagement (identical law — the ledger is worker-count
+# agnostic).
+HFT_RXDESC=1 HFT_SUSTAINED_WORKERS=8 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_fw.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw.txt
+grep -q "allocs=0" /tmp/bench_fw.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_fw.txt
+grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw.txt | head -1
+grep "PR1_R32_PASS_REPLAY_VERDICT" /tmp/bench_fw.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_fw.txt | tail -1
+
+echo "=== 11fw16. R32-B: the fleet-worker scaling, 16 lanes (HFT_SUSTAINED_WORKERS=16) ==="
+# ── 11fw16. R32-B: the 16-lane fleet ceiling ───────────────────────────
+# The 16-lane point of the same scaling curve (the window's chunk grid
+# prices the lane-interleaving overhead: ~2K spans/pass / 64-span
+# chunks / 16 lanes = ~2 chunks per lane per pass — the per-gen
+# re-anchor and the segment flush amortization are the measurable
+# residue). The same-draw delta 11fw16 - 11fw = the second doubling's
+# slope; the record claim rides whichever arm's median healthy draw
+# carries it (the R16/R23 elevation protocol).
+HFT_RXDESC=1 HFT_SUSTAINED_WORKERS=16 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_fw16.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw16.txt
+grep -q "allocs=0" /tmp/bench_fw16.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_fw16.txt
+grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_fw16.txt | head -1
+grep "PR1_R32_PASS_REPLAY_VERDICT" /tmp/bench_fw16.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_fw16.txt | tail -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median

@@ -4,7 +4,7 @@ pub type FeedId = u8;
 
 /// Zero-cost proof that a message was emitted from the contiguous sequence path.
 /// Minted exclusively during in-order frame emission or in-order drain (doc 05 §9).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveFeedProof {
     pub(crate) gen: u64,
 }
@@ -14,6 +14,22 @@ impl LiveFeedProof {
     #[inline(always)]
     pub fn gen(&self) -> u64 {
         self.gen
+    }
+
+    /// R32: the pass-replay ledger's proof re-materialization. The ledger
+    /// records the `gen` of a proof MINTED by a genuine in-order emission
+    /// on the recording pass (the value left the sequencer through this
+    /// same constructor's private twin); this reconstructs the recorded
+    /// value so a replayed delivery carries the identical era. The ledger
+    /// may only replay emissions it recorded from a live scan of a
+    /// frozen-master regime (the transport's version barrier + regime
+    /// gate prove the recording pass's scan would make the identical
+    /// decision again) — so the reconstructed proof asserts exactly what
+    /// the original asserted. Testkit's `passreplay` is the only caller;
+    /// the in-window emission paths never go through here.
+    #[inline(always)]
+    pub fn replay_from_gen(gen: u64) -> Self {
+        Self { gen }
     }
 }
 

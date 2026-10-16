@@ -1060,6 +1060,36 @@ impl Sequencer {
         self.counters
     }
 
+    /// R32: the last progressed batch's virtual clock (0 = never
+    /// progressed). The live scan drivers set `progress_vt = now_ns` at
+    /// every batch whose run advanced the watermark; the pass-replay
+    /// ledger reads it to record the pass's exact final value and
+    /// re-applies it on replay (the sequencer is per-pass state — this
+    /// is the only field the scan's progress law touches).
+    #[inline]
+    pub fn progress_vt(&self) -> u64 {
+        self.progress_vt
+    }
+
+    /// R32: the pass-replay ledger's state application — set the
+    /// watermark, the telemetry counters and the progress clock to the
+    /// RECORDED post-batch values. The ledger only calls this with
+    /// values it snapshotted off a live scan of the identical
+    /// frozen-master batch (the guards prove the live scan would produce
+    /// exactly these values again), so the sequencer lands in the state
+    /// the live scan would have left it in — the parity suites pin the
+    /// counters/watermark/clock byte-for-byte against the un-replayed
+    /// run. `progress_vt` is the batch's recorded post-scan value (the
+    /// live drivers' repeated `progress_vt = now_ns` assignment's
+    /// surviving value; replaying each batch's recorded value in order
+    /// reproduces the pass's final clock exactly).
+    #[inline]
+    pub fn replay_apply(&mut self, w: u64, counters: &Counters, progress_vt: u64) {
+        self.w = w;
+        self.counters = *counters;
+        self.progress_vt = progress_vt;
+    }
+
     #[inline]
     pub fn lens(&self) -> &[u8; WINDOW_SLOTS] {
         &self.lens
