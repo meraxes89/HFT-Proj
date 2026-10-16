@@ -1135,6 +1135,100 @@ impl RxdescState {
         }
     }
 
+    /// R31-B: the 16-wide FUSED check — `check_arr8_packed`'s dual-ZMM
+    /// twin: TWO 512-bit array loads, TWO fused transform+compare
+    /// chains, ONE u16 mismatch mask (the two __mmask8 halves OR'd).
+    /// Halves the per-group call/bounds overhead on the non-SS commit
+    /// path (the rotating windows, the straddle continuations, the
+    /// inline hole-free commits) and overlaps the two load-to-use
+    /// latencies. Bit-identical to sixteen scalar
+    /// `desc8_pack_span(off, len) | flag` compares (the 8-wide law,
+    /// twice).
+    ///
+    /// Callers prove `idx + 16 <= cap` (asserted) and the group stays
+    /// inside one chunk.
+    pub fn check_arr16_packed(
+        &self,
+        slot: u8,
+        idx: usize,
+        words: &[u64; 16],
+        delta: u64,
+        flag: u64,
+    ) -> u16 {
+        debug_assert!(delta <= u32::MAX as u64, "R31-B delta overflows u32");
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 128 bytes readable at
+                // `words` (a &[u64;16]) and at the array row
+                // (idx+16<=cap asserted below); the array row access
+                // follows check_arr8's slot-ownership protocol.
+                unsafe {
+                    assert!(
+                        idx + 16 <= self.cap,
+                        "rxdesc: array slot {slot} index {idx}+16 exceeds cap {}",
+                        self.cap
+                    );
+                    let arrays = &*self.arrays.get();
+                    let row = arrays[slot as usize].as_ptr().add(idx);
+                    let a_lo = _mm512_loadu_si512(row as *const _);
+                    let a_hi = _mm512_loadu_si512(row.add(8) as *const _);
+                    let w_lo = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let w_hi = _mm512_loadu_si512(words.as_ptr().add(8) as *const _);
+                    let low48 = _mm512_set1_epi64(0x0000_FFFF_FFFF_FFFF_u64 as i64);
+                    let d = _mm512_set1_epi64(delta as i64);
+                    let f = _mm512_set1_epi64(flag as i64);
+                    let expect_lo = _mm512_or_si512(
+                        _mm512_add_epi64(_mm512_and_si512(w_lo, low48), d),
+                        f,
+                    );
+                    let expect_hi = _mm512_or_si512(
+                        _mm512_add_epi64(_mm512_and_si512(w_hi, low48), d),
+                        f,
+                    );
+                    let eq_lo = _mm512_cmpeq_epi64_mask(a_lo, expect_lo);
+                    let eq_hi = _mm512_cmpeq_epi64_mask(a_hi, expect_hi);
+                    // Invert each half (masked to its own 8 lanes — the
+                    // complement of a zero-extended u8 would set the
+                    // other half's bits) and combine into one u16 mask.
+                    (!(eq_lo as u16) & 0xFF) | (((!(eq_hi as u16)) & 0xFF) << 8)
+                }
+            } else {
+                self.check16_packed_scalar(slot, idx, words, delta, flag)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.check16_packed_scalar(slot, idx, words, delta, flag)
+        }
+    }
+
+    /// R31-B: the scalar twin (also the AVX-512F-absent fallback) —
+    /// sixteen transformed compares against the array row.
+    fn check16_packed_scalar(
+        &self,
+        slot: u8,
+        idx: usize,
+        words: &[u64; 16],
+        delta: u64,
+        flag: u64,
+    ) -> u16 {
+        assert!(
+            idx + 16 <= self.cap,
+            "rxdesc: array slot {slot} index {idx}+16 exceeds cap {}",
+            self.cap
+        );
+        let mut bad = 0u16;
+        for (g, &w) in words.iter().enumerate() {
+            let expect = ((w & RX_PACKED_LOW48) + delta) | flag;
+            if self.get_arr(slot, idx + g) != expect {
+                bad |= 1 << g;
+            }
+        }
+        bad
+    }
+
     /// Mark a chunk inline-claimed (sink, BEFORE the exposing
     /// `spans_ready` store). The slot stores `chunk_id + 1` — the value
     /// IS the claim's identity, so a stale mark can never alias.

@@ -157,6 +157,23 @@ fn ladder8_avx512_safe(firsts: *const u64, ns: *const u64, w: u64) -> bool {
     unsafe { ladder8_avx512(firsts, ns, w) }
 }
 
+/// The pointer-form scalar reference — installable into
+/// [`SoaLadder8`](nf_protocol::packet::SoaLadder8) so scan-level parity
+/// cells can exercise the group fast paths (`ladder_group_apply`,
+/// `ladder_group16_apply` — the R31-B dual-ZMM step) DETERMINISTICALLY
+/// on every host, without the silicon gate or the `HFT_VEC_LADDER` env.
+/// Bit-identical to [`ladder8_scalar`] (the same relations, the same
+/// booleans — the group drivers' contract holds for any kernel that
+/// implements them).
+pub fn ladder8_scalar_ptr(firsts: *const u64, ns: *const u64, w: u64) -> bool {
+    // SAFETY: the SoaLadder8 contract — both pointers hold at least 8
+    // readable u64 elements (enforced by the only callers: the group
+    // drivers gather full 8/16-entry groups below the batch length).
+    let f = unsafe { std::slice::from_raw_parts(firsts, 8) };
+    let n = unsafe { std::slice::from_raw_parts(ns, 8) };
+    ladder8_scalar(f, n, w)
+}
+
 /// The best available ladder for THIS silicon, or None (scalar ladder).
 ///
 /// R12 VERDICT — default OFF (the refutation, per the R9c→R9d law): the

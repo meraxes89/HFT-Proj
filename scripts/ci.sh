@@ -582,6 +582,68 @@ grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_vl.txt | head -1
 grep "LADDER_DIAGNOSTIC" /tmp/bench_vl.txt | tail -1
 grep "R16B_RXDESC_VERDICT" /tmp/bench_vl.txt | tail -1
 
+echo "=== 11se. R31-A: the session-elision rollback (HFT_SESSION_ELISION=0 attribution) ==="
+# ── 11se. R31-A: the 22K-site session bake restored (attribution) ──────
+# The Run-600 problem statement: PR #15's workers burned 43,129 passes
+# in 5s and the wall MOVED to the pass boundary — reset_ms 1,561 ms
+# (32% of the wall), and the HFT_PREPATCH_BUDGET=1024 experiment proved
+# the hardware attribution: draining the bake into the pass dropped
+# reset_ms to 350 but DEGRADED scan_ms 3,433 -> 4,645 (the ~22,000
+# session-site rewrites per pass are RFO invalidations of the frame
+# header lines the workers' L1/L2 want hot). R31-A deletes the writes:
+# the blob AND the rxbuild master stay construction-frozen (the session
+# contract survives at the auto_session cell; the pass tuple is
+# session-value independent — the bench's own ref-pass law). The
+# default arm (11b) runs the elision; THIS arm restores the full patch
+# law. Same-draw delta 11b - 11se = the elision's contribution; the
+# ELISION_DIAGNOSTIC armed flag, RXBUILD patches, and the
+# ADVANCE_DIAGNOSTIC us_per_advance lines carry the mechanism's proof.
+HFT_SESSION_ELISION=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_se.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_se.txt
+grep -q "allocs=0" /tmp/bench_se.txt
+grep "ELISION_DIAGNOSTIC sustained" /tmp/bench_se.txt | tail -1
+grep "RXBUILD_DIAGNOSTIC sustained" /tmp/bench_se.txt | tail -1
+grep "ADVANCE_DIAGNOSTIC sustained" /tmp/bench_se.txt | tail -1
+
+echo "=== 11we. R31-A: the warm-epoch copy-gate rollback (HFT_WARM_EPOCH=0 attribution) ==="
+# ── 11we. R31-A: the redundant window copies restored (attribution) ───
+# The second R31-A operation: once all RX_NARR window slots have
+# warm-filled and verified fix-free at the stable count, every rotating
+# open re-staged the same ~252KB descriptor+tag pair (~10.8 GB of
+# redundant memcpy over the 5s window on the 43K-pass draw). The
+# warm-epoch gate skips the pair when the slot's OWN last window proved
+# the content exact (the check-and-fix stays the per-span backstop —
+# wrong skips cost fix stores, never correctness). Same-draw delta
+# 11b - 11we = the copy gate's contribution; the warm_skips= field in
+# the DIAG sustained line carries the engagement proof (0 here, >0 on
+# the rotating shapes and the fleet's straddle recovery windows).
+HFT_WARM_EPOCH=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_we.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_we.txt
+grep -q "allocs=0" /tmp/bench_we.txt
+grep "DIAG sustained: passes" /tmp/bench_we.txt | tail -1
+
+echo "=== 11r6. Run 600: the R31 stack (elision + warm epoch + the 16-frame dual-ZMM ladder) ==="
+# ── 11r6. Run 600: the full R31 attribution stack ──────────────────────
+# The record arm's post-R31 ceiling: the session elision (default on
+# since R31-A) + the warm-epoch copy gate + the R31-B scan unroll —
+# the 16-frame group step (two 8-lane ladder kernels, one call, one
+# session gate, dual-ZMM gather burst) + check_arr16_packed (the
+# 16-wide fused array check). The R12 verdict priced the 8-entry group
+# at -2..-3.6% on the PRE-R29 consumer; the R29 SS skip deleted the
+# commit path and R31-A removed the RFO invalidations, so the armed
+# ladder is priceable again on the clean cache state. Same-draw delta
+# 11vl - 11r6 isolates the 16-wide step vs the 8-wide (both run the
+# VEC_LADDER=1 stack; 11r6 adds nothing the default doesn't carry —
+# it exists to keep the 11vl comparison line alive post-Run-600).
+HFT_RXDESC=1 HFT_VEC_LADDER=1 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_r6.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r6.txt
+grep -q "allocs=0" /tmp/bench_r6.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_r6.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_r6.txt | head -1
+grep "ELISION_DIAGNOSTIC sustained" /tmp/bench_r6.txt | tail -1
+grep "DIAG sustained: passes" /tmp/bench_r6.txt | tail -1
+grep "R16B_RXDESC_VERDICT" /tmp/bench_r6.txt | tail -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
