@@ -426,6 +426,17 @@ struct Mailbox {
     /// unset = no ledger (the sink's body-scan fallback serves).
     #[allow(clippy::disallowed_types)] // Tier-F: construction-time set-once only
     rxdesc: OnceLock<Arc<RxdescState>>,
+    /// R32: the MASTER WRITE BARRIER — bumped (Release) by the RX thread
+    /// at every point that writes the construction-built master entries
+    /// (`master_patch_range`'s three call sites: the blocking-reset full
+    /// bake, the advance's incremental patch, the advance's tail patch).
+    /// Under the session elision all three sites are unreachable, so the
+    /// counter is construction-stable — the pass-replay ledger records it
+    /// once and re-verifies it every pass (any bump = a new master
+    /// regime = the ledger re-records, never replays stale verdicts).
+    /// Ordered: every bump precedes the publishing `filled[]` Release of
+    /// the next batch, so the consumer's filled-Acquire observes it.
+    master_version: AtomicU64,
 }
 
 // SAFETY: the mailbox is the SPSC handoff described in the module doc —
@@ -690,6 +701,9 @@ fn rxbuild_bake_full(
         compute_elig,
         usize::MAX,
     );
+    // R32: the write barrier — the consumer's pass-replay ledger treats
+    // any bump as a new master regime (re-record, never stale replay).
+    mb.master_version.fetch_add(1, Ordering::Release);
     rxs.patches += patched;
     rxs.mpp_idx = 0;
     rxs.idx = 0;
@@ -1052,6 +1066,8 @@ fn rx_thread(
                     compute_elig,
                     budget,
                 );
+                // R32: the write barrier (the incremental patch's twin).
+                mb.master_version.fetch_add(1, Ordering::Release);
                 rxs.mpp_idx = ni;
                 rxs.patches += np;
             }
@@ -1588,6 +1604,8 @@ fn rx_thread(
                             compute_elig,
                             usize::MAX,
                         );
+                        // R32: the write barrier (the advance tail's twin).
+                        mb.master_version.fetch_add(1, Ordering::Release);
                         rxs.patches += np;
                     }
                     rxs.mpp_idx = 0;
@@ -1902,6 +1920,7 @@ impl PipelinedReplayTransport {
             session_elision: elision_armed,
             rx_actual_cpu: AtomicI64::new(-1),
             rxdesc: OnceLock::new(),
+            master_version: AtomicU64::new(0),
         });
         let rx = std::thread::Builder::new()
             .stack_size(512 * 1024)
@@ -2276,6 +2295,57 @@ impl PipelinedReplayTransport {
             self.mb.rx_stats.warm_uncovered.load(Ordering::Relaxed),
             self.mb.rx_stats.warm_last_pass_fixes.load(Ordering::Relaxed),
         )
+    }
+
+    /// R32: the PASS-REPLAY REGIME gate — true iff the entries are
+    /// publish-by-reference from the construction-built master AND the
+    /// session elision holds it construction-frozen (zero master/blob
+    /// writes exist anywhere in the run). The consumer-side verdict
+    /// replay may arm only under this regime; any other shape runs the
+    /// live scan verbatim.
+    #[inline]
+    pub fn pass_replay_regime(&self) -> bool {
+        self.mb.rxbuild_enabled && self.mb.session_elision
+    }
+
+    /// R32: the current batch's master bounds — `(rx_start, len)` in
+    /// rxbuild mode (the published slice of the construction master),
+    /// `(0, len)` otherwise. The pass-replay ledger's per-batch identity
+    /// guard: the deterministic schedule publishes the same bounds
+    /// sequence every pass, so a recorded `(rx_start, len, w_in)` triple
+    /// proves the batch is the exact recorded one.
+    #[inline]
+    pub fn batch_bounds(&self) -> (u32, u32) {
+        let t = self.cur.expect("r32 pipeline: no current batch");
+        // SAFETY: consumer-owned view for this turn; the fields were
+        // published by the RX's Release store (ordered by the filled[]
+        // Acquire in next_batch).
+        unsafe {
+            let buf = &*self.mb.bufs[(t & self.mb.nbuf_mask) as usize].get();
+            (buf.rx_start, buf.len)
+        }
+    }
+
+    /// R32: the master write barrier's current value (the Release-bumped
+    /// counter every master write site advances — see the field's doc on
+    /// the Mailbox). The ledger re-verifies this every pass — under the
+    /// elision it is construction-stable.
+    #[inline]
+    pub fn master_version(&self) -> u64 {
+        self.mb.master_version.load(Ordering::Acquire)
+    }
+
+    /// R32 (TEST/DIAGNOSTIC ONLY — never call in a measured window):
+    /// advance the master write barrier WITHOUT writing anything, exactly
+    /// as any real master write would. The pass-replay ledger's parity
+    /// suite uses this to inject a "foreign master write" mid-run and
+    /// pin the barrier's reaction (truncate the template, fall to the
+    /// live scan, re-record under the new version — never a stale
+    /// replay). Harmless by construction: a spurious bump only makes the
+    /// ledger more conservative.
+    #[doc(hidden)]
+    pub fn r32_debug_bump_master_version(&self) {
+        self.mb.master_version.fetch_add(1, Ordering::Release);
     }
 
     /// F-2 (HFT_RXBUILD) telemetry: (cumulative master patches, patches

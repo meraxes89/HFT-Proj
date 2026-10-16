@@ -558,6 +558,13 @@ fn run_hydra_sustained_5s(
     // every measurement window; HFT_VEC_LADDER=0 is the rollback).
     let ladder = nf_testkit::soa::ladder8_best();
 
+    // R32: the steady-pass VERDICT REPLAY ledger (the main-core scan
+    // elision). Constructed BEFORE the measured window (its one-time
+    // buffer allocations sit outside the allocs=0 gate); arms itself
+    // only under the frozen-master regime (rxbuild + session elision).
+    // HFT_PASS_REPLAY=0 is the rollback (the live scan verbatim).
+    let mut pass_replay = nf_testkit::passreplay::PassReplay::new();
+
     // Untimed reference pass pins the per-pass tuple (identical bytes every
     // pass; only the session id changes, which cannot affect the tuple).
     // Auto-advance pass accounting: construction = 0, this ref pass = 1,
@@ -626,6 +633,7 @@ fn run_hydra_sustained_5s(
         transport.reset_pass(pass, sess);
         *seq = Sequencer::new_unboxed();
         sink.begin_pass();
+        pass_replay.begin_pass();
         let t_r2 = std::time::Instant::now();
 
         // Fold drain every batch: keeps the result rings shallow and the
@@ -638,13 +646,32 @@ fn run_hydra_sustained_5s(
             }
             d_wait_ns += std::time::Instant::now().duration_since(t_w).as_nanos() as u64;
             let t_b = std::time::Instant::now();
-            seq.ingest_entries_ladder(transport.entries(), transport.now_ns(), &mut sink, ladder);
+            // R32: try the verdict replay first — a TRUE return means the
+            // frozen-master regime proved this batch is byte-identical to
+            // the recorded one and the recorded sink surface was re-issued
+            // (the workers still fold every message; only the redundant
+            // re-VALIDATION walk is elided). FALSE = record/live-scan the
+            // batch through the tee.
+            if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
+                pass_replay.begin_record(&transport, &seq);
+                {
+                    let mut rec_sink = pass_replay.recorder(&mut sink);
+                    seq.ingest_entries_ladder(
+                        transport.entries(),
+                        transport.now_ns(),
+                        &mut rec_sink,
+                        ladder,
+                    );
+                }
+                pass_replay.seal_batch(&seq);
+            }
             let t_i = std::time::Instant::now();
             sink.drain_ready();
             d_work_ns += t_i.duration_since(t_b).as_nanos() as u64;
             d_fold_ns += std::time::Instant::now().duration_since(t_i).as_nanos() as u64;
             d_batches += 1;
         }
+        pass_replay.note_pass_end();
         let t_s = std::time::Instant::now();
         sink.end_pass(); // non-blocking: the tail folds during the next pass
         let n = sink.harvest_completed(&mut harvested);
@@ -682,8 +709,9 @@ fn run_hydra_sustained_5s(
     };
 
     if diag {
+        let (rp_batches, rp_live, rp_passes, rp_rerecords) = pass_replay.stats();
         eprintln!(
-            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
+            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
             d_passes,
             d_reset_ns as f64 / 1e6,
             d_scan_ns as f64 / 1e6,
@@ -696,6 +724,10 @@ fn run_hydra_sustained_5s(
             sink.assist_chunks(),
             sink.warm_skips(),
             sink.selfserve_wins(),
+            rp_batches,
+            rp_live,
+            rp_passes,
+            rp_rerecords,
             body_bytes_per_msg,
             sustained_rate as f64 * body_bytes_per_msg / 1e9
         );
@@ -757,6 +789,22 @@ fn run_hydra_sustained_5s(
         nf_protocol::gates::PR1_R29_SELF_SERVE_MIN_MSG_PER_SEC,
         nf_protocol::gates::evaluate_pr1_r29_self_serve(sustained_rate).as_str()
     );
+    // R32: the steady-pass verdict replay's verdict line — the scan
+    // elision's pricing row (the engagement law: replay_live == the
+    // first recorded pass's batch count, replay_rerecords == 0 in the
+    // steady regime; the bit-parity gate stays the hard floor).
+    {
+        let (rp_batches, rp_live, rp_passes, rp_rerecords) = pass_replay.stats();
+        println!(
+            "PR1_R32_PASS_REPLAY_VERDICT rate={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} armed={} (R32: the steady-pass verdict replay — the frozen-master scan elision, docs/43; live=first-record only in the steady regime, the workers still fold every message of every pass)",
+            sustained_rate,
+            rp_batches,
+            rp_live,
+            rp_passes,
+            rp_rerecords,
+            pass_replay.enabled()
+        );
+    }
     // R23c: the sustained arm's affine verdict — the zero-payload-reads
     // claim's measured counters + the R23 gate (2.5B REPORTED, the
     // directive's 2.5–3.0B+ milestone band; non-asserting until the
