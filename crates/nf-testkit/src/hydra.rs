@@ -7175,6 +7175,8 @@ mod tests {
             true,
             16,
             true,
+            true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
+                  // identity guard is the replay's oracle (the champion shape).
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -7324,6 +7326,8 @@ mod tests {
             true,
             16,
             true,
+            true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
+                  // identity guard is the replay's oracle (the champion shape).
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");

@@ -805,6 +805,38 @@ fn run_hydra_sustained_5s(
             pass_replay.enabled()
         );
     }
+    // R33: the producer-side elision's verdict line — the publication-
+    // schedule replay + the parked-flag wake-skip's pricing row. The
+    // engagement law: sched_replays ~= publications - the recording
+    // pass's live count, sched_passes ~= the consumed pass count, and
+    // prod_ns/publications collapses from the R32's ~3.28µs/window
+    // (the 1024-frame walk) toward ~100ns (the frozen-table walk) —
+    // wait_ms was 86.5% of the R32 wall; this row prices its collapse
+    // (docs/44). The topology line (R33-D) rides the same block: the
+    // fabric's L3-domain verdict (the ring + span grid locality law).
+    {
+        let (replays, passes, wakes_saved) = transport.rx_sched_stats();
+        let (pubs, prod_ns, polls) = transport.rx_prod_stats();
+        let per_pub_ns = if pubs > 0 {
+            prod_ns as f64 / pubs as f64
+        } else {
+            0.0
+        };
+        println!(
+            "PR1_R33_RX_SCHED_VERDICT rate={} sched_replays={} sched_passes={} wakes_saved={} wait_ms={:.1} prod_ms={:.1} per_pub_ns={:.0} polls={} (R33: the publication-schedule replay — the producer starvation wall's collapse, docs/44; the R32 baseline: wait_ms=4325.8 prod_ms=4284.3 per_pub_ns=3283 at 6.0B)",
+            sustained_rate,
+            replays,
+            passes,
+            wakes_saved,
+            d_wait_ns as f64 / 1e6,
+            prod_ns as f64 / 1e6,
+            per_pub_ns,
+            polls
+        );
+    }
+    // R33-D: the fabric topology report — one L3 domain across main/RX/
+    // workers (the sysfs truth, never the placement's intentions).
+    nf_testkit::affinity::report_fabric_topology(main_cpu, rx_cpu, &worker_cpus);
     // R23c: the sustained arm's affine verdict — the zero-payload-reads
     // claim's measured counters + the R23 gate (2.5B REPORTED, the
     // directive's 2.5–3.0B+ milestone band; non-asserting until the
