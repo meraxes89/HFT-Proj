@@ -932,6 +932,60 @@ impl ReplayTransport {
         idx
     }
 
+    /// R31-A: whether the schedule bakes a mid-pass session split (the
+    /// session-split carry rule — frames past the split keep their own
+    /// session by construction). The session-elision arm requires `false`:
+    /// a split schedule's frame session bytes are load-bearing for the
+    /// sequencer's mid-pass boundary dispatch, so the blob patch law must
+    /// stand (the elision only fires on the one-session-per-pass program
+    /// shape, where the value is contract-verified but wire-inert).
+    pub fn has_session_split(&self) -> bool {
+        self.schedule.session_split.is_some()
+    }
+
+    /// R31-A: the SESSION-ELISION advance — `reset` with the blob left
+    /// COMPLETELY untouched. The 22K-site session rewrite (the per-pass
+    /// bake of [0..10] at every patchable frame site) is the record
+    /// shape's reset wall: ~22,000 cache-line writes per pass, each one
+    /// an RFO invalidation of a line the workers' L1/L2 want hot (the
+    /// frame's first 64B carries the session prefix AND the first span's
+    /// body head), measured at 32% of the 5s wall (reset_ms 1,561) and,
+    /// when pre-paced into the pass (HFT_PREPATCH_BUDGET=1024), at a
+    /// +1,212ms scan_ms regression from the mid-pass RFO storm.
+    ///
+    /// THE LAW THE ELISION STANDS ON (rxbuild + armed + no-split shapes):
+    /// nobody on the steady path READS the blob's session bytes —
+    /// `poll_rxbuild` advances the pacing skeleton without a frame-line
+    /// read, the master entries' sess words are the scan's compare source
+    /// (and stay construction-frozen under the elision), the workers'
+    /// span bodies start at HEADER_LEN+2, and the consumer's per-pass
+    /// sequencer ADOPTS the session from the frame bytes (which stay at
+    /// the construction value — the adoption is self-consistent every
+    /// pass). The pass tuple (count, hash, msg_hash) is session-value
+    /// independent (the bench's own ref-pass law: "identical bytes every
+    /// pass; only the session id changes, which cannot affect the
+    /// tuple"), and the session CONTRACT survives at the transport
+    /// boundary: the RX still stores `auto_session = sess_fn(next_pass)`
+    /// and `reset_pass` still fail-stops on any baked-vs-requested
+    /// divergence. What is knowingly elided is the WIRE fidelity of the
+    /// per-pass session bytes — the HFT_SESSION_ELISION=0 rollback
+    /// restores the full patch law verbatim.
+    ///
+    /// The cursor half of `reset_prepatched` is kept EXACTLY (the pacing
+    /// skeleton's restart is load-bearing); the patch half is deleted.
+    pub fn reset_cursors(&mut self, session: [u8; 10]) {
+        let first_vt = self
+            .schedule
+            .events
+            .first()
+            .map(|e| e.release_vt)
+            .unwrap_or(0);
+        self.event_idx = 0;
+        self.virtual_clock = first_vt;
+        self.session = session;
+        self.clock_clamp = None;
+    }
+
     /// R8 phase-3b: `reset` without re-patching the already-prepatched
     /// prefix — the RX's prepatch cursor advanced through the consumed
     /// events during the pass, so only the tail ([from_idx..]) needs the

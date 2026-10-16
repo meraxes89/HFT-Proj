@@ -399,6 +399,21 @@ struct Mailbox {
     /// (the classic path verbatim — and HFT_RXWARM keeps its own mode; if
     /// both are set, rxbuild wins and warm is ignored).
     rxbuild_enabled: bool,
+    /// R31-A: the SESSION-ELISION arm (write-once at construction, BEFORE
+    /// the spawn). True iff the constructor requested elision AND the
+    /// shape is sound for it: the auto-advance program is armed (the
+    /// per-pass session is KNOWN to the RX through `auto_fn` — the
+    /// contract cell `auto_session` still carries it), the
+    /// publish-by-reference master is on (the steady path reads entries,
+    /// not frame lines), and the schedule has no mid-pass session split
+    /// (a split's frame session bytes are load-bearing for the
+    /// sequencer's boundary dispatch). When true, the advance calls
+    /// `ReplayTransport::reset_cursors` (the blob and the master stay
+    /// construction-frozen — ZERO per-pass session writes, ZERO RFO
+    /// against the workers'/scanner's hot lines) and the prepatch is
+    /// disarmed entirely (nothing to patch). HFT_SESSION_ELISION=0 is the
+    /// documented rollback (the full patch law verbatim).
+    session_elision: bool,
     /// R21 (Task 4): the RX thread's ACTUAL landing cpu (`sched_getcpu`
     /// recorded right after the pin attempt; -1 before the first record).
     /// The topology verifier's ACTUAL-side fact — a silent pin failure
@@ -852,7 +867,14 @@ fn rx_thread(
     // the prepatch removes. HFT_PREPATCH=0 disarms (the rollback); the
     // per-pass tuple asserts stay armed either way.
     let prepatch_enabled =
-        std::env::var("HFT_PREPATCH").as_deref() != Ok("0");
+        std::env::var("HFT_PREPATCH").as_deref() != Ok("0") && !mb.session_elision;
+    // R31-A: the session-elision flag (construction-frozen in the Mailbox —
+    // armed/rxbuild/no-split/program). Under elision the blob AND the
+    // master stay construction-frozen across passes: the advance takes
+    // the zero-write `reset_cursors` path, the prepatch has no work
+    // (disarmed above), and the per-pass session lives ONLY in the
+    // `auto_session` contract cell. HFT_SESSION_ELISION=0 is the rollback.
+    let session_elision = mb.session_elision;
     // F-4: the runtime depth's protocol values — read ONCE from the
     // construction-written Mailbox (immutable; register-cached through
     // the loop below). At the default these are the R8/R9 shapes
@@ -1514,7 +1536,13 @@ fn rx_thread(
                 // R8 phase-3b (kill-switched): only the un-prepatched tail
                 // bakes synchronously; with the prepatch disabled that is
                 // the full blob (the pre-prepatch behavior).
-                if prepatch_enabled {
+                // R31-A: the ELIDED advance — zero blob writes, zero master
+                // writes (the session-elision law: the contract cell still
+                // carries the program's session below; only the wire bytes
+                // stay construction-frozen).
+                if session_elision {
+                    inner.reset_cursors(sess);
+                } else if prepatch_enabled {
                     inner.reset_prepatched(sess, pp_idx);
                     pp_idx = 0;
                 } else {
@@ -1540,22 +1568,28 @@ fn rx_thread(
                 // cursor/index restart for the fresh pass. (The EOS marker
                 // above already closed the drained pass's window; the
                 // advance's patches land in the NEXT pass's window —
-                // they bake FOR it.)
+                // they bake FOR it.) R31-A: under elision the tail patch
+                // is a no-op by law (the master is construction-frozen —
+                // the scan's compare source stays the construction
+                // session the per-pass sequencer adopts); only the
+                // pass-local index restarts remain.
                 if rxbuild_enabled {
-                    let (lo, hi) = tmpl_words(&sess);
-                    let m = master_mut(&mb);
-                    let (_, np) = master_patch_range(
-                        m,
-                        &mb.master_evt,
-                        &mb.master_patchable,
-                        rxs.mpp_idx,
-                        usize::MAX,
-                        lo,
-                        hi,
-                        compute_elig,
-                        usize::MAX,
-                    );
-                    rxs.patches += np;
+                    if !session_elision {
+                        let (lo, hi) = tmpl_words(&sess);
+                        let m = master_mut(&mb);
+                        let (_, np) = master_patch_range(
+                            m,
+                            &mb.master_evt,
+                            &mb.master_patchable,
+                            rxs.mpp_idx,
+                            usize::MAX,
+                            lo,
+                            hi,
+                            compute_elig,
+                            usize::MAX,
+                        );
+                        rxs.patches += np;
+                    }
                     rxs.mpp_idx = 0;
                     rxs.idx = 0;
                 }
@@ -1753,6 +1787,13 @@ impl PipelinedReplayTransport {
         // verbatim); takes precedence over the warm start (a both-armed
         // run is rxbuild).
         let rxbuild = std::env::var("HFT_RXBUILD").as_deref() != Ok("0");
+        // R31-A: the session elision — DEFAULT ON (the Run-600 directive:
+        // stop mutating the shared frame buffer in place on every pass —
+        // the 22K-site bake is the reset wall AND the RFO storm). Read
+        // once at construction, outside every measured window;
+        // HFT_SESSION_ELISION=0 restores the full patch law (the
+        // attribution arm's rollback).
+        let elision = std::env::var("HFT_SESSION_ELISION").as_deref() != Ok("0");
         // F-4 (HFT_NBUF): the mailbox depth — 16 (the R8 phase-3 measured
         // shape, the default) or 32 (the buffer-reuse-stall pricing arm;
         // CHECKLIST F-4 / ROADMAP2 §6.3). Read once at construction;
@@ -1772,13 +1813,15 @@ impl PipelinedReplayTransport {
             warm && !rxbuild,
             rxbuild,
             nbuf,
+            elision,
         )
     }
 
     /// F-1/F-2/F-4: [`Self::with_coalesce_cpu_auto`] with the warm start,
-    /// the publish-by-reference master, and the mailbox depth FORCED —
-    /// the tests' and local A/B's explicit path (the envs would be
-    /// process-global and racy across parallel test transports).
+    /// the publish-by-reference master, the mailbox depth, and the
+    /// session-elision arm FORCED — the tests' and local A/B's explicit
+    /// path (the envs would be process-global and racy across parallel
+    /// test transports).
     #[allow(clippy::too_many_arguments)]
     pub fn with_coalesce_cpu_auto_forced(
         gt: &[u8],
@@ -1790,6 +1833,7 @@ impl PipelinedReplayTransport {
         warm: bool,
         rxbuild: bool,
         nbuf: u64,
+        elision: bool,
     ) -> Self {
         debug_assert!(
             nbuf == 16 || nbuf == 32,
@@ -1820,6 +1864,11 @@ impl PipelinedReplayTransport {
         } else {
             (None, Box::from([]), Box::from([]))
         };
+        // R31-A: the elision's FINAL arming decision — the request AND the
+        // shape soundness gates (armed program, rxbuild master, no
+        // mid-pass session split). Computed once here; the RX thread and
+        // the diagnostics read the decision through the Mailbox.
+        let elision_armed = elision && rxbuild && sess_fn.is_some() && !inner.has_session_split();
         #[allow(clippy::disallowed_types)]
         let mb: Arc<Mailbox> = Arc::new(Mailbox {
             nbuf,
@@ -1850,6 +1899,7 @@ impl PipelinedReplayTransport {
             master_evt,
             master_patchable,
             rxbuild_enabled: rxbuild,
+            session_elision: elision_armed,
             rx_actual_cpu: AtomicI64::new(-1),
             rxdesc: OnceLock::new(),
         });
@@ -2325,6 +2375,15 @@ impl PipelinedReplayTransport {
             rx.rxbuild_last_pass.load(Ordering::Relaxed),
             frames,
         );
+        // R31-A: the session-elision telemetry line (always printed — the
+        // 11se attribution arm greps it; elision=true patches=0 is the
+        // zero-RFO steady law: the blob AND the master stay
+        // construction-frozen, the per-pass session lives only in the
+        // auto_session contract cell).
+        eprintln!(
+            "ELISION_DIAGNOSTIC {label}: armed={} (R31-A session elision — the 22K-site per-pass session bake is OFF; HFT_SESSION_ELISION=0 restores the patch law)",
+            self.mb.session_elision,
+        );
         eprintln!(
             "DIAG cons {label}: parks={} park_ms={:.1} slow_waits={} slow_ms={:.1}",
             cs.parks.load(Ordering::Relaxed),
@@ -2625,13 +2684,22 @@ mod tests {
         let pairs: u64 = 832;
         let gt = mini_gt(pairs * 10);
         let sched = i7_straddle_sched(pairs);
-        let mut t = PipelinedReplayTransport::with_coalesce_cpu_auto(
+        // R31-A: forced with elision=false — this cell pins the PATCH law
+        // (the frame bytes and the inline sess words carry THIS pass's
+        // session through the EOS-marker sentinel race); the elision arm
+        // knowingly elides the wire fidelity and is pinned by its own
+        // cells (t_r31a_*).
+        let mut t = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
             sched,
             i7_sess(0),
             8,
             None,
             Some(i7_sess),
+            false,
+            true,
+            16,
+            false,
         );
         for pass in 1..=4u64 {
             let sess = i7_sess(pass);
@@ -2695,6 +2763,7 @@ mod tests {
                 false,
                 false,
                 16,
+                false,
             );
             let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -2706,6 +2775,7 @@ mod tests {
                 true,
                 false,
                 16,
+                false,
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -2772,6 +2842,7 @@ mod tests {
             false,
             false,
             16,
+            false,
         );
         let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
@@ -2783,6 +2854,7 @@ mod tests {
             true,
             false,
             16,
+            false,
         );
         // Drain pass 1 fully (the fill), then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut warm] {
@@ -2838,6 +2910,7 @@ mod tests {
             true,
             false,
             16,
+            false,
         );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
@@ -2885,6 +2958,7 @@ mod tests {
                 false,
                 false,
                 16,
+                false,
             );
             let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -2896,6 +2970,7 @@ mod tests {
                 false,
                 true,
                 16,
+                false,
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -2972,6 +3047,7 @@ mod tests {
                 false,
                 false,
                 16,
+                false,
             );
             let mut d32 = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -2983,6 +3059,7 @@ mod tests {
                 false,
                 false,
                 32,
+                false,
             );
             let mut d32r = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -2994,6 +3071,7 @@ mod tests {
                 false,
                 true,
                 32,
+                false,
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3066,6 +3144,7 @@ mod tests {
             false,
             false,
             16,
+            false,
         );
         let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
@@ -3077,6 +3156,7 @@ mod tests {
             false,
             true,
             16,
+            false,
         );
         // Drain pass 1 fully, then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut rxbuild] {
@@ -3133,6 +3213,7 @@ mod tests {
             false,
             true,
             16,
+            false,
         );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
@@ -3157,5 +3238,211 @@ mod tests {
         let (patches, _, master_frames) = rxbuild.rx_build_stats();
         assert_eq!(master_frames, 60);
         assert!(patches >= 240 && patches % 60 == 0, "patch law (patches {patches})");
+    }
+
+    // ─── R31-A: the session-elision pins (Run 600) ────────────────────
+
+    /// The construction session's compare words (the template the master
+    /// entries' sess fields stay frozen at under the elision).
+    fn tmpl_of(s: &[u8; 10]) -> (u64, u64) {
+        (
+            u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]),
+            u64::from_le_bytes([s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9]]),
+        )
+    }
+
+    /// R31-A: the elision's own law — the elided rxbuild transport vs the
+    /// patched rxbuild transport, side by side over multi-pass ROTATING
+    /// sessions (the sustained shape): identical EOS alignment, batch
+    /// lengths and frame counts every pass; every PAYLOAD field identical
+    /// (bytes/blocks/feed/memo/first_seq — the pass tuple's own inputs);
+    /// the SESSION surface frozen at the construction value BY DESIGN
+    /// (frame bytes [..10], inline sess words, master patch count 0 —
+    /// zero per-pass session writes anywhere), while the patched twin
+    /// carries the rotating pass session and pays the per-boundary
+    /// patch count. The pass tuple is session-value independent (the
+    /// bench's ref-pass law), so the elided shape is observably
+    /// identical where it matters and provably write-free where it
+    /// doesn't.
+    #[test]
+    fn t_r31a_session_elision_parity_vs_patched() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let construction = *b"PIPETEST01";
+        let (c_lo, c_hi) = tmpl_of(&construction);
+        for coalesce in [1usize, 128] {
+            let mut patched = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                construction,
+                coalesce,
+                None,
+                Some(sess_program),
+                false,
+                true,
+                16,
+                false,
+            );
+            let mut elided = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                construction,
+                coalesce,
+                None,
+                Some(sess_program),
+                false,
+                true,
+                16,
+                true,
+            );
+            for p in 1..=4u64 {
+                let sess = sess_program(p);
+                assert_ne!(sess, construction, "the sessions must rotate");
+                patched.reset_pass(p, sess);
+                elided.reset_pass(p, sess);
+                let mut frames = 0usize;
+                loop {
+                    let p_ok = patched.next_batch();
+                    let e_ok = elided.next_batch();
+                    assert_eq!(p_ok, e_ok, "coalesce {coalesce} pass {p}: EOS mismatch");
+                    if !p_ok {
+                        break;
+                    }
+                    let pe = patched.entries();
+                    let ee = elided.entries();
+                    assert_eq!(
+                        pe.len(),
+                        ee.len(),
+                        "coalesce {coalesce} pass {p}: batch length mismatch"
+                    );
+                    let (p_lo, p_hi) = tmpl_of(&sess);
+                    for (c, e) in pe.iter().zip(ee.iter()) {
+                        // The payload surface — bit-identical past the
+                        // session prefix (the pass tuple's own inputs).
+                        assert_eq!(c.bytes.len(), e.bytes.len());
+                        assert_eq!(
+                            &c.bytes[10..],
+                            &e.bytes[10..],
+                            "the frame payload suffix must be byte-identical"
+                        );
+                        assert_eq!(c.blocks, e.blocks);
+                        assert_eq!(c.feed, e.feed);
+                        assert_eq!(c.memo, e.memo);
+                        assert_eq!(c.first_seq, e.first_seq);
+                        // The session surface — the ELISION LAW.
+                        assert_eq!(
+                            &e.bytes[..10],
+                            &construction[..],
+                            "coalesce {coalesce} pass {p}: the blob must stay \
+                             construction-frozen under elision"
+                        );
+                        assert_eq!(
+                            (e.sess_lo, e.sess_hi),
+                            (c_lo, c_hi),
+                            "coalesce {coalesce} pass {p}: the master sess words \
+                             must stay construction-frozen under elision"
+                        );
+                        // The patched twin carries the rotating session.
+                        assert_eq!((c.sess_lo, c.sess_hi), (p_lo, p_hi));
+                        assert_eq!(&c.bytes[..10], &sess[..]);
+                    }
+                    frames += ee.len();
+                }
+                assert_eq!(frames, 60, "coalesce {coalesce} pass {p}: frame count");
+            }
+            // The write-free telemetry law: ZERO master patches under the
+            // elision (vs the patched twin's per-boundary patch count).
+            let (e_patches, _, e_frames) = elided.rx_build_stats();
+            assert_eq!(e_frames, 60, "coalesce {coalesce}: master frame count");
+            assert_eq!(
+                e_patches, 0,
+                "coalesce {coalesce}: elision must write ZERO master session patches"
+            );
+            let (p_patches, _, _) = patched.rx_build_stats();
+            assert!(
+                p_patches >= 180,
+                "coalesce {coalesce}: patched twin must keep the patch law (patches {p_patches})"
+            );
+        }
+    }
+
+    /// R31-A: the session CONTRACT survives the elision at the transport
+    /// boundary — the RX still stores the program's session into the
+    /// auto_session cell and `reset_pass` still fail-stops on any
+    /// baked-vs-requested divergence (the program is a schedule, not a
+    /// trust substitute; the elision removed the WIRE bytes, never the
+    /// contract check).
+    #[test]
+    fn t_r31a_session_elision_contract_failstop() {
+        let gt = mini_gt(120);
+        let sched = mini_sched(120);
+        let mut t = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            &gt,
+            sched,
+            *b"PIPETEST01",
+            8,
+            None,
+            Some(sess_program),
+            false,
+            true,
+            16,
+            true,
+        );
+        // A session the program will NOT bake for pass 1 — must fail-stop
+        // exactly like the patched shape.
+        let wrong = *b"PIPEEDIV\0\0";
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            t.reset_pass(1, wrong);
+        }));
+        assert!(
+            r.is_err(),
+            "elision must keep the auto-advance session divergence fail-stop"
+        );
+    }
+
+    /// R31-A: the mid-pass abandon under elision — the abandoned pass's
+    /// tail is freed through the unstick loop, the elided advance takes
+    /// the zero-write path, and the next pass still publishes the exact
+    /// frame stream (the pacing-skeleton restart is the load-bearing
+    /// half of the advance, and `reset_cursors` keeps it verbatim).
+    #[test]
+    fn t_r31a_session_elision_mid_pass_abandon() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let mut t = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            &gt,
+            sched,
+            *b"PIPETEST01",
+            8,
+            None,
+            Some(sess_program),
+            false,
+            true,
+            16,
+            true,
+        );
+        // Drain pass 1 fully, abandon pass 2 mid-flight, target pass 3.
+        t.reset_pass(1, sess_program(1));
+        assert_eq!(run_pass(&mut t), 60);
+        t.reset_pass(2, sess_program(2));
+        assert!(t.next_batch());
+        let _ = t.entries();
+        t.reset_pass(3, sess_program(3));
+        // The post-abandon pass: exact frame count AND the frozen-blob
+        // law holds through the abandon's unstick + elided advance.
+        let mut frames = 0usize;
+        let mut checked = 0usize;
+        while t.next_batch() {
+            for e in t.entries() {
+                checked += 1;
+                assert_eq!(&e.bytes[..10], &b"PIPETEST01"[..], "blob frozen after abandon");
+            }
+            frames += t.entries().len();
+        }
+        assert_eq!(frames, 60, "post-abandon pass frame count");
+        assert_eq!(checked, 60, "every entry checked");
+        let (patches, _, master_frames) = t.rx_build_stats();
+        assert_eq!(master_frames, 60);
+        assert_eq!(patches, 0, "elision keeps zero patches through the abandon");
     }
 }

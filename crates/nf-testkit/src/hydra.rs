@@ -2650,6 +2650,30 @@ pub struct HydraSpanSink<'a> {
     /// R29: the self-serve engagement telemetry (windows armed; read
     /// post-run by the verdict lines).
     rx_ss_wins: u64,
+    /// R31-A: the WARM-EPOCH copy gate — per-ARRAY-SLOT consecutive
+    /// clean-window count. A window on slot s that verifies fix-free at
+    /// the same span count as the slot's previous window proves the
+    /// slot's content is the schedule's invariant tape for that range
+    /// (the deterministic-schedule law the warm copy itself stands on);
+    /// epoch ≥ 1 means the NEXT rotating window on s can skip the
+    /// ~252KB copy_arr/copy_tags pair — the words AND tags are already
+    /// exact, and the per-span check-and-fix remains the correctness
+    /// backstop (a wrong skip costs fix stores, never correctness — the
+    /// copy's own law). After the first RX_NARR warm-filled passes, the
+    /// rotating regime's opens go copy-free exactly like the toroidal
+    /// one's.
+    rx_slot_epoch: [u32; RX_NARR],
+    /// R31-A: the slot's last window's span count (u64::MAX = never
+    /// used) — the epoch's count-stability operand.
+    rx_slot_count: [u64; RX_NARR],
+    /// R31-A: the WARM-EPOCH arm is ON (HFT_WARM_EPOCH=0 is the documented
+    /// rollback — the always-copy rotating regime, the exact pre-R31
+    /// shape). Per-run constant, read at construction; pub for the
+    /// in-process test cells.
+    pub rx_warm_epoch: bool,
+    /// R31-A: the copy-skip engagement telemetry (windows opened without
+    /// the warm copy; read post-run by the verdict lines).
+    rx_warm_skips: u64,
 }
 
 impl<'a> HydraSpanSink<'a> {
@@ -2762,6 +2786,10 @@ impl<'a> HydraSpanSink<'a> {
             rx_win_ss: false,
             rx_win_pre: 0,
             rx_ss_wins: 0,
+            rx_slot_epoch: [0; RX_NARR],
+            rx_slot_count: [u64::MAX; RX_NARR],
+            rx_warm_epoch: std::env::var("HFT_WARM_EPOCH").as_deref() != Ok("0"),
+            rx_warm_skips: 0,
         };
         // R21 (Task 2, the fused arm's flip-validation instrument): prove
         // the fused shape armed — printed ONCE per process at the first
@@ -2854,6 +2882,10 @@ impl<'a> HydraSpanSink<'a> {
         self.rx_win_ss = false;
         self.rx_win_pre = 0;
         // (rx_ss_wins is run-lifetime telemetry — not reset.)
+        // R31-A: the fresh generation's slots are cold content-wise (the
+        // span grid restarts) — every slot re-earns its warm epoch.
+        self.rx_slot_epoch = [0; RX_NARR];
+        self.rx_slot_count = [u64::MAX; RX_NARR];
         // R23c: the ledger cursor restarts with the span sequence (the
         // fresh generation's spans revisit the blob's frames from the
         // first row).
@@ -2975,6 +3007,24 @@ impl<'a> HydraSpanSink<'a> {
             } else {
                 0
             };
+            // R31-A: the PER-SLOT warm epoch — the same clean proof, but
+            // keyed to THIS window's array slot and compared against the
+            // slot's own last count (the rotating regime revisits a slot
+            // RX_NARR windows later; the global epoch's operands can have
+            // rotated through other slots since). Epoch ≥ 1 arms the next
+            // open on this slot to SKIP the warm copy (the slot's words
+            // and tags are already the exact tape — the check-and-fix
+            // stays the backstop).
+            let s = self.rx_win_slot as usize;
+            let slot_clean = self.rx_fixes == self.rx_win_fix0
+                && self.rx_slot_count[s] != u64::MAX
+                && win_count == self.rx_slot_count[s];
+            self.rx_slot_epoch[s] = if slot_clean {
+                self.rx_slot_epoch[s].saturating_add(1)
+            } else {
+                0
+            };
+            self.rx_slot_count[s] = win_count;
             self.rx_win_open = false;
         }
         self.rx_publish_ready();
@@ -3147,18 +3197,38 @@ impl<'a> HydraSpanSink<'a> {
             // optimization — the per-span check-and-fix below still
             // verifies EVERY entry against the actual body; a wrong copy
             // costs stores, never correctness.
-            let prev_arr = if self.rx_ever_opened {
-                self.rx_win_slot as usize
+            //
+            // R31-A: THE WARM-EPOCH GATE — the slot's own last window
+            // verified fix-free at exactly this window's warm-start
+            // count, so the slot ALREADY holds the exact words and tags
+            // the copy would stage (the deterministic-schedule law; the
+            // tags are body-derived and the bodies are blob-immutable).
+            // Skip the ~252KB copy pair; the check-and-fix remains the
+            // per-span backstop — a wrong skip costs fix stores, never
+            // correctness (the copy's own law, symmetric). After the
+            // first RX_NARR warm-filled passes the rotating regime's
+            // opens are copy-free, exactly like the toroidal epoch's.
+            let n_warm = st.last_window_count();
+            let slot_idx = arr_slot as usize;
+            let warm_skip = self.rx_warm_epoch
+                && self.rx_slot_epoch[slot_idx] >= 1
+                && self.rx_slot_count[slot_idx] == n_warm as u64;
+            if warm_skip {
+                self.rx_warm_skips += 1;
             } else {
-                (arr_slot as usize + RX_NARR - 1) % RX_NARR
-            };
-            st.copy_arr(prev_arr as u8, arr_slot, st.last_window_count());
-            // R23c: the tag sidecar rides the SAME warm start — the
-            // copied tags stay valid under the same determinism law
-            // (identical schedule + immutable blob bodies), so steady
-            // passes find the tag correct and the check stays the ONE
-            // word compare.
-            st.copy_tags(prev_arr as u8, arr_slot, st.last_window_count());
+                let prev_arr = if self.rx_ever_opened {
+                    self.rx_win_slot as usize
+                } else {
+                    (arr_slot as usize + RX_NARR - 1) % RX_NARR
+                };
+                st.copy_arr(prev_arr as u8, arr_slot, n_warm);
+                // R23c: the tag sidecar rides the SAME warm start — the
+                // copied tags stay valid under the same determinism law
+                // (identical schedule + immutable blob bodies), so steady
+                // passes find the tag correct and the check stays the ONE
+                // word compare.
+                st.copy_tags(prev_arr as u8, arr_slot, n_warm);
+            }
         }
         // R27b: THE RECORD-RING WATERMARK — the bound that keeps the
         // sink's window-open lead within REC_RING of the fold in EVERY
@@ -4135,7 +4205,43 @@ impl<'a> HydraSpanSink<'a> {
         let n = words.len();
         let mut i = 0usize;
         while i < n {
-            if n - i >= 8 {
+            if n - i >= 16 {
+                // ── the R31-B 16-wide FUSED group (dual ZMM) ──
+                let base_idx = (self.next_span - self.rx_win_base) as usize;
+                assert!(
+                    base_idx + 16 <= st.cap(),
+                    "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
+                );
+                let group: &[u64; 16] = words[i..i + 16].try_into().unwrap();
+                let bad =
+                    st.check_arr16_packed(self.rx_win_slot, base_idx, group, delta, affine_flag);
+                if bad != 0 {
+                    // The COLD path — the same per-lane fix, in the same
+                    // ascending order (16 lanes).
+                    for g in 0..16 {
+                        if (bad >> g) & 1 == 0 {
+                            continue;
+                        }
+                        let w = group[g];
+                        let body = self.packed_body(base_ptr, w);
+                        // R27: the toroidal window's shared-slot write —
+                        // wait for the lagging reader of the previous
+                        // window's same word.
+                        self.rx_tor_fix_guard(base_idx + g);
+                        if self.rx_affine {
+                            let tag = self.rx_affine_tag_for(body);
+                            st.set_affine_tag(self.rx_win_slot, base_idx + g, &tag);
+                        }
+                        let expect =
+                            ((w & nf_transport::rxdesc::RX_PACKED_LOW48) + delta) | affine_flag;
+                        st.set_arr(self.rx_win_slot, base_idx + g, expect);
+                        self.rx_fixes += 1;
+                    }
+                }
+                self.next_span += 16;
+                self.submit_rem -= 16;
+                i += 16;
+            } else if n - i >= 8 {
                 // ── the 8-wide FUSED group ──
                 let base_idx = (self.next_span - self.rx_win_base) as usize;
                 assert!(
@@ -4638,6 +4744,18 @@ impl<'a> HydraSpanSink<'a> {
                 } else {
                     0
                 };
+                // R31-A: the per-slot twin (same law as end_pass's close —
+                // the burst shape's windows arm the warm-epoch gate too).
+                let s = self.rx_win_slot as usize;
+                let slot_clean = self.rx_fixes == self.rx_win_fix0
+                    && self.rx_slot_count[s] != u64::MAX
+                    && win_count == self.rx_slot_count[s];
+                self.rx_slot_epoch[s] = if slot_clean {
+                    self.rx_slot_epoch[s].saturating_add(1)
+                } else {
+                    0
+                };
+                self.rx_slot_count[s] = win_count;
                 self.rx_win_open = false;
             }
             self.rx_publish_ready();
@@ -4700,6 +4818,14 @@ impl<'a> HydraSpanSink<'a> {
     #[inline]
     pub fn selfserve_wins(&self) -> u64 {
         self.rx_ss_wins
+    }
+
+    /// R31-A telemetry: rotating windows opened WITHOUT the warm copy
+    /// (the warm-epoch gate's engagement counter — 0 means every open
+    /// paid the ~252KB copy_arr/copy_tags pair, the pre-R31 shape).
+    #[inline]
+    pub fn warm_skips(&self) -> u64 {
+        self.rx_warm_skips
     }
 }
 
@@ -6655,6 +6781,97 @@ mod tests {
                 }
             } // ss
         } // comp
+    }
+
+    /// R31-A: the WARM-EPOCH copy gate — the rotating regime's opens
+    /// (toroidal disarmed, the exact pre-R27 window protocol) skip the
+    /// ~252KB copy_arr/copy_tags pair once every RX_NARR slot has
+    /// warm-filled and verified fix-free at the stable window count
+    /// (the deterministic-schedule law); the check-and-fix remains the
+    /// per-span backstop, so every record must stay bit-exact vs the
+    /// sequential reference. The rollback cell (rx_warm_epoch=false,
+    /// the in-process form of HFT_WARM_EPOCH=0) pays the copy on every
+    /// open (skips == 0) and produces the SAME records.
+    #[test]
+    fn t_r31a_warm_epoch_copy_gate() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let sess = *b"R31WARM\0\0\0";
+        let mut t0 = ReplayTransport::new(&gt, sched.clone(), sess);
+        let want = seq_pass(&mut t0, sess);
+        assert_eq!(want.0, 505_849, "coverage must hold");
+        // 2 full slot rotations of warm-fill + enough steady opens to
+        // prove the gate engaged on every slot.
+        const PASSES: u64 = 24;
+        for warm_epoch in [true, false] {
+            let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, true, true);
+            let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(
+                &gt,
+                sched.clone(),
+                sess,
+                128,
+            );
+            if let Some(st) = fabric.rxdesc_state() {
+                assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+            }
+            t.reset(sess);
+            let mut seq = Sequencer::new();
+            let mut sink = HydraSpanSink::new(&fabric);
+            sink.rx_toroidal = false; // the ROTATING regime — the copy's path
+            sink.rx_assist_wm = 0; // deterministic (the law-cell discipline)
+            sink.rx_warm_epoch = warm_epoch;
+            let ladder = crate::soa::ladder8_best();
+            let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+            let mut got = Vec::new();
+            for _pass in 0..PASSES {
+                t.reset(sess);
+                *seq = Sequencer::new_unboxed();
+                sink.begin_pass();
+                while t.next_batch() {
+                    seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                    sink.drain_ready();
+                }
+                sink.end_pass();
+                let n = sink.harvest_completed(&mut harvested);
+                for rec in &harvested[..n] {
+                    got.push(*rec);
+                }
+            }
+            sink.finish();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+            assert_eq!(
+                got.len() as u64,
+                PASSES,
+                "R31a warm-epoch records (warm_epoch={warm_epoch})"
+            );
+            for (k, rec) in got.iter().enumerate() {
+                assert_eq!(
+                    *rec, want,
+                    "R31a warm-epoch pass {k} diverged (warm_epoch={warm_epoch}) — \
+                     the copy-skip must stay check-and-fix backstopped"
+                );
+            }
+            if warm_epoch {
+                assert!(
+                    sink.warm_skips() >= PASSES - 2 * nf_transport::rxdesc::RX_NARR as u64,
+                    "R31a warm-epoch never engaged (skips={})", sink.warm_skips()
+                );
+            } else {
+                assert_eq!(
+                    sink.warm_skips(),
+                    0,
+                    "R31a rollback cell armed the copy gate"
+                );
+            }
+        }
     }
 
     /// R28: the fused packed ladder-commit parity — the steady ladder's

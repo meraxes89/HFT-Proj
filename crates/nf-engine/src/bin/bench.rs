@@ -683,7 +683,7 @@ fn run_hydra_sustained_5s(
 
     if diag {
         eprintln!(
-            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
+            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
             d_passes,
             d_reset_ns as f64 / 1e6,
             d_scan_ns as f64 / 1e6,
@@ -694,6 +694,8 @@ fn run_hydra_sustained_5s(
             d_work_ns as f64 / 1e6,
             d_fold_ns as f64 / 1e6,
             sink.assist_chunks(),
+            sink.warm_skips(),
+            sink.selfserve_wins(),
             body_bytes_per_msg,
             sustained_rate as f64 * body_bytes_per_msg / 1e9
         );

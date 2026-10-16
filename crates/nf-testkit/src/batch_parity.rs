@@ -247,7 +247,13 @@ fn soa_pass(
     )
 }
 
-/// The 3-way differential: classic vs pipelined-scalar vs pipelined-vector.
+/// The 3-way differential: classic vs pipelined-scalar vs pipelined-vector,
+/// plus the R31-B fourth leg: the group drivers with the POINTER-FORM
+/// SCALAR kernel forced in (the 16-wide dual-ZMM step and the 8-wide
+/// step run their relation/fallback logic on every host — the entries'
+/// elig bits are env-gated, so this leg pins the always-rejected
+/// fallback shape; the ENGAGED shape is pinned by
+/// `t_r31b_ladder16_group_parity` below).
 pub fn assert_soa_parity(label: &str, cfg: &ReplayConfig, gt: &[u8]) {
     let sched = build_schedule(gt, cfg);
     let sess = *b"SOAPAR0001";
@@ -255,11 +261,16 @@ pub fn assert_soa_parity(label: &str, cfg: &ReplayConfig, gt: &[u8]) {
     let mut t_pl_scalar =
         nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(&gt, sched.clone(), sess, 128);
     let mut t_pl_vec =
+        nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(&gt, sched.clone(), sess, 128);
+    let mut t_pl_group =
         nf_transport::pipeline::PipelinedReplayTransport::with_coalesce(&gt, sched, sess, 128);
     let c = classic_pass(&mut t_classic, sess);
     let s = soa_pass(&mut t_pl_scalar, sess, None);
     let ladder = crate::soa::ladder8_best();
     let v = soa_pass(&mut t_pl_vec, sess, ladder);
+    let group_ladder: Option<nf_protocol::packet::SoaLadder8> =
+        Some(crate::soa::ladder8_scalar_ptr);
+    let g = soa_pass(&mut t_pl_group, sess, group_ladder);
     assert_eq!(
         c, s,
         "{label}: pipelined-scalar diverged from classic\nclassic={c:#?}\nscalar ={s:#?}"
@@ -267,6 +278,10 @@ pub fn assert_soa_parity(label: &str, cfg: &ReplayConfig, gt: &[u8]) {
     assert_eq!(
         c, v,
         "{label}: pipelined-VECTOR diverged from classic\nclassic={c:#?}\nvector  ={v:#?}"
+    );
+    assert_eq!(
+        c, g,
+        "{label}: pipelined-GROUP (R31-B forced kernel) diverged from classic\nclassic={c:#?}\ngroup  ={g:#?}"
     );
 }
 
@@ -339,6 +354,149 @@ fn t_r12_soa_parity_single_feed_seeded() {
         ..Default::default()
     };
     assert_soa_parity("soa-single-feed", &cfg, &gt);
+}
+
+// ─── R31-B: the 16-wide group ladder parity (Run 600) ─────────────────
+
+/// Hand-built steady entry tape: 64 frames, even = feed-0 emit, odd =
+/// feed-1 pure duplicate of its even partner (the canonical group
+/// shape), 4 blocks per frame, elig bit 7 SET (the engaged group path —
+/// the transport-side elig compute is env-gated, so the ENGAGED shape
+/// needs hand-built entries). `foreign_at` mutates one entry's session
+/// words (the mid-tape cold frame — the 16- and 8-wide groups must
+/// reject and route it through the scalar ladder + classic dispatch,
+/// exactly as the 8-wide path would).
+#[cfg(test)]
+fn r31b_entries(foreign_at: Option<usize>) -> Vec<nf_protocol::packet::FrameEntry<'static>> {
+    use nf_protocol::packet::{FrameEntry, FrameMemo};
+    const MSGS: usize = 4;
+    const MSG_LEN: usize = 12; // 'S' + 8B counter + 'O' (mini_gt's shape)
+    const FRAME_LEN: usize = 20 + MSGS * (2 + MSG_LEN);
+    const N: usize = 64;
+    let sess: [u8; 10] = *b"R31BGROUP1";
+    let sess_lo =
+        u64::from_le_bytes([sess[0], sess[1], sess[2], sess[3], sess[4], sess[5], sess[6], sess[7]]);
+    let sess_hi =
+        u64::from_le_bytes([sess[2], sess[3], sess[4], sess[5], sess[6], sess[7], sess[8], sess[9]]);
+    // Phase 1: fill the blob + the triple store completely (both
+    // fixed-capacity — no reallocation, so the addresses freeze here).
+    let mut blob = vec![0u8; N * FRAME_LEN];
+    // Exact capacity: the pushes below never reallocate.
+    #[allow(clippy::disallowed_types)]
+    let mut triples: Vec<(u64, u32, u32)> = Vec::with_capacity(N * MSGS);
+    for k in 0..N {
+        // Even k emits (first advances by MSGS); odd k duplicates its
+        // even partner's first (a PURE dup: last = first + MSGS - 1 <
+        // the watermark the even partner just advanced to).
+        let first = 1 + (k / 2) as u64 * MSGS as u64;
+        let base = k * FRAME_LEN;
+        let frame = &mut blob[base..base + FRAME_LEN];
+        frame[..10].copy_from_slice(&sess);
+        frame[10..18].copy_from_slice(&first.to_be_bytes());
+        frame[18..20].copy_from_slice(&(MSGS as u16).to_be_bytes());
+        for m in 0..MSGS {
+            let off = 20 + m * (2 + MSG_LEN);
+            frame[off..off + 2].copy_from_slice(&(MSG_LEN as u16).to_be_bytes());
+            frame[off + 2] = b'S';
+            frame[off + 3..off + 11].copy_from_slice(&(m as u64 + 1).to_be_bytes());
+            frame[off + 11] = b'O';
+            let start = (22 + m * (2 + MSG_LEN)) as u32;
+            triples.push((first + m as u64, start, start + MSG_LEN as u32));
+        }
+    }
+    // Phase 2: build the 'static entries from the FROZEN addresses. The
+    // blob/triples are forgotten at the end — the test's 'static borrows
+    // own them from here (a per-cell leak of ~6KB; the differential
+    // cells' price).
+    let blob_ptr = blob.as_ptr();
+    let trip_ptr = triples.as_ptr();
+    let mut entries: Vec<FrameEntry<'static>> = Vec::with_capacity(N);
+    for k in 0..N {
+        let first = 1 + (k / 2) as u64 * MSGS as u64;
+        let feed = (k & 1) as u8;
+        // SAFETY: the buffers are frozen (phase 1 complete, exact
+        // capacities — no reallocation ever occurred); the forget below
+        // extends their lifetime past this function's frame.
+        let bytes: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(blob_ptr.add(k * FRAME_LEN), FRAME_LEN) };
+        let blk: &'static [(u64, u32, u32)] =
+            unsafe { std::slice::from_raw_parts(trip_ptr.add(k * MSGS), MSGS) };
+        // The mid-tape cold frame: foreign session WORDS (the entry's
+        // inline compare words diverge from the scan's live template;
+        // the frame bytes keep the wire session — the steady compare is
+        // the inline words' own law).
+        let (lo, hi) = if foreign_at == Some(k) {
+            (!sess_lo, sess_hi)
+        } else {
+            (sess_lo, sess_hi)
+        };
+        entries.push(FrameEntry {
+            bytes,
+            feed,
+            blocks: blk,
+            memo: Some(FrameMemo {
+                valid_count: MSGS as u16,
+            }),
+            first_seq: first,
+            sess_lo: lo,
+            sess_hi: hi,
+            elig: 0x80 | feed,
+        });
+    }
+    std::mem::forget(blob);
+    std::mem::forget(triples);
+    entries
+}
+
+/// R31-B: the ENGAGED group path — the 16-frame dual-ZMM step (and its
+/// 8-frame fallback) vs the scalar steady ladder vs the classic
+/// per-frame ladder, over the hand-built steady tape: identical
+/// counters, watermark, and sink tuple. The cold variant (one foreign
+/// session mid-tape) forces the groups to reject at that entry and
+/// route the classic path — the fallback chain (16 → 8 → scalar →
+/// cold_apply) must produce the same observables as the pure-scalar
+/// legs.
+#[test]
+fn t_r31b_ladder16_group_parity() {
+    use nf_protocol::packet::SoaLadder8;
+    let group_ladder: Option<SoaLadder8> = Some(crate::soa::ladder8_scalar_ptr);
+    for foreign in [None, Some(33usize)] {
+        let entries = r31b_entries(foreign);
+        // Leg A: the classic per-frame ladder.
+        let a = {
+            let mut seq = Sequencer::new();
+            let mut sink = SpanConformanceSink::new();
+            for e in &entries {
+                seq.ingest_auto(e.bytes, e.feed, 1_000, &mut sink, e.blocks, e.memo);
+            }
+            (seq.counters(), seq.watermark(), sink.count, sink.hash, sink.msg_hash)
+        };
+        // Leg B: the R8 scalar steady ladder (ladder = None).
+        let b = {
+            let mut seq = Sequencer::new();
+            let mut sink = SpanConformanceSink::new();
+            seq.ingest_entries_ladder(&entries, 1_000, &mut sink, None);
+            (seq.counters(), seq.watermark(), sink.count, sink.hash, sink.msg_hash)
+        };
+        // Leg C: the R31-B group drivers (16-wide first, 8-wide
+        // fallback) with the pointer-form scalar kernel — the ENGAGED
+        // shape (elig bits set, sessions aligned).
+        let c = {
+            let mut seq = Sequencer::new();
+            let mut sink = SpanConformanceSink::new();
+            seq.ingest_entries_ladder(&entries, 1_000, &mut sink, group_ladder);
+            (seq.counters(), seq.watermark(), sink.count, sink.hash, sink.msg_hash)
+        };
+        assert_eq!(
+            a, b,
+            "R31-B scalar steady ladder diverged from classic (foreign={foreign:?})"
+        );
+        assert_eq!(
+            a, c,
+            "R31-B 16-wide group ladder diverged from classic (foreign={foreign:?})\n\
+             classic={a:#?}\ngroup  ={c:#?}"
+        );
+    }
 }
 
 /// Multi-pass with fresh sessions through the SoA path (the sustained
@@ -632,13 +790,22 @@ fn t_i7_prepatch_chaos_sustained_soak() {
         want.push((sink.count, sink.hash, sink.msg_hash));
     }
 
-    let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto(
+    // R31-A: forced with elision=false — this soak pins the PATCH law's
+    // I-7 class (the frame bytes must carry THIS pass's session through
+    // the EOS-marker sentinel race, the tardy consumer, and the abandon
+    // unstick); the elision knowingly removes the wire bytes and is
+    // pinned by its own cells (the pipeline t_r31a_* trio).
+    let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
         &gt,
         sched,
         prog(0),
         128,
         None,
         Some(prog),
+        false,
+        true,
+        16,
+        false,
     );
 
     // Deterministic LCG chaos — reproducible failure modes, no RNG dep.
@@ -772,6 +939,7 @@ fn t_f1_rxwarm_chaos_sustained_soak() {
         true,
         false,
         16,
+        false,
     );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).
@@ -912,6 +1080,7 @@ fn t_f2_rxbuild_chaos_sustained_soak() {
         false,
         true,
         16,
+        false,
     );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).
