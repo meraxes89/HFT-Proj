@@ -959,22 +959,46 @@ impl Sequencer {
         ladder: Option<packet::SoaLadder8>,
     ) {
         let wants_spans = sink.wants_spans();
+        // R28: the packed emission — one branch per ingest call (the
+        // monomorphization seam); the steady ladder packs each span's
+        // (off, len, count) word at discovery and the commit sink never
+        // materializes a SpanRec.
+        let packed = wants_spans && sink.wants_packed_spans();
         let mut pos = 0usize;
         loop {
             if self.steady_ready() {
                 let mut w = self.w;
-                let (progressed, cold) = steady_scan_ladder(
-                    &mut self.counters,
-                    sink,
-                    entries,
-                    &mut pos,
-                    &mut w,
-                    self.session_lo,
-                    self.session_hi,
-                    self.gen,
-                    wants_spans,
-                    ladder,
-                );
+                let (progressed, cold) = if packed {
+                    let mut em = PackedEmitter::new();
+                    steady_scan_ladder(
+                        &mut self.counters,
+                        sink,
+                        entries,
+                        &mut pos,
+                        &mut w,
+                        self.session_lo,
+                        self.session_hi,
+                        self.gen,
+                        wants_spans,
+                        ladder,
+                        &mut em,
+                    )
+                } else {
+                    let mut em = RecEmitter::new();
+                    steady_scan_ladder(
+                        &mut self.counters,
+                        sink,
+                        entries,
+                        &mut pos,
+                        &mut w,
+                        self.session_lo,
+                        self.session_hi,
+                        self.gen,
+                        wants_spans,
+                        ladder,
+                        &mut em,
+                    )
+                };
                 self.w = w;
                 if progressed {
                     self.progress_vt = now_ns;
@@ -1074,7 +1098,7 @@ enum StepOutcome<'e, 'a> {
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn steady_step<'e, 'a, S: Sink>(
+fn steady_step<'e, 'a, S: Sink, E: SpanEmit<'a>>(
     entry: &'e packet::FrameEntry<'a>,
     w: &mut u64,
     pk: &mut [u64; 2],
@@ -1082,8 +1106,7 @@ fn steady_step<'e, 'a, S: Sink>(
     dup: &mut [u64; 2],
     dup_msgs: &mut u64,
     emitted: &mut u64,
-    recs: &mut [crate::types::SpanRec<'a>; STEADY_RECS],
-    nrecs: &mut usize,
+    em: &mut E,
     sink: &mut S,
     proof: &LiveFeedProof,
     wants_spans: bool,
@@ -1130,16 +1153,9 @@ fn steady_step<'e, 'a, S: Sink>(
     byt[fi] += frame.len() as u64;
     if wants_spans {
         let body = &frame[moldudp64::HEADER_LEN + 2..frame.len()];
-        recs[*nrecs] = crate::types::SpanRec {
-            first_seq: first,
-            count: n as u16,
-            body,
-            blocks,
-        };
-        *nrecs += 1;
-        if *nrecs == recs.len() {
-            sink.on_span_batch(proof, recs);
-            *nrecs = 0;
+        em.push(first, n as u16, body, blocks);
+        if em.is_full() {
+            em.flush(sink, proof);
         }
     } else {
         for &(seq, start, end) in blocks {
@@ -1155,6 +1171,138 @@ fn steady_step<'e, 'a, S: Sink>(
 /// emitting frames at k=8..32; overflow flushes mid-scan in order — see
 /// `steady_step`).
 const STEADY_RECS: usize = 32;
+
+// ── R28: the steady scan's span-EMISSION buffer ─────────────────────────────
+//
+// The scan drivers buffer span emissions and flush them in one call
+// (the R8 batch law). R28 re-derives the BUFFER at the SoA seam: the
+// classic `SpanRec` emitter (every sink) materializes the 48 B struct
+// per span; the PACKED emitter (sinks that opt into
+// `Sink::wants_packed_spans`) folds each span's (off, len, count) into
+// ONE 64-bit word at discovery — batch-relative offset — so the commit
+// path's expected-word transform is a single vector AND+ADD+OR per 8
+// spans and the struct store/reload/pointer-chase tax leaves the scan
+// entirely. ONE source of truth per ladder step (steady_step /
+// ladder_group_apply are generic over the emitter; monomorphized twice).
+
+/// R28: the steady scan's span-emission buffer — `push` at discovery,
+/// `flush` at the batch boundary (buffer fill / scan exit, always before
+/// the caller applies a cold frame — emission order preserved).
+trait SpanEmit<'a> {
+    /// Buffer one span emission (the exact `on_span` argument tuple).
+    fn push(&mut self, first_seq: u64, count: u16, body: &'a [u8], blocks: &'a [(u64, u32, u32)]);
+    /// The buffer's capacity gate (flush fires at `push`'s return when
+    /// full).
+    fn is_full(&self) -> bool;
+    /// Deliver the buffer to the sink (no-op when empty).
+    fn flush<S: Sink>(&mut self, sink: &mut S, proof: &LiveFeedProof);
+}
+
+/// The classic R8 emitter — `SpanRec` materialization, verbatim.
+struct RecEmitter<'a> {
+    recs: [crate::types::SpanRec<'a>; STEADY_RECS],
+    n: usize,
+}
+
+impl<'a> RecEmitter<'a> {
+    fn new() -> Self {
+        Self {
+            recs: [crate::types::SpanRec {
+                first_seq: 0,
+                count: 0,
+                body: &[],
+                blocks: &[],
+            }; STEADY_RECS],
+            n: 0,
+        }
+    }
+}
+
+impl<'a> SpanEmit<'a> for RecEmitter<'a> {
+    #[inline(always)]
+    fn push(&mut self, first_seq: u64, count: u16, body: &'a [u8], blocks: &'a [(u64, u32, u32)]) {
+        self.recs[self.n] = crate::types::SpanRec {
+            first_seq,
+            count,
+            body,
+            blocks,
+        };
+        self.n += 1;
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.n == self.recs.len()
+    }
+
+    #[inline(always)]
+    fn flush<S: Sink>(&mut self, sink: &mut S, proof: &LiveFeedProof) {
+        if self.n != 0 {
+            sink.on_span_batch(proof, &self.recs[..self.n]);
+            self.n = 0;
+        }
+    }
+}
+
+/// R28: the PACKED emitter — one 64-bit word per span
+/// `(off_batch: u32 | len: u16 | count: u16)` plus the batch's
+/// (base_ptr, first_seq, total) header. The word's offset is
+/// batch-RELATIVE (`body_ptr - base_ptr`, `base_ptr` = the first span's
+/// body pointer) — the commit sink converts to the array's blob-global
+/// offsets with one constant add per batch (see
+/// `on_span_batch_packed`'s contract).
+struct PackedEmitter {
+    words: [u64; STEADY_RECS],
+    n: usize,
+    /// The batch's first body pointer (the offsets' origin).
+    base: usize,
+    /// The batch's first span's sequence number.
+    first0: u64,
+    /// The batch's total message count (Σ count).
+    total: u64,
+}
+
+impl PackedEmitter {
+    fn new() -> Self {
+        Self {
+            words: [0; STEADY_RECS],
+            n: 0,
+            base: 0,
+            first0: 0,
+            total: 0,
+        }
+    }
+}
+
+impl<'a> SpanEmit<'a> for PackedEmitter {
+    #[inline(always)]
+    fn push(&mut self, first_seq: u64, count: u16, body: &'a [u8], _blocks: &'a [(u64, u32, u32)]) {
+        if self.n == 0 {
+            self.base = body.as_ptr() as usize;
+            self.first0 = first_seq;
+        }
+        let off = body.as_ptr() as usize - self.base;
+        debug_assert!(off <= u32::MAX as usize, "R28 packed offset overflows u32");
+        debug_assert!(body.len() <= u16::MAX as usize, "R28 packed len overflows u16");
+        self.words[self.n] = off as u64 | ((body.len() as u64) << 32) | ((count as u64) << 48);
+        self.n += 1;
+        self.total += count as u64;
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.n == self.words.len()
+    }
+
+    #[inline(always)]
+    fn flush<S: Sink>(&mut self, sink: &mut S, proof: &LiveFeedProof) {
+        if self.n != 0 {
+            sink.on_span_batch_packed(proof, self.first0, self.total, self.base, &self.words[..self.n]);
+            self.n = 0;
+            self.total = 0;
+        }
+    }
+}
 
 /// R8: the by-REFERENCE steady scan — identical ladder to [`steady_scan`],
 /// iterating `&[FrameEntry]` with zero per-frame entry copies (the
@@ -1180,16 +1328,7 @@ fn steady_scan_ref<'a, S: Sink>(
     let mut emitted = 0u64;
     let mut progressed = false;
     let mut cold: Option<&packet::FrameEntry<'a>> = None;
-    let mut recs = [
-        crate::types::SpanRec {
-            first_seq: 0,
-            count: 0,
-            body: &[],
-            blocks: &[],
-        };
-        STEADY_RECS
-    ];
-    let mut nrecs = 0usize;
+    let mut em = RecEmitter::new();
     let proof = LiveFeedProof { gen };
     while let Some(entry) = entries.next() {
         match steady_step(
@@ -1200,8 +1339,7 @@ fn steady_scan_ref<'a, S: Sink>(
             &mut dup,
             &mut dup_msgs,
             &mut emitted,
-            &mut recs,
-            &mut nrecs,
+            &mut em,
             sink,
             &proof,
             wants_spans,
@@ -1216,9 +1354,7 @@ fn steady_scan_ref<'a, S: Sink>(
             StepOutcome::DupSkipped => {}
         }
     }
-    if nrecs != 0 {
-        sink.on_span_batch(&proof, &recs[..nrecs]);
-    }
+    em.flush(sink, &proof);
     counters.feed_a.packets += pk[0];
     counters.feed_b.packets += pk[1];
     counters.feed_a.bytes += byt[0];
@@ -1237,7 +1373,7 @@ fn steady_scan_ref<'a, S: Sink>(
 /// when the group was applied; false routes it through the scalar ladder.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn ladder_group_apply<'a, S: Sink>(
+fn ladder_group_apply<'a, S: Sink, E: SpanEmit<'a>>(
     entries: &'a [packet::FrameEntry<'a>],
     p: usize,
     ladder8: packet::SoaLadder8,
@@ -1247,8 +1383,7 @@ fn ladder_group_apply<'a, S: Sink>(
     dup: &mut [u64; 2],
     dup_msgs: &mut u64,
     emitted: &mut u64,
-    recs: &mut [crate::types::SpanRec<'a>; STEADY_RECS],
-    nrecs: &mut usize,
+    em: &mut E,
     sink: &mut S,
     proof: &LiveFeedProof,
     wants_spans: bool,
@@ -1310,16 +1445,9 @@ fn ladder_group_apply<'a, S: Sink>(
             let entry = &entries[p + k];
             let frame = entry.bytes;
             let body = &frame[moldudp64::HEADER_LEN + 2..frame.len()];
-            recs[*nrecs] = crate::types::SpanRec {
-                first_seq: firsts[k],
-                count: ns[k] as u16,
-                body,
-                blocks: entry.blocks,
-            };
-            *nrecs += 1;
-            if *nrecs == recs.len() {
-                sink.on_span_batch(proof, recs);
-                *nrecs = 0;
+            em.push(firsts[k], ns[k] as u16, body, entry.blocks);
+            if em.is_full() {
+                em.flush(sink, proof);
             }
         }
     } else {
@@ -1363,7 +1491,7 @@ fn ladder_group_apply<'a, S: Sink>(
 /// scalar ladder; any cold frame stops the scan and is returned unapplied.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn steady_scan_ladder<'a, S: Sink>(
+fn steady_scan_ladder<'a, S: Sink, E: SpanEmit<'a>>(
     counters: &mut Counters,
     sink: &mut S,
     entries: &'a [packet::FrameEntry<'a>],
@@ -1374,6 +1502,7 @@ fn steady_scan_ladder<'a, S: Sink>(
     gen: u64,
     wants_spans: bool,
     ladder: Option<packet::SoaLadder8>,
+    em: &mut E,
 ) -> (bool, Option<usize>) {
     let len = entries.len();
     let mut pk = [0u64; 2];
@@ -1383,16 +1512,6 @@ fn steady_scan_ladder<'a, S: Sink>(
     let mut emitted = 0u64;
     let mut progressed = false;
     let mut cold: Option<usize> = None;
-    let mut recs = [
-        crate::types::SpanRec {
-            first_seq: 0,
-            count: 0,
-            body: &[],
-            blocks: &[],
-        };
-        STEADY_RECS
-    ];
-    let mut nrecs = 0usize;
     let proof = LiveFeedProof { gen };
     // The group gather buffers (stack; L1-hot).
     let mut firsts = [0u64; 8];
@@ -1412,8 +1531,7 @@ fn steady_scan_ladder<'a, S: Sink>(
                     &mut dup,
                     &mut dup_msgs,
                     &mut emitted,
-                    &mut recs,
-                    &mut nrecs,
+                    em,
                     sink,
                     &proof,
                     wants_spans,
@@ -1439,8 +1557,7 @@ fn steady_scan_ladder<'a, S: Sink>(
             &mut dup,
             &mut dup_msgs,
             &mut emitted,
-            &mut recs,
-            &mut nrecs,
+            em,
             sink,
             &proof,
             wants_spans,
@@ -1455,9 +1572,7 @@ fn steady_scan_ladder<'a, S: Sink>(
             StepOutcome::DupSkipped => {}
         }
     }
-    if nrecs != 0 {
-        sink.on_span_batch(&proof, &recs[..nrecs]);
-    }
+    em.flush(sink, &proof);
     counters.feed_a.packets += pk[0];
     counters.feed_b.packets += pk[1];
     counters.feed_a.bytes += byt[0];
@@ -1525,22 +1640,11 @@ where
     let mut emitted = 0u64;
     let mut progressed = false;
     let mut cold: Option<packet::FrameEntry<'a>> = None;
-    // R8: span-emission buffer — steady spans are captured as SpanRecs and
-    // delivered with ONE on_span_batch call per buffer-fill / scan-exit (the
-    // default Sink impl replays them exactly, so this is purely mechanical
-    // batching; sinks like the count/hydra/fabric sinks amortize their
-    // per-call guard work across the batch). 32 covers a coalesced poll's
+    // R8/R28: the span-emission buffer (the classic SpanRec emitter —
+    // this driver serves non-packed sinks; the ladder driver's packed
+    // emitter is the SoA fast path). 32 covers a coalesced poll's
     // emitting frames at k=8..32; overflow flushes mid-scan in order.
-    let mut recs = [
-        crate::types::SpanRec {
-            first_seq: 0,
-            count: 0,
-            body: &[],
-            blocks: &[],
-        };
-        STEADY_RECS
-    ];
-    let mut nrecs = 0usize;
+    let mut em = RecEmitter::new();
     let proof = LiveFeedProof { gen };
     while let Some(entry) = entries.next() {
         // R12: the shared per-entry ladder (one source of truth for all
@@ -1553,8 +1657,7 @@ where
             &mut dup,
             &mut dup_msgs,
             &mut emitted,
-            &mut recs,
-            &mut nrecs,
+            &mut em,
             sink,
             &proof,
             wants_spans,
@@ -1571,9 +1674,7 @@ where
     }
     // Flush any buffered span emissions (BEFORE the caller applies the cold
     // frame, preserving emission order).
-    if nrecs != 0 {
-        sink.on_span_batch(&proof, &recs[..nrecs]);
-    }
+    em.flush(sink, &proof);
     // Commit deferred counters (scan exit — before the caller touches the
     // cold frame, preserving increment order).
     counters.feed_a.packets += pk[0];

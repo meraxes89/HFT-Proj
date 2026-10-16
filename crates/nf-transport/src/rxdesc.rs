@@ -69,6 +69,19 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Number of circulating per-pass array slots (see the module doc).
 pub const RX_NARR: usize = 8;
+
+/// R27c: the RECORD ring depth — decoupled from the array ring
+/// (`RX_NARR`, which sizes the descriptor/tag rows and the 3-bit `aslot`
+/// field). The record ring is 4 KB of padded cursors, so it can afford to
+/// run 64 deep: the R27b fold watermark that guards each record-slot
+/// overwrite then only binds once the sink's window-open lead exceeds 63
+/// windows — outside any 5-second window's reachable lead (the R27c
+/// arithmetic: 830 ms of per-open watermark spins per sustained run
+/// collapse to zero, releasing the Zero-Reset Toroidal Pass to run
+/// copy-free AND wait-free). The array ring stays at 8 (the toroidal
+/// epoch freezes its slot; the rotating regime's reuse gate keeps its
+/// lockstep law, and the memory footprint stays flat).
+pub const REC_RING: usize = 64;
 /// Chunk-state ring geometry: one u64 slot per chunk-grid position
 /// (global chunk id mod 2^15). The slot holds `chunk_id + 1` for an
 /// inline-claimed chunk (0 = none) — the VALUE CHECK makes aliasing
@@ -173,6 +186,26 @@ pub const RX_AFFINE_FLAG: u64 = 1 << 48;
 pub const RX_AFFINE_TAG_WORDS: usize = 3;
 
 const _: () = assert!(RX_AFFINE_TAG_WORDS * 8 + 8 <= 32, "R24 half-cacheline law");
+
+// ── R26: the SoA sidecar re-derivation ─────────────────────────────────────
+//
+// The R24 layout stored the 3 tag words AoS ([t0, t1, t2] per span —
+// 24 B/span interleaved). The worker's steady evaluation needs ONLY t2
+// (the golden value) in release mode; t0/t1 feed the debug-only integrity
+// law and the cold fix path. AoS forces the hot loop to strided 24 B
+// loads (1⅔ lines per 8 spans, 2 of every 3 loaded words discarded) plus
+// the 3-word slice copy in `get_affine_tag`.
+//
+// R26 splits the sidecar SoA at exactly that seam:
+//   * `tagvals[slot][idx]`     — the golden VALUE, 8 B/span: EIGHT
+//     consecutive spans pack ONE 64-byte line (`get_values8` — a single
+//     512-bit load feeding the vertical 8-span group).
+//   * `tagraws[slot][2*idx+1]` — the (t0, t1) pair, 16 B/span: the cold
+//     integrity/fix path only.
+// The [u64; 3] API (set/get_affine_tag, affine_tag_pack) is PRESERVED
+// verbatim — the split is a storage re-derivation, not a protocol change;
+// the sidecar rides the same slot protocol, warm start and fix paths.
+const _: () = assert!(RX_AFFINE_TAG_WORDS == 3, "R26 SoA split assumes the 3-word pack");
 
 /// R23c: one ledger row — the RX producer's per-frame affine snapshot
 /// (the single untimed pass over the blob's packet bodies). The `body_ptr`
@@ -472,30 +505,45 @@ pub fn rx_unpack_u64(w: u64) -> (u64, u64) {
 /// workers know where to split a segment: spans at and above a
 /// pass-start record's base fold into the NEXT pass's chain (the
 /// consumer snapshots and re-seeds there), so a composite record may
-/// never straddle the base. Base spans stay 47-bit-safe (a sustained
-/// run's global span ids are bounded by spans/s × runtime — decades
-/// of headroom; `debug_assert`ed at pack time).
+/// never straddle the base.
 pub const RX_REC_PASS_BIT: u64 = 1 << 47;
-const RX_REC_BASE_MASK: u64 = (1 << 47) - 1;
+const RX_REC_BASE_MASK: u64 = (1 << 44) - 1;
+const RX_REC_SLOT_MASK: u64 = 0x7 << 44;
 
-/// R25a: pack a window record `(gen, base_span, pass_start)`.
+const _: () = assert!(RX_NARR <= 8, "R27 aslot field is 3 bits");
+
+/// R27: pack a window record `(gen, base_span, pass_start, arr_slot)`.
+/// The array-slot field (3 bits) decouples the RECORD ring slot (which
+/// rotates every window — the workers' walk consumes record slots in
+/// order, and a lagging walker must find every window's record) from
+/// the ARRAY slot the window's descriptors live in. In the classic
+/// protocol the two are equal (the array rotates with the record); the
+/// toroidal epoch (R27) freezes the ARRAY slot while the record keeps
+/// rotating — the record is the epoch tag, the array is the invariant
+/// tape. Base spans stay 44-bit-safe (17.6T spans — decades of
+/// sustained headroom; `debug_assert`ed at pack time).
 #[inline(always)]
-pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool) -> u64 {
-    debug_assert!(gen < (1 << 16) && base_span < (1 << 47));
-    (gen << 48) | if pass_start {
-        RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
-    } else {
-        base_span & RX_REC_BASE_MASK
-    }
+pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool, arr_slot: u8) -> u64 {
+    debug_assert!(gen < (1 << 16) && base_span < (1 << 44));
+    debug_assert!((arr_slot as usize) < RX_NARR);
+    (gen << 48)
+        | if pass_start {
+            RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
+        } else {
+            base_span & RX_REC_BASE_MASK
+        }
+        | ((arr_slot as u64) << 44)
 }
 
-/// R25a: unpack a window record — `(gen, base_span, pass_start)`.
+/// R25a/R27: unpack a window record — `(gen, base_span, pass_start,
+/// arr_slot)`.
 #[inline(always)]
-pub fn rx_unpack_record(w: u64) -> (u64, u64, bool) {
+pub fn rx_unpack_record(w: u64) -> (u64, u64, bool, u8) {
     (
         w >> 48,
         w & RX_REC_BASE_MASK,
         w & RX_REC_PASS_BIT != 0,
+        ((w & RX_REC_SLOT_MASK) >> 44) as u8,
     )
 }
 
@@ -511,6 +559,21 @@ pub fn rxdesc_pack_span(offset: u32, len: u16) -> u64 {
 #[inline(always)]
 pub fn rxdesc_unpack_span(w: u64) -> (u32, u16) {
     ((w & 0xFFFF_FFFF) as u32, ((w >> 32) & 0xFFFF) as u16)
+}
+
+/// R28: the packed word's low-48 mask (the (off, len) fields; the count
+/// rides bits 48-63 and never reaches the array).
+pub const RX_PACKED_LOW48: u64 = 0x0000_FFFF_FFFF_FFFF;
+
+/// R28: transform eight packed span words into expected array words —
+/// `expect[g] = ((word & LOW48) + delta) | flag` (the scalar twin of
+/// `check_arr8_packed`'s vector path; bit-identical). The add's low-32
+/// carry is excluded by the standing off-fits-u32 law.
+#[inline(always)]
+fn transform_packed_expect(words: &[u64; 8], delta: u64, flag: u64, expect: &mut [u64; 8]) {
+    for g in 0..8 {
+        expect[g] = ((words[g] & RX_PACKED_LOW48) + delta) | flag;
+    }
 }
 
 /// Cache-line-padded atomic word (no false sharing between the RX, the
@@ -537,12 +600,14 @@ pub struct RxdescState {
     arrays: UnsafeCell<Vec<Box<[u64]>>>,
     cap: usize,
     /// Pass records: `records[i]` = packed `(gen, base_span)` of the
-    /// newest window that used slot i (0 = never used — gen 0 base 0 is
+    /// newest window that used record slot i (0 = never used — gen 0 base 0 is
     /// distinguishable because a real gen-0 window-0 record has base 0
     /// too; the walk matches on generation + monotone base, so a zero
     /// word reads as gen 0/base 0 and is simply a stale/never entry the
-    /// walk's monotone check rejects).
-    records: [RxPad; RX_NARR],
+    /// walk's monotone check rejects). R27c: the ring runs `REC_RING`
+    /// (64) deep — decoupled from the 8-slot array ring so the R27b
+    /// watermark's reuse bound sits far beyond any 5 s window's lead.
+    records: [RxPad; REC_RING],
     /// The publication cursor: packed `(gen, spans_ready)`. Release by
     /// the sink after array fixes; Acquire by workers.
     ready: RxPad,
@@ -567,13 +632,18 @@ pub struct RxdescState {
     chunk_state: UnsafeCell<Box<[u64; RX_CHUNK_CAP as usize]>>,
     /// Prefill fixes applied by sinks (telemetry; Relaxed).
     pub fixes: AtomicU64,
-    /// R23c: the affine tag sidecar — RX_NARR arrays of `cap` spans ×
-    /// [`RX_AFFINE_TAG_WORDS`] words each, riding the SAME slot protocol
-    /// as `arrays` (warm-copied at window open; fixed by the sink's
-    /// check-and-fix cold path; read by workers after the ready
-    /// Acquire). EMPTY (cap-0 rows) when the affine mode is disarmed —
-    /// zero cost on the rollback.
-    tags: UnsafeCell<Vec<Box<[u64]>>>,
+    /// R23c: the affine tag sidecar — RX_NARR arrays of `cap` spans, riding
+    /// the SAME slot protocol as `arrays` (warm-copied at window open;
+    /// fixed by the sink's check-and-fix cold path; read by workers after
+    /// the ready Acquire). EMPTY (cap-0 rows) when the affine mode is
+    /// disarmed — zero cost on the rollback.
+    ///
+    /// R26: the sidecar is SoA — `tagvals` (the golden VALUE word, 8 B/span,
+    /// one 64 B line per 8 spans for the vertical group) and `tagraws` (the
+    /// (t0, t1) integrity pair, 16 B/span, cold-path only). The [u64; 3]
+    /// pack API is assembled/disassembled at the boundary.
+    tagvals: UnsafeCell<Vec<Box<[u64]>>>,
+    tagraws: UnsafeCell<Vec<Box<[u64]>>>,
     /// R23c: the RX producer's affine ledger — one [`AffineLedgerEntry`]
     /// per rendered frame, filled ONCE by the RX thread's single pass
     /// over the blob's packet bodies (untimed; attach-allocated). The
@@ -689,9 +759,11 @@ impl RxdescState {
         // R23c: the tag sidecar rides the array protocol only when the
         // affine mode is armed (the process-wide OnceLock gate — read
         // once HERE, at construction, never inside a window). Disarmed:
-        // empty rows, zero footprint.
-        let tag_cap = if rxdesc_affine_enabled() {
-            cap.saturating_mul(RX_AFFINE_TAG_WORDS)
+        // empty rows, zero footprint. R26: SoA rows (values 8 B/span,
+        // raws 16 B/span).
+        let tag_cap = if rxdesc_affine_enabled() { cap } else { 0 };
+        let raw_cap = if rxdesc_affine_enabled() {
+            cap.saturating_mul(2)
         } else {
             0
         };
@@ -700,8 +772,12 @@ impl RxdescState {
             .map(|_| vec![0u64; cap].into_boxed_slice())
             .collect();
         #[allow(clippy::disallowed_types)]
-        let tags: Vec<Box<[u64]>> = (0..RX_NARR)
+        let tagvals: Vec<Box<[u64]>> = (0..RX_NARR)
             .map(|_| vec![0u64; tag_cap].into_boxed_slice())
+            .collect();
+        #[allow(clippy::disallowed_types)]
+        let tagraws: Vec<Box<[u64]>> = (0..RX_NARR)
+            .map(|_| vec![0u64; raw_cap].into_boxed_slice())
             .collect();
         Self {
             arrays: UnsafeCell::new(arrays),
@@ -719,7 +795,8 @@ impl RxdescState {
                     .unwrap(),
             ),
             fixes: AtomicU64::new(0),
-            tags: UnsafeCell::new(tags),
+            tagvals: UnsafeCell::new(tagvals),
+            tagraws: UnsafeCell::new(tagraws),
             ledger: UnsafeCell::new(Box::new([])),
             ledger_len: AtomicU64::new(0),
         }
@@ -738,31 +815,51 @@ impl RxdescState {
         self.gen.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Derive the next array slot from `last_slot` (the module-doc rule —
-    /// the RX at bake points and the sink at window open MUST use this
-    /// same function on the same read for the lockstep to hold).
+    /// Derive the next RECORD slot from `last_slot` (the module-doc rule —
+    /// the sink at window open MUST use this same function on the same
+    /// read for the ring protocol to hold). R27c: the modulus is
+    /// `REC_RING` (64) — the record ring is decoupled from the array
+    /// ring; the record's `aslot` field carries the window's ARRAY slot.
     #[inline]
     pub fn next_slot(&self) -> u8 {
         let last = self.last_slot.load(Ordering::Relaxed);
         if last == u8::MAX {
             0
         } else {
-            (last + 1) % RX_NARR as u8
+            (last + 1) % REC_RING as u8
         }
+    }
+
+    /// R27: the newest published RECORD slot (u8::MAX = none yet). The
+    /// toroidal epoch reuses the previous window's ARRAY slot while the
+    /// RECORD slot keeps rotating — the sink needs the raw tracker (not
+    /// `next_slot`) to publish the next record on the right ring slot.
+    #[inline]
+    pub fn last_slot_value(&self) -> u8 {
+        self.last_slot.load(Ordering::Relaxed)
     }
 
     /// Publish the window's record (sink, at window open — AFTER the
     /// reuse gate and the warm start): `records[slot] = (gen, base_span,
-    /// pass_start)` and `last_slot = slot`. R25a: `pass_start` marks a
-    /// window opening exactly at a pass boundary — the composite-fold
-    /// workers split their segment there (the consumer snapshots +
-    /// re-seeds the chain at that span, so composites never straddle
-    /// it).
+    /// pass_start, arr_slot)` and `last_slot = slot`. R25a: `pass_start`
+    /// marks a window opening exactly at a pass boundary — the
+    /// composite-fold workers split their segment there (the consumer
+    /// snapshots + re-seeds the chain at that span, so composites never
+    /// straddle it). R27: `arr_slot` is the ARRAY slot the window's
+    /// descriptors live in (== `slot` in the classic protocol; the
+    /// toroidal epoch freezes it while the record ring rotates).
     #[inline]
-    pub fn publish_record(&self, slot: u8, gen: u64, base_span: u64, pass_start: bool) {
+    pub fn publish_record(
+        &self,
+        slot: u8,
+        gen: u64,
+        base_span: u64,
+        pass_start: bool,
+        arr_slot: u8,
+    ) {
         self.records[slot as usize]
             .0
-            .store(rx_pack_record(gen, base_span, pass_start), Ordering::Release);
+            .store(rx_pack_record(gen, base_span, pass_start, arr_slot), Ordering::Release);
         self.last_slot.store(slot, Ordering::Relaxed);
     }
 
@@ -821,10 +918,11 @@ impl RxdescState {
     }
 
     /// Read a pass record (worker, during the record walk) —
-    /// `(gen, base_span, pass_start)` (R25a: the flag is part of the
-    /// walk's boundary bookkeeping).
+    /// `(gen, base_span, pass_start, arr_slot)` (R25a: the flag is part
+    /// of the walk's boundary bookkeeping; R27: the array slot decouples
+    /// the record ring from the descriptor array).
     #[inline]
-    pub fn read_record(&self, slot: u8) -> (u64, u64, bool) {
+    pub fn read_record(&self, slot: u8) -> (u64, u64, bool, u8) {
         rx_unpack_record(self.records[slot as usize].0.load(Ordering::Acquire))
     }
 
@@ -964,6 +1062,79 @@ impl RxdescState {
         }
     }
 
+    /// R28: the FUSED batch-relative check — one vector transform + one
+    /// vector compare per 8 spans replaces the expect[] build + the
+    /// per-span pack arithmetic. `words` are the steady ladder's packed
+    /// span words `(off_batch: u32 | len: u16 | count: u16)`; `delta` is
+    /// the batch-constant `base_ptr − blob_base` (the batch-relative →
+    /// blob-global offset translation) and `flag` the protocol's flag
+    /// half (the count field is masked off, the flag OR'd back in —
+    /// bits 48-63 never reach the array). The expected array word is
+    /// `((word & LOW48) + delta) | flag`: the add's low-32 carry is
+    /// excluded by the standing off-fits-u32 law (debug-asserted at
+    /// pack and here against the first word), so the len field rides
+    /// through untouched. Bit-identical to eight scalar
+    /// `desc8_pack_span(off, len) | flag` compares.
+    ///
+    /// Callers prove `idx + 8 <= cap` (asserted) and the group stays
+    /// inside one chunk.
+    pub fn check_arr8_packed(
+        &self,
+        slot: u8,
+        idx: usize,
+        words: &[u64; 8],
+        delta: u64,
+        flag: u64,
+    ) -> u8 {
+        debug_assert!(delta <= u32::MAX as u64, "R28 delta overflows u32");
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 64 bytes readable at `words`
+                // (a &[u64;8]) and at the array row (idx+8<=cap asserted
+                // below); the array row access follows check_arr8's
+                // slot-ownership protocol.
+                unsafe {
+                    assert!(
+                        idx + 8 <= self.cap,
+                        "rxdesc: array slot {slot} index {idx}+8 exceeds cap {}",
+                        self.cap
+                    );
+                    let arrays = &*self.arrays.get();
+                    let a = _mm512_loadu_si512(
+                        arrays[slot as usize].as_ptr().add(idx) as *const _,
+                    );
+                    let w = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    // (word & LOW48) + delta | flag — the count bits drop,
+                    // the len field rides the add, the flag ORs in.
+                    let low48 = _mm512_set1_epi64(0x0000_FFFF_FFFF_FFFF_u64 as i64);
+                    let d = _mm512_set1_epi64(delta as i64);
+                    let f = _mm512_set1_epi64(flag as i64);
+                    let expect = _mm512_or_si512(
+                        _mm512_add_epi64(_mm512_and_si512(w, low48), d),
+                        f,
+                    );
+                    // Equality is sign-agnostic — epi64 is the AVX-512F
+                    // u64 compare; the mask's bit i is set iff lane i is
+                    // equal. Invert for the mismatch mask.
+                    let eq = _mm512_cmpeq_epi64_mask(a, expect);
+                    !eq
+                }
+            } else {
+                let mut expect = [0u64; 8];
+                transform_packed_expect(words, delta, flag, &mut expect);
+                self.check_arr8(slot, idx, &expect)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut expect = [0u64; 8];
+            transform_packed_expect(words, delta, flag, &mut expect);
+            self.check_arr8(slot, idx, &expect)
+        }
+    }
+
     /// Mark a chunk inline-claimed (sink, BEFORE the exposing
     /// `spans_ready` store). The slot stores `chunk_id + 1` — the value
     /// IS the claim's identity, so a stale mark can never alias.
@@ -1017,8 +1188,9 @@ impl RxdescState {
         rxdesc_affine_enabled()
     }
 
-    /// R23c: write one span's tag (the sink's fix path; the same slot
-    /// ownership protocol as `set_arr`).
+    /// R23c/R26: write one span's tag (the sink's fix path; the same slot
+    /// ownership protocol as `set_arr`). The [u64; 3] pack splits into the
+    /// SoA rows: vals[idx] = t2, raws[2i] = t0, raws[2i+1] = t1.
     #[inline(always)]
     pub fn set_affine_tag(&self, slot: u8, idx: usize, w: &[u64; RX_AFFINE_TAG_WORDS]) {
         debug_assert!((slot as usize) < RX_NARR);
@@ -1031,14 +1203,20 @@ impl RxdescState {
         // SAFETY: slot ownership per the module doc; disjoint access at
         // any instant (RX s+1 / sink s / workers ≤ s).
         unsafe {
-            let tags = &mut *self.tags.get();
-            let base = idx * RX_AFFINE_TAG_WORDS;
-            tags[slot as usize][base..base + RX_AFFINE_TAG_WORDS]
-                .copy_from_slice(w);
+            let vals = &mut *self.tagvals.get();
+            let raws = &mut *self.tagraws.get();
+            if vals.is_empty() || vals[slot as usize].is_empty() {
+                return; // disarmed: the sidecar was never allocated
+            }
+            vals[slot as usize][idx] = w[2];
+            raws[slot as usize][idx * 2] = w[0];
+            raws[slot as usize][idx * 2 + 1] = w[1];
         }
     }
 
-    /// R23c: read one span's tag (workers, after the ready Acquire).
+    /// R23c/R26: read one span's tag (the debug integrity law and the
+    /// parity tests; workers after the ready Acquire) — assembled from
+    /// the SoA rows (the inverse of `set_affine_tag`).
     #[inline(always)]
     pub fn get_affine_tag(&self, slot: u8, idx: usize) -> [u64; RX_AFFINE_TAG_WORDS] {
         debug_assert!((slot as usize) < RX_NARR && idx < self.cap);
@@ -1046,21 +1224,111 @@ impl RxdescState {
         // SAFETY: the entry was published by the sink's ready store (the
         // caller Acquired it); read-only here.
         unsafe {
-            let tags = &*self.tags.get();
-            let base = idx * RX_AFFINE_TAG_WORDS;
-            out.copy_from_slice(
-                &tags[slot as usize][base..base + RX_AFFINE_TAG_WORDS],
-            );
+            let vals = &*self.tagvals.get();
+            let raws = &*self.tagraws.get();
+            if vals.is_empty() || vals[slot as usize].is_empty() {
+                return out; // disarmed
+            }
+            out[0] = raws[slot as usize][idx * 2];
+            out[1] = raws[slot as usize][idx * 2 + 1];
+            out[2] = vals[slot as usize][idx];
         }
         out
     }
 
-    /// R23c: the WARM-START twin for the tag sidecar — copy `n` spans'
+    /// R26: read one span's golden VALUE — the hot-path twin of
+    /// `get_affine_tag` for the worker's steady evaluation (ONE 8-byte
+    /// load from the SoA values row; the (t0, t1) integrity pair is
+    /// debug-cold-path only). Callers prove the entry is published
+    /// (the ready Acquire) and the word's [`RX_AFFINE_FLAG`] is set.
+    #[inline(always)]
+    pub fn get_affine_value(&self, slot: u8, idx: usize) -> u64 {
+        debug_assert!((slot as usize) < RX_NARR && idx < self.cap);
+        // SAFETY: read-only after the ready Acquire; the row exists iff
+        // the sidecar is armed (the pack path checked).
+        unsafe {
+            let vals = &*self.tagvals.get();
+            vals[slot as usize][idx]
+        }
+    }
+
+    /// R26: load EIGHT consecutive spans' golden values — ONE 64-byte
+    /// line of the SoA values row (the vertical 8-span group's whole
+    /// tag traffic). AVX-512F wide load when present, eight scalar
+    /// loads otherwise (bit-identical). Callers prove `idx + 8 <= cap`
+    /// and every word's [`RX_AFFINE_FLAG`] is set.
+    pub fn get_values8(&self, slot: u8, idx: usize) -> [u64; 8] {
+        debug_assert!((slot as usize) < RX_NARR);
+        assert!(
+            idx + 8 <= self.cap,
+            "rxdesc: values slot {slot} index {idx}+8 exceeds cap {}",
+            self.cap
+        );
+        // SAFETY: the entries were published by the sink's ready store
+        // (the caller Acquired it); `idx+8 <= cap` proven above; the row
+        // exists iff the sidecar is armed.
+        let words: &[u64; 8] = unsafe {
+            let vals = &*self.tagvals.get();
+            &*(vals[slot as usize].as_ptr().add(idx) as *const [u64; 8])
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 64 bytes readable at `words`
+                // (idx+8 <= cap, the row is cap words).
+                unsafe {
+                    let v = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let mut out = [0u64; 8];
+                    _mm512_storeu_si512(out.as_mut_ptr() as *mut _, v);
+                    return out;
+                }
+            }
+        }
+        *words
+    }
+
+    /// R26: load EIGHT consecutive array words — ONE 64-byte line of the
+    /// descriptor row (the vertical group's flag sweep: one AND-reduce
+    /// tests all eight [`RX_AFFINE_FLAG`] bits). AVX-512F wide load when
+    /// present; callers prove `idx + 8 <= cap` (mirrors `check_arr8`'s
+    /// read contract — the group is exactly eight words).
+    pub fn get_arr8(&self, slot: u8, idx: usize) -> [u64; 8] {
+        debug_assert!((slot as usize) < RX_NARR);
+        assert!(
+            idx + 8 <= self.cap,
+            "rxdesc: array slot {slot} index {idx}+8 exceeds cap {}",
+            self.cap
+        );
+        // SAFETY: `idx+8 <= cap` proven above; the group is one u64-slice
+        // view of the published row.
+        let words: &[u64; 8] = unsafe {
+            let arrays = &*self.arrays.get();
+            &*(arrays[slot as usize].as_ptr().add(idx) as *const [u64; 8])
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if r25c_avx512f() {
+                use std::arch::x86_64::*;
+                // SAFETY: AVX-512F detected; 64 bytes readable.
+                unsafe {
+                    let v = _mm512_loadu_si512(words.as_ptr() as *const _);
+                    let mut out = [0u64; 8];
+                    _mm512_storeu_si512(out.as_mut_ptr() as *mut _, v);
+                    return out;
+                }
+            }
+        }
+        *words
+    }
+
+    /// R23c/R26: the WARM-START twin for the tag sidecar — copy `n` spans'
     /// tags from slot `from` to slot `to` (the sink, at window open,
     /// right after `copy_arr`; the same NT-copy law when the phases
-    /// match). No-op when the sidecar is disarmed (the slots are empty
-    /// zero-capacity allocations with dangling bases — the length check
-    /// MUST gate before any pointer math).
+    /// match). No-op when the sidecar is disarmed (the rows are empty
+    /// zero-capacity allocations — the length check MUST gate before any
+    /// pointer math). R26: both SoA rows copy (values 8 B/span — the NT
+    /// streaming law; raws 16 B/span).
     pub fn copy_tags(&self, from: u8, to: u8, n: usize) {
         let n = n.min(self.cap);
         if n == 0 || from == to {
@@ -1070,14 +1338,25 @@ impl RxdescState {
         // holds the previous window's published, immutable entries — the
         // same protocol as copy_arr.
         unsafe {
-            let tags = &mut *self.tags.get();
-            if tags.is_empty() || tags[0].is_empty() {
+            let vals = &mut *self.tagvals.get();
+            if vals.is_empty() || vals[0].is_empty() {
                 return; // disarmed: the sidecar was never allocated
             }
-            let words = n * RX_AFFINE_TAG_WORDS;
-            let src = tags[from as usize].as_ptr();
-            let dst = tags[to as usize].as_mut_ptr();
-            std::ptr::copy_nonoverlapping(src, dst, words);
+            let raws = &mut *self.tagraws.get();
+            let vsrc = vals[from as usize].as_ptr();
+            let vdst = vals[to as usize].as_mut_ptr();
+            if nt_copy_enabled() && (vsrc as usize) % 64 == (vdst as usize) % 64 {
+                nt_copy_u64(vsrc, vdst, n);
+            } else {
+                std::ptr::copy_nonoverlapping(vsrc, vdst, n);
+            }
+            let rsrc = raws[from as usize].as_ptr();
+            let rdst = raws[to as usize].as_mut_ptr();
+            if nt_copy_enabled() && (rsrc as usize) % 64 == (rdst as usize) % 64 {
+                nt_copy_u64(rsrc, rdst, n * 2);
+            } else {
+                std::ptr::copy_nonoverlapping(rsrc, rdst, n * 2);
+            }
         }
     }
 

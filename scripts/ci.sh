@@ -460,6 +460,128 @@ grep -q "allocs=0" /tmp/bench_bs_off.txt
 grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_bs_off.txt
 grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_bs_off.txt | head -1
 
+echo "=== 11g. R26: Worker 8-Span Vertical Group ROLLBACK (attribution) ==="
+# THE R26 SHIP (docs/41): the workers ran at ~52 GB/s each against the
+# 151 GB/s single-core kernel peak — ~2/3 of the walk's cycles were the
+# per-span record-walk tax (the AoS tag fetch's 3-word copy where 1
+# word suffices, the per-span flag branch, the per-span LOCK RMW on
+# affine_hits, the spray's dead walk over all-tagged spans). R26: the
+# SoA sidecar (tagvals 8 B/span — one 64 B line per 8 spans) + the
+# vertical 8-span group (one 64 B arr load, one 64 B values load, the
+# counter RMW batched 8x) + the spray auto-mute in the all-tagged
+# steady regime. THIS arm is the rollback: the pre-R26 per-span walk
+# verbatim (HFT_WORKER_GROUP=0's semantics on the armed rxdesc
+# stack). Same-draw delta 11ab - 11g = the worker-side group's
+# contribution (the t_r26_worker_group_parity differential pins the
+# tuples bit-exact and the fix counts identical).
+HFT_RXDESC=1 HFT_WORKER_GROUP=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_wg_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_wg_off.txt
+grep -q "allocs=0" /tmp/bench_wg_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_wg_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_wg_off.txt | head -1
+
+echo "=== 11t. R27: Zero-Reset Toroidal Pass ROLLBACK (attribution) ==="
+# THE R27 SHIP (docs/41): reset_ms=833.8ms across 37,244 passes (17% of
+# wall) was the pass boundary's bulk warm copies (the arr row + the tag
+# sidecar, ~320 KB per window). R27: the steady epoch — a window that
+# verifies fix-free at the expected span count PROVES the array slot's
+# content is window-invariant, so the next window reuses the slot with
+# ZERO copies (the record ring keeps rotating with the epoch-tagged
+# aslot field; divergence disarms to the rotating regime; toroidal
+# fixes carry the per-fix lagging-reader guard). THIS arm is the
+# rollback: the rotate-and-copy window open verbatim
+# (HFT_TOROIDAL=0's semantics). Same-draw delta 11ab - 11t = the
+# toroidal elision's contribution (the t_r27_toroidal_multipass_parity
+# differential pins the tuples bit-exact in both regimes).
+HFT_RXDESC=1 HFT_TOROIDAL=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_tor_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_tor_off.txt
+grep -q "allocs=0" /tmp/bench_tor_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_tor_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_tor_off.txt | head -1
+
+echo "=== 11p. R28: Fused Packed Ladder-Commit ROLLBACK (attribution) ==="
+# THE R28 SHIP (docs/41): the main core's ~48c/span included the
+# SpanRec materialization tax (the 48 B struct store at discovery, the
+# L1D reload, the per-span (off, len) arithmetic into expect[], the
+# 512-bit load inside check_arr8). R28: the steady ladder packs each
+# span's (off, len, count) into ONE 64-bit word at discovery
+# (batch-relative) and the commit's expected words emerge from ONE
+# vector AND+ADD+OR per 8 spans fused into the compare
+# (check_arr8_packed — the count field masked, the flag OR'd, the
+# batch-constant delta added). THIS arm is the rollback: the SpanRec
+# emission verbatim (HFT_PACKED_EMISSION=0's semantics). Same-draw
+# delta 11ab - 11p = the fused commit's contribution (the
+# t_r28_packed_ladder_commit_parity differential pins the tuples
+# bit-exact and the fix counts identical).
+HFT_RXDESC=1 HFT_PACKED_EMISSION=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_pk_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_pk_off.txt
+grep -q "allocs=0" /tmp/bench_pk_off.txt
+grep -q "PR1_R23_AFFINE_SUSTAINED_VERDICT rate=" /tmp/bench_pk_off.txt
+grep "PR1_R23_AFFINE_SUSTAINED_VERDICT" /tmp/bench_pk_off.txt | head -1
+
+echo "=== 11ss. R29: the ZERO-THREAD INGEST rollback (HFT_SELF_SERVE=0 attribution) ==="
+# ── 11ss. R29: the ZERO-THREAD INGEST rollback (attribution) ────────────
+# The self-serve pre-publish arms when the toroidal epoch reaches the
+# deep-steady threshold (two clean windows at the same count — the R27c
+# hole-free law): the window's open publishes the WHOLE span range
+# (spans_ready = base + count0), the workers self-serve from the frozen
+# array, and the main core's scan walks the sequencer ladder only (the
+# commit path — chunk-open assists, the vector check, the publish
+# cadence — deleted). THE SUBMISSION FUNNEL (the 4.3B decode ceiling)
+# LEAVES the main core. THIS arm is the rollback: the full submission
+# cadence verbatim (HFT_SELF_SERVE=0's semantics). Same-draw delta
+# 11ab - 11s = the zero-thread ingest's contribution. The engagement
+# telemetry rides the R16B line (selfserve= — 0 on this arm, the
+# sustained window count on the default). The t_r29_selfserve_parity
+# cell pins the comp x ss law cells bit-exact.
+HFT_RXDESC=1 HFT_SELF_SERVE=0 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_ss_off.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_ss_off.txt
+grep -q "allocs=0" /tmp/bench_ss_off.txt
+grep -q "selfserve=0 " /tmp/bench_ss_off.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_ss_off.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_ss_off.txt | head -1
+
+echo "=== 11rx. R31 candidate: the RX PASS-SUPPLY stack (HFT_PREPATCH_BUDGET=1024 attribution) ==="
+# ── 11rx. R31 candidate: the RX PASS-SUPPLY stack (attribution) ─────────
+# The R29 draw's own telemetry: the self-serve arm doubled the pass
+# cadence (passes 41.8K vs 16.5K) and the wall MOVED — reset_ms 1502 ms
+# (30% of the wall), the ADVANCE_DIAGNOSTIC's us_per_advance 35.8 (4.4x
+# the rollback's 8.1). The decomposition: the per-publication prepatch
+# budget (64, the R9c constant tuned for the CLASSIC render path's
+# ~24us publication period) drains only ~1.4K of the ~22K patchable
+# session sites per pass; the advance's synchronous tail patches the
+# remaining ~20.6K (~35.8us) ON the consumer's reset critical path. The
+# F-5 measurement: at budget 1024 the ~22 publications/pass absorb the
+# FULL patchable set during the pass and the advance tail EMPTIES. THIS
+# arm prices the flip on the R29 stack (same-draw delta 11ab - 11rx;
+# the advance_ms/us_per_advance lines carry the mechanism's proof).
+HFT_RXDESC=1 HFT_PREPATCH_BUDGET=1024 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_rxsup.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_rxsup.txt
+grep -q "allocs=0" /tmp/bench_rxsup.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_rxsup.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_rxsup.txt | head -1
+grep "DIAG rx sustained" /tmp/bench_rxsup.txt | tail -1
+grep "ADVANCE_DIAGNOSTIC sustained" /tmp/bench_rxsup.txt | tail -1
+grep "R16B_RXDESC_VERDICT" /tmp/bench_rxsup.txt | tail -1
+
+echo "=== 11vl. R31 candidate: the RX-supply stack + the VECTOR LADDER (HFT_VEC_LADDER=1 attribution) ==="
+# ── 11vl. R31 candidate: the RX-supply stack + the VECTOR LADDER ────────
+# The R12 verdict priced the 8-entry SoA consumer group at -2..-3.6%
+# (decode-bound: the group body bloated the scan loop past the uop
+# cache) — measured on the PRE-R29 consumer. The R29 SS skip DELETED
+# the commit path from the steady batches; the scan's uop budget
+# changed shape, so the group path is priceable again. THIS arm: the
+# 11rx stack + HFT_VEC_LADDER=1 (the consumer group + the RX-side elig
+# compute). Same-draw delta 11rx - 11vl = the ladder's contribution on
+# the post-R29 consumer.
+HFT_RXDESC=1 HFT_PREPATCH_BUDGET=1024 HFT_VEC_LADDER=1 cargo run --release -p nf-engine --bin bench -- --hydra-only | tee /tmp/bench_vl.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_vl.txt
+grep -q "allocs=0" /tmp/bench_vl.txt
+grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_vl.txt
+grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_vl.txt | head -1
+grep "LADDER_DIAGNOSTIC" /tmp/bench_vl.txt | tail -1
+grep "R16B_RXDESC_VERDICT" /tmp/bench_vl.txt | tail -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median
