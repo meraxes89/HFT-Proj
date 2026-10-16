@@ -598,6 +598,8 @@ fn run_hydra_sustained_5s(
     let mut pass: u64 = 1;
     let mut diag = true; // one summary line per 5s run — the phase split is first-class R8 telemetry
     let mut d_reset_ns: u64 = 0;
+    let mut d_boundary_wait_ns: u64 = 0;
+    let mut d_boundary_open_ns: u64 = 0;
     let mut d_scan_ns: u64 = 0;
     let mut d_end_ns: u64 = 0;
     let mut d_pending_max: u64 = 0;
@@ -631,10 +633,16 @@ fn run_hydra_sustained_5s(
 
         let t_r = std::time::Instant::now();
         transport.reset_pass(pass, sess);
+        let t_r1 = std::time::Instant::now();
         *seq = Sequencer::new_unboxed();
         sink.begin_pass();
         pass_replay.begin_pass();
         let t_r2 = std::time::Instant::now();
+        // R35 (probe): the boundary attribution — the transport re-arm
+        // wait vs the sink's pass-open work. Off the steady path by one
+        // Instant pair per pass (~40ns; the RXSCHED_DIAGNOSTIC pattern).
+        d_boundary_wait_ns += t_r1.duration_since(t_r).as_nanos() as u64;
+        d_boundary_open_ns += t_r2.duration_since(t_r1).as_nanos() as u64;
 
         // Fold drain every batch: keeps the result rings shallow and the
         // ordered fold close behind submission (the overlap's slack is the
@@ -730,6 +738,24 @@ fn run_hydra_sustained_5s(
             rp_rerecords,
             body_bytes_per_msg,
             sustained_rate as f64 * body_bytes_per_msg / 1e9
+        );
+        // R35: the boundary attribution — the transport re-arm wait vs
+        // the sink pass-open work (the reset wall's split; the probe
+        // Instant pair adds ~40ns/pass, inside the diag noise floor).
+        eprintln!(
+            "BOUNDARY_DIAGNOSTIC sustained: reset_wait_ms={:.1} pass_open_ms={:.1} per_pass_reset_wait_ns={:.0} per_pass_open_ns={:.0}",
+            d_boundary_wait_ns as f64 / 1e6,
+            d_boundary_open_ns as f64 / 1e6,
+            if d_passes > 0 {
+                d_boundary_wait_ns / d_passes
+            } else {
+                0
+            },
+            if d_passes > 0 {
+                d_boundary_open_ns / d_passes
+            } else {
+                0
+            },
         );
     }
     // R8 phase-2: fabric + pipeline telemetry (always on — the per-run
@@ -833,6 +859,29 @@ fn run_hydra_sustained_5s(
             per_pub_ns,
             polls
         );
+        // R35-A: the boundary-collapse verdict — the engagement law
+        // (prearm_passes == advances) + the reset wall's split. The
+        // R33 record draw's baseline: reset_ms=2157.9 (43.2% of the
+        // 5s window), reset_wait ≈ 11.9µs/pass — the marker-free ->
+        // wake -> advance -> wake round trip.
+        {
+            let (armed, prearm_passes, gate_ns) = transport.rx_prearm_stats();
+            let per_pass_reset_ns = if d_passes > 0 {
+                d_boundary_wait_ns / d_passes
+            } else {
+                0
+            };
+            println!(
+                "PR1_R35_PREARM_VERDICT rate={} armed={} prearm_passes={} reset_ms={:.1} reset_wait_ms={:.1} per_pass_reset_wait_ns={:.0} gate_ms={:.2} (R35-A: the marker-decoupled advance — the bake at the EOS-marker's landing + the bounded pre-arm gate; the R33 baseline: reset_ms=2157.9 reset_wait=11900ns/pass, docs/46)",
+                sustained_rate,
+                armed,
+                prearm_passes,
+                d_reset_ns as f64 / 1e6,
+                d_boundary_wait_ns as f64 / 1e6,
+                per_pass_reset_ns,
+                gate_ns as f64 / 1e6,
+            );
+        }
     }
     // R33-D: the fabric topology report — one L3 domain across main/RX/
     // workers (the sysfs truth, never the placement's intentions).

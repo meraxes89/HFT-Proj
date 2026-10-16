@@ -807,7 +807,8 @@ fn t_i7_prepatch_chaos_sustained_soak() {
         16,
         false,
         false, // R33-A: off — the patch-law soak is not the frozen-master regime
-    );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
 
     // Deterministic LCG chaos — reproducible failure modes, no RNG dep.
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -942,7 +943,8 @@ fn t_f1_rxwarm_chaos_sustained_soak() {
         16,
         false,
         false, // R33-A: off — the patch-law soak is not the frozen-master regime
-    );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).
     let mut rng: u64 = 0x0123_4567_89AB_CDEF;
@@ -1084,7 +1086,8 @@ fn t_f2_rxbuild_chaos_sustained_soak() {
         16,
         false,
         false, // R33-A: off — the patch-law soak is not the frozen-master regime
-    );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).
     let mut rng: u64 = 0x0123_4567_89AB_CDEF;

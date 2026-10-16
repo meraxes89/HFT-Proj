@@ -1500,6 +1500,24 @@ impl RxdescState {
         self.ledger_len.store(len as u64, Ordering::Release);
     }
 
+    /// R35-B (docs/46): the bake's input view — the published ledger
+    /// rows in stream order (the worker-side Phase-R bake reads the
+    /// frame bodies through the row pointers; the ledger is
+    /// construction-published once by the RX's fill, and the rows are
+    /// read-only from the publish on). An empty slice = the fill has
+    /// not landed yet (the worker defers its bake).
+    pub fn ledger_rows(&self) -> &[AffineLedgerEntry] {
+        let n = self.ledger_len.load(Ordering::Acquire) as usize;
+        if n == 0 {
+            return &[];
+        }
+        // SAFETY: rows [0, n) were fully written before the ledger_len
+        // Release (the fill's own contract, `ledger_set`'s doc); the
+        // backing Box<[AffineLedgerEntry]> is pinned for the process's
+        // life; read-only from the publish on.
+        unsafe { &(*self.ledger.get()).as_ref()[..n] }
+    }
+
     /// R23c: the sink's ledger lookup — the monotone body-pointer cursor
     /// (spans arrive in frame order in the steady path, so the forward
     /// scan is O(1) amortized; duplicate deliveries re-hit the same row
