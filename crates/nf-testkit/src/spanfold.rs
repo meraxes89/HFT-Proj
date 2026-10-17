@@ -1074,7 +1074,7 @@ mod tests {
         assert_eq!(v_pd, tp[19] ^ tp[1]);
         // The 512-length variant: two permutations of the same multiset.
         let mut rng = Xs(0x5EED_C0DE_3636_0003);
-        let mut a = vec![5u8; 256].into_iter().chain(vec![7u8; 256]).collect::<Vec<_>>();
+        let a: Vec<u8> = vec![5u8; 256].into_iter().chain(vec![7u8; 256]).collect();
         let mut b = a.clone();
         // Fisher-Yates with the cell PRNG.
         for i in (1..b.len()).rev() {
