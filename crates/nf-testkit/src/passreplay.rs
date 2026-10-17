@@ -170,6 +170,20 @@ pub struct PassReplay {
     live_batches: u64,
     replayed_passes: u64,
     re_records: u64,
+    /// R36-E: the call-fusion arm (`HFT_CALL_FUSION` — default ON; read
+    /// once at construction, outside every measured window).
+    fusion: bool,
+    /// R36-E: the count of packed calls absorbed into their predecessor
+    /// (the main-side re-issue work elided).
+    fused_calls: u64,
+    /// R36-E: the pass bracket's fusion barrier — the first packed call
+    /// of each pass NEVER fuses into the previous pass's last call (the
+    /// emission-order law: calls re-issue strictly inside the live
+    /// begin/end brackets; a cross-pass fusion would submit the next
+    /// pass's spans before its begin_pass opens the window/record —
+    /// the boundary record would never carry the pass-start flag and
+    /// the workers' phase machine would stall).
+    fusion_barrier: bool,
 }
 
 impl Default for PassReplay {
@@ -207,7 +221,82 @@ impl PassReplay {
             live_batches: 0,
             replayed_passes: 0,
             re_records: 0,
+            fusion: std::env::var("HFT_CALL_FUSION").as_deref() != Ok("0"),
+            fused_calls: 0,
+            fusion_barrier: true,
         }
+    }
+
+    /// R36-E: THE CALL FUSION — try to absorb a packed call into its
+    /// recorded predecessor. TRUE means the ledger was extended in place
+    /// (no new call pushed; the words are REBASED onto the predecessor's
+    /// base and appended contiguously onto its tail). The guard chain:
+    /// same generation, the contiguous span sequence
+    /// (`first == prev.first + prev.total`), the predecessor's words at
+    /// the ledger's tail, the successor's base ahead of the
+    /// predecessor's within one u32, and the capacity law. The base
+    /// changes per emitter flush (each flush's first body pointer), so
+    /// the fusion rebases the successor's offsets — a ONE-TIME recording
+    /// cost; the replay then re-issues ONE call whose words are exact
+    /// against the fused base (both sink paths stay correct: the
+    /// self-serve counting branch never reads the words, the classic
+    /// check path reads the rebased offsets — identical to the unfused
+    /// sequence's semantics).
+    fn try_fuse_packed(
+        &mut self,
+        gen: u64,
+        first: u64,
+        total: u64,
+        base: usize,
+        words: &[u64],
+    ) -> bool {
+        if !self.fusion || self.words.len() + words.len() > MAX_WORDS {
+            return false;
+        }
+        // The pass bracket's barrier: the pass's first call starts a
+        // fresh script (never fuses into the previous pass's tail).
+        if self.fusion_barrier {
+            self.fusion_barrier = false;
+            return false;
+        }
+        let Some(Call::Packed {
+            gen: pgen,
+            first: pfirst,
+            total: ptotal,
+            base: pbase,
+            w_lo: pw_lo,
+            n: pn,
+        }) = self.calls.last()
+        else {
+            return false;
+        };
+        if *pgen != gen
+            || *pfirst + *ptotal != first
+            || (*pw_lo as usize + *pn as usize != self.words.len())
+            || base < *pbase
+            || (base - *pbase) > u32::MAX as usize
+        {
+            return false;
+        }
+        // FUSE: rebase the successor's words onto the predecessor's base
+        // (the blob advance is a plain add on the low-32 offset field;
+        // the len/count fields ride untouched — the carry law is the
+        // batch's own u32 offset budget, asserted at the sink).
+        let delta = (base - *pbase) as u64;
+        self.words
+            .extend(words.iter().map(|w| w.wrapping_add(delta)));
+        let last = self.calls.last_mut().expect("checked above");
+        if let Call::Packed {
+            total: ptotal,
+            n: pn,
+            ..
+        } = last
+        {
+            *ptotal += total;
+            *pn += words.len() as u32;
+        }
+        self.fused_calls += 1;
+        true
     }
 
     /// The env arm's state (the rollback telemetry).
@@ -226,6 +315,13 @@ impl PassReplay {
         )
     }
 
+    /// R36-E: the call-fusion telemetry — the count of packed calls
+    /// absorbed into their predecessors (the main-side re-issue work
+    /// elided). The verdict line's engagement instrument.
+    pub fn fused_calls(&self) -> u64 {
+        self.fused_calls
+    }
+
     /// Whether the ledger is live and armed for this transport (the
     /// regime gate + env + poison). The harness consults this once per
     /// run; `try_replay` re-checks cheaply per batch.
@@ -240,6 +336,21 @@ impl PassReplay {
         self.pass_batch_idx = 0;
         self.pass_live = 0;
         self.recording = None;
+        // R36-E: the bracket barrier — this pass's calls may not fuse
+        // into the previous pass's tail (the emission-order law 4).
+        self.fusion_barrier = true;
+    }
+
+    /// R36-E: the batch barrier's twin — a transport batch's first
+    /// recorded call starts a fresh script too. The fusion is an
+    /// INTRA-BATCH lever: the emitter's per-32-span flushes within one
+    /// batch merge; the batch boundary restores the per-batch call
+    /// script (the harness's per-batch work/guard rhythm and the
+    /// window-open cadence ride the batch edges — keeping the fused
+    /// surface strictly inside one batch's bracket keeps every
+    /// downstream law structural).
+    fn begin_batch_barrier(&mut self) {
+        self.fusion_barrier = true;
     }
 
     /// Try to replay batch `pass_batch_idx` from the template. TRUE ⇒
@@ -315,6 +426,9 @@ impl PassReplay {
         if !self.enabled || self.poison {
             return;
         }
+        // R36-E: the batch bracket — the batch's first call starts a
+        // fresh script (the fusion is an intra-batch lever).
+        self.begin_batch_barrier();
         // The version latches with the FIRST recorded batch of the
         // template (the re-record path clears the template first, so
         // this is the new regime's version).
@@ -598,16 +712,37 @@ impl<S: Sink> Sink for Recorder<'_, S> {
             {
                 self.ledger.poison = true;
             } else {
-                let w_lo = self.ledger.words.len() as u32;
-                self.ledger.words.extend_from_slice(words);
-                self.ledger.push_call(Call::Packed {
-                    gen: proof.gen(),
-                    first: first_seq,
+                // R36-E: THE CALL FUSION — consecutive packed calls of the
+                // same transport batch (the same gen/blob base, contiguous
+                // span sequence, the previous words at the ledger's tail)
+                // merge into ONE call. The ladder's emitter flushes at 32
+                // spans, so ONE pass's surface is ~344 calls × ~31 ns of
+                // replay dispatch — fusing them collapses the main side's
+                // re-issue to ~22 fused calls per pass (the sink's
+                // self-serve counting branch is granularity-invariant:
+                // the counters, the chunk-grid cadence, and the window
+                // opens are identical for any split of the same span
+                // run). HFT_CALL_FUSION=0 restores the verbatim
+                // per-flush calls (the attribution arm).
+                let fused = self.ledger.try_fuse_packed(
+                    proof.gen(),
+                    first_seq,
                     total,
-                    base: base_ptr,
-                    w_lo,
-                    n: words.len() as u32,
-                });
+                    base_ptr,
+                    words,
+                );
+                if !fused {
+                    let w_lo = self.ledger.words.len() as u32;
+                    self.ledger.words.extend_from_slice(words);
+                    self.ledger.push_call(Call::Packed {
+                        gen: proof.gen(),
+                        first: first_seq,
+                        total,
+                        base: base_ptr,
+                        w_lo,
+                        n: words.len() as u32,
+                    });
+                }
             }
         }
         self.inner

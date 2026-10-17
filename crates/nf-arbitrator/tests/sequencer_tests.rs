@@ -724,3 +724,131 @@ fn test_r3_span_hb_eos() {
     assert_eq!(seq_c.watermark(), seq_s.watermark());
     assert_eq!(seq_c.state(), seq_s.state());
 }
+
+/// R36-B (docs/solution1.md §3 — boundary transparency): THE RE-ANCHOR
+/// DIFFERENTIAL. `reanchor()` (the O(1) pass re-anchor: 1 KiB presence
+/// bitmap, the 64 KiB arena left stale under the write-before-read law)
+/// must be observably identical to a fresh `Sequencer::new_unboxed()`
+/// across multi-pass adversarial streams — in-order drains, out-of-order
+/// staging (arena slots written then unstuck), window-ring wraps, gaps,
+/// heartbeats, and session re-adoption. The stale-arena leak (a lens not
+/// cleared) would surface as divergent msgs/events on the pass AFTER the
+/// one that staged.
+#[test]
+fn test_r36_reanchor_differential() {
+    let sess_a = b"REANCHOR01";
+    let sess_b = b"REANCHOR02";
+    // The per-pass frame programs (adversarial shapes; each pass
+    // re-anchors w=0 so the seq offsets restart):
+    let programs: Vec<Vec<Vec<u8>>> = vec![
+        // Pass 1: plain in-order.
+        vec![make_frame(sess_a, 1, 8)],
+        // Pass 2: out-of-order — the anchor frame drains first, the far
+        // block STAGES (arena slots at ring offsets 100..103), then the
+        // fill frame drains through and unsticks the staged block.
+        vec![
+            make_frame(sess_a, 1, 4),
+            make_frame(sess_a, 101, 4),
+            make_frame(sess_a, 5, 96),
+        ],
+        // Pass 3: a gap + heartbeat + the fill.
+        vec![
+            make_frame(sess_a, 1, 3),
+            make_frame(sess_a, 7, 3), // 4..6 missing -> staged
+            make_hb_frame(sess_a, 10),
+            make_frame(sess_a, 4, 3),
+        ],
+        // Pass 4: window-ring wrap — offsets beyond 1024 wrap the slots.
+        vec![
+            make_frame(sess_a, 1, 1),
+            make_frame(sess_a, 1025, 6),
+            make_frame(sess_a, 2, 1023),
+        ],
+        // Pass 5: session re-adoption (the boundary + template refresh).
+        vec![
+            make_frame(sess_b, 1, 5),
+            make_frame(sess_b, 6, 5),
+        ],
+        // Pass 6: EOS shape.
+        vec![
+            make_frame(sess_a, 1, 6),
+            make_eos_frame(sess_a, 7),
+        ],
+    ];
+    // Run A: fresh construction per pass (the reference).
+    let mut run_a: Vec<Vec<(u64, Vec<u8>, u64)>> = Vec::new();
+    let mut events_a: Vec<Vec<Event>> = Vec::new();
+    {
+        let mut seq = Sequencer::new();
+        for prog in &programs {
+            *seq = Sequencer::new_unboxed();
+            let mut sink = TestSink::default();
+            for (i, f) in prog.iter().enumerate() {
+                seq.ingest(f, 0, 1000 + i as u64, &mut sink);
+            }
+            run_a.push(std::mem::take(&mut sink.msgs));
+            events_a.push(std::mem::take(&mut sink.events));
+        }
+    }
+    // Run B: the re-anchor (the stale arena rides across passes).
+    let mut run_b: Vec<Vec<(u64, Vec<u8>, u64)>> = Vec::new();
+    let mut events_b: Vec<Vec<Event>> = Vec::new();
+    {
+        let mut seq = Sequencer::new();
+        for prog in &programs {
+            seq.reanchor();
+            let mut sink = TestSink::default();
+            for (i, f) in prog.iter().enumerate() {
+                seq.ingest(f, 0, 1000 + i as u64, &mut sink);
+            }
+            run_b.push(std::mem::take(&mut sink.msgs));
+            events_b.push(std::mem::take(&mut sink.events));
+        }
+    }
+    // The differential: bit-exact messages and events on every pass.
+    assert_eq!(run_a.len(), run_b.len());
+    for p in 0..run_a.len() {
+        assert_eq!(
+            run_a[p], run_b[p],
+            "pass {p}: reanchor diverged from fresh construction (msgs)"
+        );
+        assert_eq!(
+            events_a[p], events_b[p],
+            "pass {p}: reanchor diverged from fresh construction (events)"
+        );
+    }
+    // Every program that completes its window must have drained in full
+    // on BOTH arms (the count law — no message lost to a stale lens).
+    let expected: Vec<usize> = vec![8, 104, 9, 1025, 10, 6];
+    for (p, want) in expected.iter().enumerate() {
+        assert_eq!(
+            run_a[p].len(),
+            *want,
+            "pass {p}: the reference arm drained {want} (corpus law)"
+        );
+        assert_eq!(run_b[p].len(), *want, "pass {p}: the reanchor arm drained {want}");
+    }
+}
+
+/// R36-B micro: the reanchor's isolated cost (the release-mode roofline —
+/// the 1 KiB presence-bitmap zero + scalar resets; must be tens of ns,
+/// NOT the 64 KiB arena class).
+#[test]
+fn test_r36_reanchor_microbench() {
+    let mut seq = Sequencer::new();
+    // Stage some slots so the lens has live state to clear.
+    let sess = b"MICROBEN01";
+    let f = make_frame(sess, 1, 16);
+    let mut sink = TestSink::default();
+    seq.ingest(&f, 0, 1000, &mut sink);
+    let n = 100_000u64;
+    let t = std::time::Instant::now();
+    for _ in 0..n {
+        seq.reanchor();
+        std::hint::black_box(&seq);
+    }
+    let ns = t.elapsed().as_nanos() as f64 / n as f64;
+    eprintln!("R36_REANCHOR_MICRO ns_per_call={ns:.1}");
+    // The law: well under 200 ns (the 64 KiB memset class is ~1200).
+    assert!(ns < 200.0, "the reanchor must be the O(1) class, measured {ns:.1} ns");
+}
