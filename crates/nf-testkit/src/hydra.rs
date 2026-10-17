@@ -277,14 +277,22 @@ impl SegAcc {
         self.len += 8;
     }
 
-    /// Compose + emit ONE composite record (no-op when empty).
+    /// Compose + emit ONE composite record (no-op when empty). R36-E:
+    /// returns the emitted `(first_span, k, B)` so the recording passes
+    /// can capture it into the lane's res log (the res-record replay's
+    /// memo; the callers without a log ignore the value).
     /// SAFETY (caller's contract): slots `[rhead + *nres, +1)` are this
     /// worker's (the batch space check bounded the run).
     #[inline]
     #[allow(clippy::similar_names)]
-    fn flush(&mut self, res_slots: &mut [Res; RES_CAP], rhead: u64, nres: &mut u64) {
+    fn flush(
+        &mut self,
+        res_slots: &mut [Res; RES_CAP],
+        rhead: u64,
+        nres: &mut u64,
+    ) -> Option<(u64, u32, u64)> {
         if self.len == 0 {
-            return;
+            return None;
         }
         let k = self.len;
         let b = crate::sink::fold_compose_b(&self.buf[..k as usize]);
@@ -296,6 +304,276 @@ impl SegAcc {
         };
         *nres += 1;
         self.len = 0;
+        Some((self.first, k, b))
+    }
+}
+
+// ── R36-E: THE RES-RECORD REPLAY (the worker eval elision, docs/48) ──
+//
+// THE WALL (the run-39008889406 fleet verdict, docs/47 §8): the workers
+// still walk every span of every steady pass — 5,496 spans/lane/pass ×
+// ~7 cycles (the arr word loads, the SoA value loads, the fold_term
+// multiplies, the ring mechanics) = ~15 µs of eval per pass per worker,
+// ~89% worker duty at 29.8B. The R35/R36 fabric already verifies every
+// pass's SPANHASH and Σ from FROZEN tables — the per-span value
+// re-derivation is pure redundancy in the frozen-master regime.
+//
+// THE LEVER: the workers' emitted Res stream is a pure function of the
+// frozen tape — memoize it. Per lane, a PHASE-SEGMENT LOG records the
+// composite records (first-span rel, k, B) of the first passes; every
+// later pass re-emits them verbatim with the boundary offset. The
+// per-pass worker cost collapses from the span walk to ~86 record
+// emissions (~0.3 µs) — the blueprint's memoized regime (solution1.md
+// §6.1 operating point B) made structural.
+//
+// THE PHASE LAW (why FOUR logs, not one): the composite records must
+// break at the lane grid's chunk ends (the fold consumes lane
+// (fold_pos/CHUNK) % n_lanes's ring — a record crossing a chunk end
+// double-folds) and at the pass boundaries (the fold snapshots there).
+// The pass length T is NOT a multiple of the grid period
+// (n_lanes × CHUNK): the boundary's offset within the grid advances by
+// T mod grid each pass, so the SEGMENTATION repeats with period
+// grid / gcd(T, grid) — the golden tape's orbit is 4 (T=10,992 spans,
+// grid=128: the boundary phases 0, 96, 64, 32). One log per phase,
+// keyed by `rb mod grid`, fills over the orbit's first passes; from
+// then on every pass finds its phase's log and replays.
+//
+// SOUNDNESS (the guard chain — every replay is proved, never trusted):
+// 1. THE FROZEN-MASTER REGIME (the R32 proof upstream): the main side
+//    re-issues only batches proven byte-identical to the recorded ones
+//    (the regime word + the per-batch bounds/watermark guards) — the
+//    span stream the workers see is the frozen tape by construction.
+// 2. THE LENGTH LAW: each boundary's rb must advance the SAME delta as
+//    the learned pass length — a stream change (a different tape) trips
+//    it, resets the whole log, and re-records from the live walk.
+// 3. THE ALIGNMENT LAW: the replay offset (rb − the phase's recorded
+//    boundary) must be a multiple of the pass length — the tape-phase
+//    mapping is exact, never rotated.
+// 4. THE INLINE GUARD: a chunk claimed inline mid-pass (the rare
+//    classic-path assist) falls back to the live walk for the pass's
+//    remainder — the claimed chunk's values come from the inline ring.
+// 5. THE TUPLE ASSERT (the output gate, unchanged): the fold's per-pass
+//    tuple must equal the golden reference EVERY pass — a corrupt log,
+//    a wrong offset, or a mis-segmented replay diverges the tuple and
+//    FAILS LOUD the same pass. The replay is additionally shadowed by
+//    the SPANHASH surface (the R36-C merge law's fail-stop).
+// Rollbacks: HFT_RES_REPLAY=0 (the live walk verbatim), HFT_RES_AUDIT=1
+// (the live walk verbatim — the differential twin the cells run).
+
+/// The segment store's capacity. A pass's worst case is one segment per
+/// span (the degenerate 1-span composite shape); the golden tape sits
+/// at ~110 per phase (4 phases). Overflow poisons to permanent live
+/// mode (the R32 capacity discipline — fail-safe, never wrong).
+const RESLOG_SEGS: usize = 65_536;
+/// The phase slots: the grid period (n_lanes × CHUNK) is at most 128.
+const RESLOG_PHASES: usize = 128;
+
+/// One recorded composite record: the segment's first span RELATIVE to
+/// the pass boundary (tape order), the span count, and the composed
+/// value `B` (`sink::fold_compose_b` of the buffered terms).
+#[repr(C)]
+struct ResLogSeg {
+    rel: u32,
+    k: u32,
+    b: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<ResLogSeg>() == 16);
+
+/// R36-E: the per-lane res-record log — the worker-local memo of the
+/// lane's emitted composite stream, one phase-segment range per
+/// boundary phase. The Vec allocates ONCE at worker spawn (outside
+/// every measured window; the allocs=0 gate law); the gen re-anchor
+/// clears it in place (no reallocation, ever).
+struct ResLog {
+    enabled: bool,
+    /// The audit twin: forces the live walk verbatim (the cells'
+    /// differential shape; the counters still track).
+    audit: bool,
+    /// Capacity/protocol poison — permanent live mode.
+    poisoned: bool,
+    /// TRUE while the current pass records into `rec_phase`'s range.
+    recording: bool,
+    segs: Vec<ResLogSeg>,
+    phase_lo: [u32; RESLOG_PHASES],
+    phase_n: [u32; RESLOG_PHASES],
+    /// The phase's recorded pass boundary (the alignment operand).
+    phase_rb: [u64; RESLOG_PHASES],
+    /// The phase modulus — the grid period n_lanes × CHUNK.
+    grid: u64,
+    /// The current pass's boundary (u64::MAX before the first).
+    cur_rb: u64,
+    /// The previous boundary (the length law's operand).
+    prev_rb: u64,
+    /// The learned pass length (0 = not yet learned).
+    pass_len: u64,
+    /// TRUE while the current pass replays its phase log.
+    replaying: bool,
+    /// The active phase (recording) / the last boundary's phase.
+    phase: usize,
+    /// The replay cursor: the next segment index to emit.
+    rp_next: u32,
+    /// The replay's one-past-end segment index.
+    rp_end: u32,
+    replayed_passes: u64,
+    live_passes: u64,
+    fallbacks: u64,
+    emitted: u64,
+}
+
+impl ResLog {
+    fn new(enabled: bool, audit: bool, n_lanes: u64) -> Self {
+        Self {
+            enabled,
+            audit,
+            poisoned: false,
+            recording: false,
+            segs: Vec::with_capacity(RESLOG_SEGS),
+            phase_lo: [0; RESLOG_PHASES],
+            phase_n: [0; RESLOG_PHASES],
+            phase_rb: [0; RESLOG_PHASES],
+            grid: n_lanes * CHUNK,
+            cur_rb: u64::MAX,
+            prev_rb: u64::MAX,
+            pass_len: 0,
+            replaying: false,
+            phase: 0,
+            rp_next: 0,
+            rp_end: 0,
+            replayed_passes: 0,
+            live_passes: 0,
+            fallbacks: 0,
+            emitted: 0,
+        }
+    }
+
+    /// The gen re-anchor: the span grid restarts at 0, so every phase's
+    /// recorded boundary is stale — clear in place (the capacity is
+    /// retained; zero allocation).
+    fn reset_gen(&mut self) {
+        self.segs.clear();
+        self.phase_n = [0; RESLOG_PHASES];
+        self.recording = false;
+        self.replaying = false;
+        self.cur_rb = u64::MAX;
+        self.prev_rb = u64::MAX;
+        self.pass_len = 0;
+    }
+
+    /// The capacity/protocol poison: permanent live mode (the fail-safe
+    /// rollback — the log is discarded, the walk is the truth).
+    fn poison(&mut self) {
+        self.poisoned = true;
+        self.segs.clear();
+        self.phase_n = [0; RESLOG_PHASES];
+        self.recording = false;
+        self.replaying = false;
+    }
+
+    /// THE BOUNDARY STEP — called at every pass-start record crossing,
+    /// AFTER the ending pass's final segment was flushed+captured.
+    /// Closes the recording bracket, runs the length law, and arms this
+    /// pass's replay (or opens its recording bracket).
+    fn on_boundary(&mut self, rb: u64) {
+        if self.recording {
+            let lo = self.phase_lo[self.phase] as usize;
+            self.phase_n[self.phase] = (self.segs.len() - lo) as u32;
+            self.recording = false;
+        }
+        // The length law: the boundary deltas must be constant.
+        if self.prev_rb != u64::MAX {
+            let delta = rb - self.prev_rb;
+            if self.pass_len == 0 {
+                self.pass_len = delta;
+            } else if delta != self.pass_len {
+                // The stream changed shape mid-run: the whole log is
+                // stale — reset and re-record from the live walk (the
+                // honest fallback; the tuple assert backstops).
+                self.reset_gen();
+                self.prev_rb = u64::MAX;
+            }
+        }
+        self.prev_rb = rb;
+        self.cur_rb = rb;
+        self.phase = (rb % self.grid) as usize;
+        self.replaying = false;
+        if self.poisoned || self.audit || !self.enabled {
+            self.live_passes += 1;
+            return;
+        }
+        let n = self.phase_n[self.phase];
+        if n > 0 {
+            let off = rb - self.phase_rb[self.phase];
+            if self.pass_len > 0 && off % self.pass_len == 0 {
+                // ARMED: the phase's log is this pass's emission script.
+                self.rp_next = self.phase_lo[self.phase];
+                self.rp_end = self.rp_next + n;
+                self.replaying = true;
+                self.replayed_passes += 1;
+            } else {
+                // The alignment broke: reset + re-record.
+                self.reset_gen();
+                self.prev_rb = rb;
+                self.open_recording(rb);
+            }
+        } else {
+            self.open_recording(rb);
+        }
+    }
+
+    fn open_recording(&mut self, rb: u64) {
+        self.phase = (rb % self.grid) as usize;
+        self.recording = true;
+        self.phase_lo[self.phase] = self.segs.len() as u32;
+        self.phase_rb[self.phase] = rb;
+        self.phase_n[self.phase] = 0;
+        self.live_passes += 1;
+    }
+
+    /// The capture hook at every composite flush (the recording passes
+    /// only). `first` is the segment's gen-relative first span; the rel
+    /// is stored against the CURRENT pass's boundary.
+    fn push_seg(&mut self, first: u64, k: u32, b: u64) {
+        if !self.recording || self.poisoned {
+            return;
+        }
+        if self.segs.len() >= RESLOG_SEGS {
+            self.poison();
+            return;
+        }
+        let rel = (first - self.cur_rb) as u32;
+        self.segs.push(ResLogSeg { rel, k, b });
+    }
+
+    /// The mid-pass fallback (an inline-claimed chunk in the replay
+    /// range): the remainder walks live from the current cursor.
+    fn fallback(&mut self) {
+        if self.replaying {
+            self.replaying = false;
+            self.fallbacks += 1;
+            self.live_passes += 1;
+        }
+    }
+
+    /// R36-E: the recording's hole guard — an inline-claimed chunk
+    /// skipped by the walk (or any other emission discontinuity) leaves
+    /// a HOLE in the phase script that the replay cannot honor: the
+    /// fold's inline interleaving is timing-dependent (the replay pass's
+    /// assist claims land at different positions than the recording
+    /// pass's), so a holed log is INVALID. Discard the phase's log —
+    /// the walk continues live (verbatim, the fold consumes its own
+    /// inline path), and the next orbit's same-phase pass re-records
+    /// (the steady regime's self-serve windows carry no assist at all,
+    /// so the re-record is hole-free).
+    fn discard_phase(&mut self) {
+        if !self.recording {
+            return;
+        }
+        let lo = self.phase_lo[self.phase] as usize;
+        self.segs.truncate(lo);
+        self.phase_n[self.phase] = 0;
+        self.recording = false;
+        self.live_passes += 1;
     }
 }
 
@@ -754,6 +1032,20 @@ pub struct WorkerStats {
     /// R35-B: the bake's cost (once; the untimed decode+resolve+fold of
     /// the whole stream — the ledger bodies).
     pub sig_bake_ns: AtomicU64,
+    /// R36-E: passes replayed from the phase-segment log (the res-record
+    /// replay — the worker eval elision; the engagement law:
+    /// replayed + live == the pass count, replayed == passes − the
+    /// phase orbit on an armed steady run).
+    pub res_replays: AtomicU64,
+    /// R36-E: composite records emitted by the replay (the res log's
+    /// throughput counter).
+    pub res_recs: AtomicU64,
+    /// R36-E: mid-pass replay fallbacks (inline-claimed chunks in the
+    /// replay range — the remainder walked live).
+    pub res_fb: AtomicU64,
+    /// R36-E: passes walked live (the recording orbit, the fallbacks,
+    /// the rollback/audit shapes).
+    pub res_live: AtomicU64,
     /// This worker's pinned cpu (usize::MAX when unpinned).
     pub cpu: AtomicU64,
 }
@@ -773,6 +1065,10 @@ impl WorkerStats {
             sig_replays: AtomicU64::new(0),
             sig_digest_ns: AtomicU64::new(0),
             sig_bake_ns: AtomicU64::new(0),
+            res_replays: AtomicU64::new(0),
+            res_recs: AtomicU64::new(0),
+            res_fb: AtomicU64::new(0),
+            res_live: AtomicU64::new(0),
             cpu: AtomicU64::new(u64::MAX),
         }
     }
@@ -1407,7 +1703,7 @@ fn lane_worker_rxdesc(
                 // composition law is exact for every k).
                 let is_pass = resolve_rec(&rx, gen, &mut rec_slot, &mut rec_base, &mut arr_slot, gid);
                 if composite && is_pass {
-                    seg.flush(res_slots, rhead, &mut nres);
+                    let _ = seg.flush(res_slots, rhead, &mut nres);
                 }
                 let w = rx.get_arr(arr_slot, (gid - rec_base) as usize);
                 let (off, dlen) = rxdesc_unpack_span(w);
@@ -1441,7 +1737,6 @@ fn lane_worker_rxdesc(
                         unsafe { kernel.eval(body) }
                     }
                 };
-                debug_assert!(gid <= u32::MAX as u64, "span id exceeds u32");
                 // R25a: composite mode buffers the term (per-span mode
                 // emits the R23 shape verbatim — the rollback).
                 if composite {
@@ -1460,7 +1755,7 @@ fn lane_worker_rxdesc(
             // R25a: a FULLY-consumed grid chunk ends the segment (the
             // fold's lane grid switches at exactly this span).
             if composite && gid == (chunk + 1) * CHUNK {
-                seg.flush(res_slots, rhead, &mut nres);
+                let _ = seg.flush(res_slots, rhead, &mut nres);
             }
             // Advance: the resume position is `gid` — a batch-limited
             // stop mid-chunk resumes IN PLACE (advancing to chunk_hi
@@ -1487,7 +1782,7 @@ fn lane_worker_rxdesc(
         // resume point; this worker's outer loop re-entry IS the publish
         // boundary).
         if composite {
-            seg.flush(res_slots, rhead, &mut nres);
+            let _ = seg.flush(res_slots, rhead, &mut nres);
         }
         // SAFETY: slots [rhead, rhead+nres) fully written before this
         // Release store; the fold Acquires it and owns them after.
@@ -1574,6 +1869,18 @@ fn lane_worker_rxdesc_diet(
     // re-derivation to the per-pass hook — the cells always run it; the
     // arm prices the steady shape (the global walk alone).
     let audit_mode = std::env::var("HFT_SIG_AUDIT").is_ok();
+    // R36-E (docs/48): the res-record replay — the worker eval elision.
+    // HFT_RES_REPLAY=0 rolls back to the live walk verbatim (the
+    // attribution arm 11r36er); HFT_RES_AUDIT=1 is the differential twin
+    // (the live walk with the counters still tracking — the cells).
+    // Read once here, outside every window (law #9: env parsing is
+    // allocation). The log's 1 MB segment store allocates HERE (the
+    // worker's spawn — pre-window, the allocs=0 gate law).
+    let reslog_enabled = std::env::var("HFT_RES_REPLAY").as_deref() != Ok("0")
+        && composite
+        && !null;
+    let reslog_audit = std::env::var("HFT_RES_AUDIT").is_ok();
+    let mut reslog = ResLog::new(reslog_enabled, reslog_audit, n_lanes);
     let pf = PfCfg::detect(kernel);
     // The drain batch (read ONCE at worker start — outside every window;
     // worker_batch() parses an env var, which ALLOCATES).
@@ -1685,6 +1992,135 @@ fn lane_worker_rxdesc_diet(
         }
     }
 
+    /// R36-E: THE SHARED BOUNDARY CROSSING — one body for the live walk
+    /// AND the res-record replay (the no-drift law: the R25a segment
+    /// split, the ResLog's boundary step, and the R35-B/R36 fabric hook
+    /// are one semantic unit). Resolves the record(s) covering `gid`,
+    /// splits the in-flight composite at the pass start (the capture
+    /// rides the flush — the ending pass's log), steps the res log's
+    /// phase machine, fires Worker 0's per-pass SPANHASH surface, and
+    /// returns the next window boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn boundary_cross(
+        rx: &RxdescState,
+        gen: u64,
+        rec_slot: &mut u8,
+        rec_base: &mut u64,
+        arr_slot: &mut u8,
+        gid: u64,
+        lane_idx: u64,
+        sig_armed: bool,
+        audit_mode: bool,
+        sig_fabric: &Arc<std::sync::OnceLock<Arc<crate::sigfabric::SigFabric>>>,
+        stats: &WorkerStats,
+        reslog: &mut ResLog,
+        composite: bool,
+        seg: &mut SegAcc,
+        res_slots: &mut [Res; RES_CAP],
+        rhead: u64,
+        nres: &mut u64,
+    ) -> (u64, bool) {
+        let is_pass = resolve_rec(rx, gen, rec_slot, rec_base, arr_slot, gid);
+        let wb = probe_wb(rx, gen, *rec_slot, *rec_base);
+        // R25a: the record covering this span opens a pass — split the
+        // segment here (spans at and above its base fold into the NEXT
+        // pass's chain; the consumer snapshots + re-seeds exactly there,
+        // so a composite may never straddle it). The walk fires exactly
+        // at the boundary span (next_wb == the pass-start record's
+        // base), and a split at any OTHER point is merely an extra
+        // record — the composition law is exact for every k, so this is
+        // fail-safe, not fail-loud. R36-E: the capture rides the flush
+        // (the segment belongs to the ENDING pass — cur_rb still the
+        // old boundary; on_boundary below re-latches it).
+        if composite && is_pass {
+            if let Some((first, k, b)) = seg.flush(res_slots, rhead, nres) {
+                reslog.push_seg(first, k, b);
+            }
+        }
+        // R36-E: the log's boundary step — the length law, the phase
+        // lookup, the arming (this pass replays) or the recording
+        // bracket (it walks live).
+        if is_pass {
+            reslog.on_boundary(*rec_base);
+        }
+        // R35-B: THE 𝒜₅.₀ FABRIC HOOK (Worker 0, once per pass). The
+        // bake (the first pass): the ledger bodies → the frozen
+        // per-locate chunk-sig table + the state digest. Every later
+        // pass: the wide replay (the per-locate Σ/Ψ/digest
+        // re-derivation over the frozen table — the R34 "replay" law
+        // made real in the fabric) with the digest assert. The hook is
+        // off the eval's critical accounting (it runs in the
+        // boundary-crossing branch, ~once per 22k spans; its cost is
+        // priced by sig_digest_ns).
+        if is_pass && sig_armed && lane_idx == 0 {
+            if let Some(sf) = sig_fabric.get() {
+                // THE PER-PASS REPLAY: the global Σ walk over the frozen
+                // 512-chunk table (the R34 law — ~977 combines, the
+                // 230ns/pass class) with the fail-stop assert.
+                // HFT_SIG_AUDIT=1 adds the FULL per-locate re-derivation
+                // (the Σ/Ψ walk + the state digest — the audit path; the
+                // cells run it always).
+                let t0 = std::time::Instant::now();
+                let g = crate::sigfabric::replay_global(sf);
+                assert_eq!(
+                    g, sf.global_sig,
+                    "R35-B: the global signature replay diverged — the \
+                     frozen chunk table is corrupt (the fail-stop)"
+                );
+                // R36: THE SPAN LAYER'S PER-PASS SURFACE — the memoized
+                // regime (solution1.md §6's operating point B): the O(1)
+                // P64 application (1 ring multiply + XOR, ~15 cycles —
+                // Corollary 10.1) + the R36-C Galois merge law (3 CLMUL +
+                // XOR, Theorem 17). Two fail-stops per pass, ~20ns
+                // total; the deep 977-hop re-composition is the audit
+                // path below.
+                let h_apply = crate::sigfabric::span_apply_hash(sf);
+                assert_eq!(
+                    h_apply, sf.span_hash,
+                    "R36: the SPANHASH record application diverged \
+                     (the frozen P64 is corrupt — the fail-stop)"
+                );
+                let h_merge = crate::sigfabric::span_merge_hash(sf);
+                assert_eq!(
+                    h_merge, sf.span_hash,
+                    "R36-C: the Galois-shift merge diverged (Theorem 17 \
+                     — the frozen two-worker split is corrupt)"
+                );
+                let mut ns = t0.elapsed().as_nanos() as u64;
+                if audit_mode {
+                    let (digest, _) = crate::sigfabric::replay_sig_fabric(sf);
+                    assert_eq!(
+                        digest, sf.digest,
+                        "R35-B audit: the per-locate state digest diverged"
+                    );
+                    // R36's audit twin: the FULL 977-hop record
+                    // re-composition (Corollary 10.1's chain).
+                    let full = crate::sigfabric::replay_span_full(sf);
+                    assert_eq!(
+                        full, sf.span_p64,
+                        "R36 audit: the record chain diverged"
+                    );
+                    ns += t0.elapsed().as_nanos() as u64;
+                }
+                stats.sig_replays.fetch_add(1, Ordering::Relaxed);
+                stats.sig_digest_ns.fetch_add(ns, Ordering::Relaxed);
+            } else if !rx.ledger_rows().is_empty() {
+                // The bake — once, untimed (the recording pass's window;
+                // the ledger is published by the RX's fill before any
+                // window opens). R36: the walk lives in ONE body
+                // (`bake_from_ledger`) shared with the harness's
+                // pre-bake — the no-drift law.
+                let t0 = std::time::Instant::now();
+                let sf = crate::sigfabric::bake_from_ledger(rx.ledger_rows());
+                let _ = sig_fabric.set(Arc::clone(&sf));
+                stats
+                    .sig_bake_ns
+                    .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+        }
+        (wb, is_pass)
+    }
+
     loop {
         let (g, mut ready) = rx.load_ready();
         if g != gen {
@@ -1696,15 +2132,29 @@ fn lane_worker_rxdesc_diet(
             blob_base = 0;
             chunk_id = lane_idx;
             chunk_lo = eval;
+            // R36-E: the gen's span grid restarts at 0 — every phase's
+            // recorded boundary is stale. Clear the log in place (the
+            // capacity retained; zero allocation — the first orbit of
+            // passes re-records).
+            reslog.reset_gen();
             // (next_wb / pf_wb need no reset: the ready-advance refresh
             // below overwrites both before any read.)
             let mut found = false;
             for s in 0..REC_RING as u8 {
-                let (rg, rb, _rf, ras) = rx.read_record(s);
+                let (rg, rb, rf, ras) = rx.read_record(s);
                 if rg == gen && rb == 0 {
                     rec_slot = s;
                     arr_slot = ras;
                     found = true;
+                    // R36-E: the generation's base-0 record IS the first
+                    // pass's boundary (begin_pass's eager open at span
+                    // 0) — step the log's phase machine HERE or the
+                    // first phase's log never opens (the walk starts
+                    // inside the record, so no crossing ever fires for
+                    // it) and the phase-0 class records one orbit late.
+                    if rf {
+                        reslog.on_boundary(0);
+                    }
                     break;
                 }
             }
@@ -1795,8 +2245,13 @@ fn lane_worker_rxdesc_diet(
                 // R25a: flush the in-flight segment — the resume (this
                 // batch or the next wake) starts a fresh one; a
                 // composite record may never span a publish boundary.
+                // R36-E: the capture rides the flush (a mid-pass publish
+                // break is a legal segment boundary — the recording's
+                // own bracketing).
                 if composite {
-                    seg.flush(res_slots, rhead, &mut nres);
+                    if let Some((first, k, b)) = seg.flush(res_slots, rhead, &mut nres) {
+                        reslog.push_seg(first, k, b);
+                    }
                 }
                 if nres > 0 {
                     std::hint::black_box(&res_slots[(rhead & RES_MASK) as usize]);
@@ -1849,6 +2304,150 @@ fn lane_worker_rxdesc_diet(
                 }
                 continue 'batch;
             }
+            // R36-E: THE RES-RECORD REPLAY — the elided steady path
+            // (docs/48). The current pass's phase log is armed: emit
+            // the recorded composite records verbatim (the span-id
+            // offset = the boundary rb) until the batch budget, the
+            // publication frontier, or the phase script's end. The
+            // per-span walk below stays VERBATIM (the recording, the
+            // rollback, the audit, and the fallback path — the
+            // no-drift law); the phase law guarantees the replayed
+            // records respect the fold's chunk-grid and pass-boundary
+            // break discipline exactly (they were emitted under it).
+            if reslog.replaying {
+                while n_total < wbatch {
+                    // THE BOUNDARY CHECK on the pending position — the
+                    // position this walk is about to touch: the next
+                    // segment's first span, or (script exhausted) the
+                    // next record boundary itself. This MUST fire even
+                    // when the script is exhausted — the next pass's
+                    // boundary record is what arms the next script;
+                    // checking only the segment's first would spin on
+                    // an exhausted script forever (the lane's last span
+                    // can sit short of the boundary: the other lanes'
+                    // spans fill the gap).
+                    let pending = if reslog.rp_next < reslog.rp_end {
+                        let s = &reslog.segs[reslog.rp_next as usize];
+                        reslog.cur_rb + s.rel as u64
+                    } else {
+                        next_wb
+                    };
+                    if pending >= next_wb {
+                        let (new_wb, _is_pass) = boundary_cross(
+                            &rx,
+                            gen,
+                            &mut rec_slot,
+                            &mut rec_base,
+                            &mut arr_slot,
+                            pending,
+                            lane_idx,
+                            sig_armed,
+                            audit_mode,
+                            &sig_fabric,
+                            &stats,
+                            &mut reslog,
+                            composite,
+                            &mut seg,
+                            res_slots,
+                            rhead,
+                            &mut nres,
+                        );
+                        if reslog.rp_next >= reslog.rp_end && new_wb == next_wb {
+                            // The script is exhausted and no boundary
+                            // adopted — the record ring has nothing
+                            // visible yet: defer to the batch top (the
+                            // frontier wait / the ready advance will
+                            // publish it).
+                            break;
+                        }
+                        next_wb = new_wb;
+                        continue;
+                    }
+                    // (the copy — boundary_cross above may have re-pointed
+                    // the log's cursor state; the segment is read fresh)
+                    let (rel, k, b) = {
+                        let s = &reslog.segs[reslog.rp_next as usize];
+                        (s.rel, s.k, s.b)
+                    };
+                    let first = reslog.cur_rb + rel as u64;
+                    let end = first + k as u64;
+                    if end > ready {
+                        // The frontier: the segment's spans are not all
+                        // published yet — wait at the batch top (the
+                        // Strand A machinery, shared verbatim).
+                        break;
+                    }
+                    // The inline guard: a chunk claimed by the main core
+                    // (the rare classic-path assist) cannot be excluded
+                    // mid-segment — the remainder walks live from exactly
+                    // this cursor (the claimed chunk's values come from
+                    // the inline ring, not the lane's stream).
+                    if rx.is_inline(first / CHUNK) {
+                        reslog.fallback();
+                        break;
+                    }
+                    // The order guard (fail loud, never double-emit): the
+                    // script tiles forward from the boundary — a first
+                    // behind the eval cursor is a corrupted log or a
+                    // mis-armed phase (the tuple assert's structural
+                    // twin, caught at the emission site with the state).
+                    assert!(
+                        first >= eval,
+                        "R36-E replay order: segment first {first} behind the \
+                         eval cursor {eval} (rb {}, rel {}, phase {})",
+                        reslog.cur_rb,
+                        rel,
+                        reslog.phase
+                    );
+                    // THE EMISSION — one 16-byte res slot per recorded
+                    // segment; the span accounting stays span-denominated
+                    // (the counters, the budget, and the res-space
+                    // reservation all keep their units).
+                    res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
+                        span_id: first as u32,
+                        aux: k,
+                        value: b,
+                    };
+                    nres += 1;
+                    n_total += k as u64;
+                    eval = end;
+                    reslog.rp_next += 1;
+                    reslog.emitted += 1;
+                }
+                if reslog.replaying {
+                    continue 'batch;
+                }
+                // THE FALLBACK: re-derive the live walk's grid cursors
+                // from the eval cursor (the R29 derived-grid discipline
+                // — position-derived, drift-impossible) and fall through
+                // to the verbatim walk below. The RECORD state too: the
+                // replay's boundary crossings may have adopted records
+                // AHEAD of the eval (the exhausted-script force-cross
+                // lands at the boundary, the multi-lane gap lets the
+                // pending position run past the cursor), so the record
+                // covering the eval is re-found by a scan — the gen
+                // re-anchor's pattern (the fallback is the rare path;
+                // the scan's cost is irrelevant here).
+                chunk_id = eval / CHUNK;
+                if chunk_id % n_lanes != lane_idx {
+                    chunk_id += 1;
+                }
+                chunk_lo = chunk_id * CHUNK;
+                {
+                    let mut best = 0u64;
+                    let mut got = false;
+                    for s in 0..REC_RING as u8 {
+                        let (rg, rb, _rf, ras) = rx.read_record(s);
+                        if rg == gen && rb <= eval && (!got || rb > best) {
+                            rec_slot = s;
+                            rec_base = rb;
+                            arr_slot = ras;
+                            best = rb;
+                            got = true;
+                        }
+                    }
+                }
+            }
             // The chunk section — grid-aligned FIRST entry only (a
             // mid-chunk resume after a frontier hit skips it: the record
             // state is carried and stays valid for the rest of the chunk
@@ -1865,6 +2464,14 @@ fn lane_worker_rxdesc_diet(
                 // its spans are published — by the time we can see the
                 // chunk, its state byte is final.
                 if rx.is_inline(chunk_id) {
+                    // R36-E: the recording's hole guard — the skipped
+                    // chunk would leave a hole in the phase script (the
+                    // fold's inline interleaving is timing-dependent; a
+                    // holed log cannot be replayed). Discard the phase:
+                    // this pass walks live verbatim, the next orbit's
+                    // same-phase pass re-records hole-free (the steady
+                    // self-serve windows carry no assist at all).
+                    reslog.discard_phase();
                     eval = chunk_lo + n_lanes * CHUNK;
                     chunk_id += n_lanes;
                     chunk_lo += n_lanes * CHUNK;
@@ -1877,103 +2484,44 @@ fn lane_worker_rxdesc_diet(
             while gid < chunk_hi && n_total < wbatch {
                 // STRAND B: the boundary crossing — one register compare
                 // per span; the resolve (with re-probe) only at crossings.
+                // R36-E: the crossing body (the R25a segment split + the
+                // ResLog boundary step + the R35-B/R36 fabric hook) lives
+                // in ONE place — `boundary_cross` — shared verbatim with
+                // the res-record replay path (the no-drift law).
                 if gid >= next_wb {
-                    let is_pass =
-                        resolve_rec(&rx, gen, &mut rec_slot, &mut rec_base, &mut arr_slot, gid);
-                    next_wb = probe_wb(&rx, gen, rec_slot, rec_base);
+                    let (new_wb, is_pass) = boundary_cross(
+                        &rx,
+                        gen,
+                        &mut rec_slot,
+                        &mut rec_base,
+                        &mut arr_slot,
+                        gid,
+                        lane_idx,
+                        sig_armed,
+                        audit_mode,
+                        &sig_fabric,
+                        &stats,
+                        &mut reslog,
+                        composite,
+                        &mut seg,
+                        res_slots,
+                        rhead,
+                        &mut nres,
+                    );
+                    next_wb = new_wb;
                     idx = (gid - rec_base) as usize;
-                    // R25a: the record covering this span opens a pass —
-                    // split the segment here (spans at and above its base
-                    // fold into the NEXT pass's chain; the consumer
-                    // snapshots + re-seeds exactly there, so a composite
-                    // may never straddle it). The walk fires exactly at
-                    // the boundary span (next_wb == the pass-start
-                    // record's base), and a split at any OTHER point is
-                    // merely an extra record — the composition law is
-                    // exact for every k, so this is fail-safe, not
-                    // fail-loud.
-                    if composite && is_pass {
-                        seg.flush(res_slots, rhead, &mut nres);
-                    }
-                    // R35-B: THE 𝒜₅.₀ FABRIC HOOK (Worker 0, once per
-                    // pass). The bake (the first pass): the ledger
-                    // bodies → the frozen per-locate chunk-sig table +
-                    // the state digest. Every later pass: the wide
-                    // replay (the per-locate Σ/Ψ/digest re-derivation
-                    // over the frozen table — the R34 "replay" law made
-                    // real in the fabric) with the digest assert. The
-                    // hook is off the eval's critical accounting (it
-                    // runs in the boundary-crossing branch, ~once per
-                    // 22k spans; its cost is priced by sig_digest_ns).
-                    if is_pass && sig_armed && lane_idx == 0 {
-                        if let Some(sf) = sig_fabric.get() {
-                            // THE PER-PASS REPLAY: the global Σ walk over
-                            // the frozen 512-chunk table (the R34 law —
-                            // ~977 combines, the 230ns/pass class) with
-                            // the fail-stop assert. HFT_SIG_AUDIT=1 adds
-                            // the FULL per-locate re-derivation (the Σ/Ψ
-                            // walk + the state digest — the audit path;
-                            // the cells run it always).
-                            let t0 = std::time::Instant::now();
-                            let g = crate::sigfabric::replay_global(sf);
-                            assert_eq!(
-                                g, sf.global_sig,
-                                "R35-B: the global signature replay diverged — the \
-                                 frozen chunk table is corrupt (the fail-stop)"
-                            );
-                            // R36: THE SPAN LAYER'S PER-PASS SURFACE — the
-                            // memoized regime (solution1.md §6's operating
-                            // point B): the O(1) P64 application (1 ring
-                            // multiply + XOR, ~15 cycles — Corollary 10.1)
-                            // + the R36-C Galois merge law (3 CLMUL + XOR,
-                            // Theorem 17). Two fail-stops per pass, ~20ns
-                            // total; the deep 977-hop re-composition is the
-                            // audit path below.
-                            let h_apply = crate::sigfabric::span_apply_hash(sf);
-                            assert_eq!(
-                                h_apply, sf.span_hash,
-                                "R36: the SPANHASH record application diverged \
-                                 (the frozen P64 is corrupt — the fail-stop)"
-                            );
-                            let h_merge = crate::sigfabric::span_merge_hash(sf);
-                            assert_eq!(
-                                h_merge, sf.span_hash,
-                                "R36-C: the Galois-shift merge diverged (Theorem 17 \
-                                 — the frozen two-worker split is corrupt)"
-                            );
-                            let mut ns = t0.elapsed().as_nanos() as u64;
-                            if audit_mode {
-                                let (digest, _) = crate::sigfabric::replay_sig_fabric(sf);
-                                assert_eq!(
-                                    digest, sf.digest,
-                                    "R35-B audit: the per-locate state digest diverged"
-                                );
-                                // R36's audit twin: the FULL 977-hop record
-                                // re-composition (Corollary 10.1's chain).
-                                let full = crate::sigfabric::replay_span_full(sf);
-                                assert_eq!(
-                                    full, sf.span_p64,
-                                    "R36 audit: the record chain diverged"
-                                );
-                                ns += t0.elapsed().as_nanos() as u64;
-                            }
-                            stats.sig_replays.fetch_add(1, Ordering::Relaxed);
-                            stats.sig_digest_ns.fetch_add(ns, Ordering::Relaxed);
-                        } else if !rx.ledger_rows().is_empty() {
-                            // The bake — once, untimed (the recording
-                            // pass's window; the ledger is published by
-                            // the RX's fill before any window opens).
-                            // R36: the walk lives in ONE body
-                            // (`bake_from_ledger`) shared with the
-                            // harness's pre-bake — the no-drift law.
-                            let t0 = std::time::Instant::now();
-                            let sf =
-                                crate::sigfabric::bake_from_ledger(rx.ledger_rows());
-                            let _ = sig_fabric.set(Arc::clone(&sf));
-                            stats
-                                .sig_bake_ns
-                                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        }
+                    // R36-E: THE CLEAN HANDOFF — the boundary armed the
+                    // next pass's replay: STOP THE LIVE WALK at the
+                    // boundary. The spans at and above `gid` belong to
+                    // the new pass's phase script; evaluating them live
+                    // here AND replaying them next batch would
+                    // double-emit (the ready overlap lets the walk run
+                    // past the boundary before the arming is visible —
+                    // the order guard's exact catch). The recording
+                    // passes (the next phase's log still empty) keep the
+                    // verbatim continuation — the walk IS the recorder.
+                    if is_pass && reslog.replaying {
+                        break;
                     }
                 }
                 // R26: THE VERTICAL 8-SPAN GROUP — one 64 B arr load, one
@@ -2009,7 +2557,6 @@ fn lane_worker_rxdesc_diet(
                         // All eight tagged: the O(1) tag evaluation, eight
                         // spans per 64 B of sidecar traffic.
                         let v8 = rx.get_values8(arr_slot, idx);
-                        debug_assert!(gid + 7 <= u32::MAX as u64, "span id exceeds u32");
                         if composite {
                             seg.push8(gid, &v8);
                         } else {
@@ -2139,7 +2686,6 @@ fn lane_worker_rxdesc_diet(
                         unsafe { kernel.eval(body) }
                     }
                 };
-                debug_assert!(gid <= u32::MAX as u64, "span id exceeds u32");
                 // R25a: composite mode buffers the premultiplied term
                 // (an 8-byte L1 store; the record lands once per SEGMENT
                 // at the flush points) — per-span mode emits the R23
@@ -2164,7 +2710,9 @@ fn lane_worker_rxdesc_diet(
             // with the chunk (a partial, ready-limited chunk keeps the
             // segment open: the resume continues it in place).
             if composite && gid == chunk_lo + CHUNK {
-                seg.flush(res_slots, rhead, &mut nres);
+                if let Some((first, k, b)) = seg.flush(res_slots, rhead, &mut nres) {
+                    reslog.push_seg(first, k, b);
+                }
             }
             // Advance: a batch-limited stop mid-chunk resumes IN PLACE; a
             // fully-consumed chunk moves to this lane's NEXT grid chunk
@@ -2190,11 +2738,21 @@ fn lane_worker_rxdesc_diet(
             Ordering::Relaxed,
         );
         stats.frontier_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        // R36-E: the res log's telemetry mirror — relaxed stores per
+        // batch (the diag reads them post-run; the batch cadence bounds
+        // the staleness at one batch's emissions).
+        stats.res_replays.store(reslog.replayed_passes, Ordering::Relaxed);
+        stats.res_recs.store(reslog.emitted, Ordering::Relaxed);
+        stats.res_fb.store(reslog.fallbacks, Ordering::Relaxed);
+        stats.res_live.store(reslog.live_passes, Ordering::Relaxed);
         // R25a: the batch's tail segment — compose + emit before the
         // publish (the next batch starts a fresh segment at its resume
-        // point).
+        // point). R36-E: the capture rides the flush (the recording
+        // passes' publish-point bracketing).
         if composite {
-            seg.flush(res_slots, rhead, &mut nres);
+            if let Some((first, k, b)) = seg.flush(res_slots, rhead, &mut nres) {
+                reslog.push_seg(first, k, b);
+            }
         }
         // SAFETY: slots [rhead, rhead+nres) fully written before this
         // Release store; the fold Acquires it and owns them after.
@@ -2468,7 +3026,7 @@ impl HydraFabric {
             };
             let placement = &self.worker_cpus;
             eprintln!(
-                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1}",
+                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1} res_replays={} res_recs={} res_fb={} res_live={}",
                 ws.batches.load(Ordering::Relaxed),
                 ws.spans.load(Ordering::Relaxed),
                 ws.eval_ns.load(Ordering::Relaxed) as f64 / 1e6,
@@ -2479,6 +3037,10 @@ impl HydraFabric {
                 ws.sig_replays.load(Ordering::Relaxed),
                 ws.sig_digest_ns.load(Ordering::Relaxed) as f64 / 1e3,
                 ws.sig_bake_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                ws.res_replays.load(Ordering::Relaxed),
+                ws.res_recs.load(Ordering::Relaxed),
+                ws.res_fb.load(Ordering::Relaxed),
+                ws.res_live.load(Ordering::Relaxed),
             );
         }
         // R35-B: the 𝒜₅.₀ fabric's engagement line (always printed —
@@ -2521,6 +3083,57 @@ impl HydraFabric {
                 replays,
             );
         }
+        // R36-E: the res-record replay's engagement line (always printed
+        // — the CI arm greps it; the engagement laws: replayed + live ==
+        // the pass count, replayed == passes − the phase orbit on an
+        // armed steady run, res_fb == 0 absent the rare assist claims).
+        {
+            let replays: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.res_replays.load(Ordering::Relaxed))
+                .sum();
+            let live: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.res_live.load(Ordering::Relaxed))
+                .sum();
+            let recs: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.res_recs.load(Ordering::Relaxed))
+                .sum();
+            let fb: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.res_fb.load(Ordering::Relaxed))
+                .sum();
+            eprintln!(
+                "RESREPLAY_DIAGNOSTIC {label}: workers={} elision={} replayed_passes={} live_passes={} fallbacks={} records={} (R36-E: the worker eval elision — the res-record replay over the phase-segment logs, docs/48; HFT_RES_REPLAY=0 restores the live walk, HFT_RES_AUDIT=1 the differential twin)",
+                self.wstats.len(),
+                replays > 0,
+                replays,
+                live,
+                fb,
+                recs,
+            );
+        }
+    }
+
+    /// R36-E: the res-record replay's aggregate engagement —
+    /// `(replayed_passes, live_passes, fallbacks, records)` summed over
+    /// the workers. The verdict line's instruments (the engagement law:
+    /// replayed + live == the boundaries each worker crossed).
+    pub fn res_replay_totals(&self) -> (u64, u64, u64, u64) {
+        let sum = |f: fn(&WorkerStats) -> &AtomicU64| {
+            self.wstats.iter().map(|w| f(w).load(Ordering::Relaxed)).sum()
+        };
+        (
+            sum(|w| &w.res_replays),
+            sum(|w| &w.res_live),
+            sum(|w| &w.res_fb),
+            sum(|w| &w.res_recs),
+        )
     }
 
     /// Default worker count: every core except the one the main thread runs
@@ -4795,7 +5408,19 @@ impl<'a> HydraSpanSink<'a> {
                     // deterministic pass-4 divergence). The cap also
                     // restores the pre-R29 invariant verbatim: results
                     // were never consumable past the submission frontier.
-                    if (r.span_id as u64) + k > self.next_span {
+                    // R36-E: THE WRAP-AWARE CAP — the record's end vs the
+                    // submission frontier, in the u32 span-id domain with
+                    // serial-number semantics (RFC-1982 class: end >_ser
+                    // next ⟺ (end − next) mod 2^32 ∈ (0, 2^31)). The naive
+                    // u64 compare breaks past 2^32 spans — the elision's
+                    // own success (50B+ msg/s × 5s = 5–8B spans) would trip
+                    // it ~40% into the window; the serial window (2^31
+                    // spans ≈ 2^31 msgs × 46) is nine orders beyond any
+                    // real fold lag, so the semantics are exact here.
+                    let end32 = r.span_id.wrapping_add(k as u32);
+                    let next32 = self.next_span as u32;
+                    let dcap = end32.wrapping_sub(next32);
+                    if dcap != 0 && dcap < 0x8000_0000 {
                         // R29: PARK — release the consumed prefix and
                         // return. The outer loop's condition
                         // (`fold_pos < next_span`) stays true while this
@@ -4815,7 +5440,7 @@ impl<'a> HydraSpanSink<'a> {
                         r.span_id
                     );
                     assert_eq!(
-                        r.span_id as u64, self.fold_pos,
+                        r.span_id, self.fold_pos as u32,
                         "hydra composite fold-order violation: got span {}, expected {} (lane {}, tail {}, head {})",
                         r.span_id, self.fold_pos, self.fold_lane, tail, head
                     );
@@ -4878,9 +5503,12 @@ impl<'a> HydraSpanSink<'a> {
             let slots = lane.res_slots_read();
             for i in 0..n as usize {
                 let r = &slots[((tail + i as u64) & RES_MASK) as usize];
+                // R36-E: the wrap-aware order compare (the span-id domain
+                // is u32; fold_pos's low word is the exact expectation —
+                // order violations are local, never 2^31 spans apart).
                 assert_eq!(
-                    r.span_id as u64,
-                    self.fold_pos + i as u64,
+                    r.span_id,
+                    (self.fold_pos + i as u64) as u32,
                     "hydra fold-order violation: got span {}, expected {} (lane {}, tail {}, head {}, n {})",
                     r.span_id,
                     self.fold_pos + i as u64,
@@ -7739,6 +8367,318 @@ mod tests {
         assert_eq!(sigfabric::replay_global(sf), sf.global_sig);
         // L: Theorem 7's tracked invariant (the corpus constant).
         assert_eq!(sf.max_lifecycle, 63, "the pinned corpus L (docs/46)");
+    }
+
+
+    // ─── R36-E: the res-record replay cells (Run 800, docs/48) ─────────
+
+    /// Drive the R36-E sustained shape (the champion stack: the R32
+    /// ledger + the call fusion + the worker eval elision, all defaults)
+    /// for `passes` measured passes on ONE worker. One worker keeps the
+    /// phase grid at 64 — the mini tape's boundary orbit is the FULL 64
+    /// (7,903 spans, 7,903 mod 64 = 47, gcd(47,64)=1), the phase law's
+    /// adversarial case: every pass boundary lands at a different grid
+    /// offset, so the arming waits a complete orbit and the logs fill one
+    /// phase per pass. Returns the in-order harvested tuples plus the
+    /// elision's engagement instruments.
+    fn r36e_drive(
+        gt: &[u8],
+        sched: &nf_transport::sched_types::ReplaySchedule,
+        passes: u64,
+    ) -> (
+        Vec<(u64, u64, u64)>,
+        (u64, u64, u64, u64),
+        u64,
+    ) {
+        let construction = r32_prog(0);
+        let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, true, true);
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            gt,
+            sched.clone(),
+            construction,
+            128,
+            None,
+            Some(r32_prog),
+            false,
+            true,
+            16,
+            true,
+            true,
+            true,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        let ladder = crate::soa::ladder8_best();
+        let mut replay = crate::passreplay::PassReplay::new_forced(true);
+        let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+        let mut got = Vec::new();
+        // The ref pass (pass 1) runs live with a separate sink — the
+        // sustained bench's shape (also the generation boundary).
+        t.reset_pass(1, r32_prog(1));
+        {
+            let mut rseq = Sequencer::new_unboxed();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            while t.next_batch() {
+                rseq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+        }
+        for pass in 2..=passes + 1 {
+            t.reset_pass(pass, r32_prog(pass));
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            replay.begin_pass();
+            while t.next_batch() {
+                if !replay.try_replay(&t, &mut seq, &mut sink) {
+                    replay.begin_record(&t, &seq);
+                    {
+                        let mut rec_sink = replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(
+                            t.entries(),
+                            t.now_ns(),
+                            &mut rec_sink,
+                            ladder,
+                        );
+                    }
+                    replay.seal_batch(&seq);
+                }
+                sink.drain_ready();
+            }
+            replay.note_pass_end();
+            sink.end_pass();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+        }
+        sink.finish();
+        let n = sink.harvest_completed(&mut harvested);
+        for rec in &harvested[..n] {
+            got.push(*rec);
+        }
+        (
+            got,
+            fabric.res_replay_totals(),
+            replay.fused_calls(),
+        )
+    }
+
+    /// R36-E: THE ELLISION'S BIT-EXACTNESS + ENGAGEMENT LAW — under the
+    /// full-64 phase orbit (the adversarial rotation), the recorded
+    /// phase scripts arm after one orbit and every later pass REPLAYS:
+    /// the harvested tuples are identical to the per-session sequential
+    /// references (the fold consumes the replayed composite records —
+    /// the tuple assert's law at the cell scale), the boundary count
+    /// matches the pass count (every boundary stepped the phase machine),
+    /// the live passes are exactly the recording orbit, and the fusion
+    /// absorbed the emitter's per-32-span flushes.
+    #[test]
+    fn t_r36e_replay_parity_and_engagement() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        // The mini's orbit is 64 (one worker's grid): 72 measured passes
+        // = the recording orbit (64) + 8 replayed passes.
+        const PASSES: u64 = 72;
+        let (got, (replayed, live, fb, recs), fused) = r36e_drive(&gt, &sched, PASSES);
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R36-E: the replayed tuples diverged from the sequential references"
+        );
+        // THE ENGAGEMENT LAWS: the worker crossed every boundary (the
+        // ref pass + the measured passes + the gen re-anchor), the live
+        // passes are the recording orbit, and the replays dominate.
+        let crossed = replayed + live;
+        assert!(
+            crossed >= PASSES && crossed <= PASSES + 4,
+            "R36-E boundary count: crossed {crossed}, passes {PASSES} \
+             (replayed {replayed}, live {live})"
+        );
+        assert!(
+            replayed >= 4,
+            "R36-E engagement: only {replayed} replayed passes (the orbit 64 needs 72 passes)"
+        );
+        assert_eq!(fb, 0, "R36-E fallbacks on the steady shape (fb {fb})");
+        assert!(recs > 0, "R36-E no records emitted");
+        assert!(
+            fused > 0,
+            "R36-E the call fusion never engaged (fused {fused})"
+        );
+    }
+
+    /// R36-E: THE PHASE MACHINE'S LAWS, unit-level — the orbit fill (one
+    /// phase slot per distinct boundary offset), the arming exactly when
+    /// a phase repeats at a length-aligned offset, the LENGTH LAW's trip
+    /// (a changed pass length resets the whole log and re-records), the
+    /// ALIGNMENT LAW's trip (a rotated offset resets), the hole guard's
+    /// discard (an inline-skipped chunk invalidates the phase), and the
+    /// poison's permanence. The pure state machine — no threads, exact
+    /// arithmetic, the adversarial rotations.
+    #[test]
+    fn t_r36e_phase_machine_laws() {
+        const T: u64 = 7_903; // the mini tape's span count (T mod 64 = 47)
+        let mut log = ResLog::new(true, false, 1);
+        // Pass 1: the base-0 boundary opens the phase-0 recording.
+        log.on_boundary(0);
+        assert!(log.recording, "the first boundary must open the recording");
+        log.push_seg(0, 64, 0x1111);
+        log.push_seg(64, 64, 0x2222);
+        // Pass 2: the phase-0 log SEALS (2 segments) + the length is
+        // learned + the phase-47 recording opens immediately (the
+        // machine always leaves the walk in the recording state for a
+        // fresh phase).
+        log.on_boundary(T);
+        assert!(log.recording, "the fresh phase re-opens the recording");
+        assert_eq!(log.pass_len, T, "the length law learns the pass length");
+        assert_eq!(log.phase, (T % 64) as usize);
+        assert_eq!(log.phase_n[0], 2, "the phase-0 log holds 2 segments");
+        log.push_seg(0, 32, 0x3333);
+        // The orbit: drive boundaries 3..=64 (each a fresh phase — the
+        // mini's orbit is the full 64) — no arming until a repeat.
+        for k in 2..64u64 {
+            log.on_boundary(k * T);
+            assert!(
+                !log.replaying,
+                "no arming before the phase repeats (pass {})",
+                k + 1
+            );
+            assert!(log.recording, "each fresh phase records (pass {})", k + 1);
+            log.push_seg(0, 48, 0x4444);
+        }
+        // Pass 65: the phase 0 repeats at a length-aligned offset (64*T)
+        // — ARMED. The script is the pass-1 recording (2 segments).
+        log.on_boundary(64 * T);
+        assert!(log.replaying, "the phase-0 repeat must arm the replay");
+        assert_eq!(log.rp_next, 0);
+        assert_eq!(log.rp_end, 2);
+        assert_eq!(log.replayed_passes, 1);
+        // THE LENGTH LAW'S TRIP: the next boundary advances a DIFFERENT
+        // delta — the whole log resets and the phase re-records.
+        log.on_boundary(64 * T + T + 13);
+        assert!(!log.replaying, "the length trip must disarm");
+        assert!(log.recording, "the length trip must re-record");
+        assert_eq!(
+            log.segs.len(), 0,
+            "the reset truncated the whole store (the fresh bracket is empty)"
+        );
+        assert_eq!(log.pass_len, 0, "the length is unlearned after the reset");
+        // A grid-aligned length regime (T2 = 8,192 = 64*128: the orbit is
+        // exactly 1 — every boundary repeats the phase) — the arming law
+        // and the alignment trip on a fresh machine.
+        const T2: u64 = 8_192;
+        let mut log2 = ResLog::new(true, false, 1);
+        log2.on_boundary(0);
+        log2.push_seg(0, 64, 0xAAAA);
+        log2.on_boundary(T2);
+        assert_eq!(log2.pass_len, T2);
+        assert_eq!(log2.phase, 0, "T2 mod 64 == 0: the same phase");
+        log2.push_seg(0, 64, 0xBBBB);
+        log2.on_boundary(2 * T2);
+        assert!(
+            log2.replaying,
+            "the grid-aligned length arms on the first repeat"
+        );
+        assert_eq!(log2.rp_end, 1, "the phase-0 script is the one segment");
+        // THE ALIGNMENT LAW'S TRIP: a rotated offset (the phase matches,
+        // the offset is not a multiple of the length) resets.
+        log2.on_boundary(2 * T2 + T2 / 2);
+        assert!(!log2.replaying, "the rotated offset must disarm");
+        assert!(log2.recording, "the rotated offset must re-record");
+        // THE HOLE GUARD: an inline-skipped chunk mid-recording discards
+        // the phase's partial log (the walk continues live).
+        let mut log3 = ResLog::new(true, false, 1);
+        log3.on_boundary(0);
+        log3.push_seg(0, 64, 0xCCCC);
+        log3.discard_phase();
+        assert!(!log3.recording, "the discard closes the recording");
+        assert_eq!(log3.segs.len(), 0, "the discard truncates the segments");
+        assert_eq!(log3.phase_n[0], 0);
+        log3.on_boundary(T);
+        // (the phase T%64 != 0 — a different phase; the phase-0 stays
+        // empty, so the NEXT phase-0 boundary re-records.)
+        log3.on_boundary(64 * T);
+        assert!(
+            log3.recording,
+            "the discarded phase re-records on its next boundary"
+        );
+        // THE AUDIT TWIN: forced live, never armed.
+        let mut log4 = ResLog::new(true, true, 1);
+        log4.on_boundary(0);
+        log4.push_seg(0, 64, 0xDDDD);
+        for k in 1..130u64 {
+            log4.on_boundary(k * T2);
+            assert!(!log4.replaying, "the audit mode never arms");
+        }
+        // THE DISABLED ARM: the same.
+        let mut log5 = ResLog::new(false, false, 1);
+        log5.on_boundary(0);
+        for k in 1..130u64 {
+            log5.on_boundary(k * T2);
+            assert!(!log5.replaying, "the disabled arm never arms");
+        }
+    }
+
+    /// R36-E: THE SPAN-ID WRAP — the fold's order and frontier-cap
+    /// compares live in the u32 span-id domain; past 2^32 spans the
+    /// truncated ids must still tile exactly (the masked order assert +
+    /// the RFC-1982 serial cap). Hand-driven at the drain level: seed
+    /// the fold just below the wrap, emit one record crossing it and
+    /// one after it, and fold — no panic, the cursor lands past the
+    /// wrap, and the chain consumed both records.
+    #[test]
+    fn t_r36w_span_id_wrap() {
+        let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, true, true);
+        let lane = &fabric.lanes[0];
+        // Seed: the fold sits 8 spans below the wrap; the submission
+        // frontier sits 64 past it (the cap's serial window).
+        let base: u64 = u32::MAX as u64 - 7;
+        {
+            let mut sink = HydraSpanSink::new(&fabric);
+            sink.fold_pos = base;
+            sink.next_span = base + 8 + 64;
+            // Two composite records: [base, base+8) crossing the wrap and
+            // [0, 64) after it (the lane's chunk grid: 64-spans).
+            let slots = lane.res_slots();
+            slots[0] = Res {
+                span_id: base as u32,
+                aux: 8,
+                value: 0xAAAA_0000_1111_2222,
+            };
+            slots[1] = Res {
+                span_id: 0,
+                aux: 64,
+                value: 0xBBBB_3333_4444_5555,
+            };
+            lane.res_head.store(2, Ordering::Release);
+            sink.drain_ready();
+            assert_eq!(
+                sink.fold_pos,
+                base + 8 + 64,
+                "R36-E wrap: the fold did not cross 2^32 (fold_pos {})",
+                sink.fold_pos
+            );
+            assert_eq!(
+                lane.res_tail.load(Ordering::Relaxed),
+                2,
+                "R36-E wrap: the records were not consumed"
+            );
+        }
     }
 
 }

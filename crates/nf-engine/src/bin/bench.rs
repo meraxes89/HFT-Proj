@@ -612,6 +612,33 @@ fn run_hydra_sustained_5s(
     // the per-pass hash assert is disabled (count/msg_hash still asserted).
     // (Read BEFORE the allocation window — env::var allocates.)
     let null_diag = std::env::var("HFT_HYDRA_NULL").as_deref() == Ok("1");
+    // R36-E: the eval-elision arm (HFT_RES_REPLAY — default ON; the
+    // worker reads its own copy at spawn, this copy drives the verdict
+    // line's engagement asserts). Read BEFORE the window (env::var
+    // allocates).
+    let res_replay_on = std::env::var("HFT_RES_REPLAY").as_deref() != Ok("0");
+    // R36-E: THE DIAG CLOCK DIET — the per-batch Instant pairs (~2.4 µs
+    // per pass at the 22-batch cadence on the 9V45, ~17% of the projected
+    // post-elision main-thread budget) become calibrated TSC reads: one
+    // _rdtsc (~6ns) + one multiply-shift conversion (the Q32 reciprocal of
+    // the calibrated frequency; the verdict rate's denominator keeps the
+    // monotonic-raw clock — only the DIAG SPLITS change instruments).
+    // Non-x86_64 builds read 0 deltas (the fleet is x86_64; the DIAG is
+    // report-only there).
+    let tsc_mul: u64 = ((1u64 << 32) as f64 * 1000.0 / cal.freq_mhz) as u64;
+    let tsc_now = || -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::x86_64::_rdtsc()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    };
+    let tsc_d = |t0: u64, t1: u64| -> u64 {
+        t1.wrapping_sub(t0).wrapping_mul(tsc_mul) >> 32
+    };
     // R36-B: the re-anchor rollback (CI arm 11r36r) — restores the full
     // per-pass sequencer construction (the 64 KiB arena zero + copy, the
     // PR #20 boundary shape) for the same-draw attribution.
@@ -676,9 +703,9 @@ fn run_hydra_sustained_5s(
         session_counter += 1;
         pass += 1;
 
-        let t_r = std::time::Instant::now();
+        let t_r = tsc_now();
         transport.reset_pass(pass, sess);
-        let t_r1 = std::time::Instant::now();
+        let t_r1 = tsc_now();
         // R36-B: THE O(1) RE-ANCHOR — the 64 KiB arena zero + full-struct
         // copy of `*seq = Sequencer::new_unboxed()` was the pass-open wall
         // (~82% of it: the write-before-read law makes the arena zero pure
@@ -689,34 +716,34 @@ fn run_hydra_sustained_5s(
         } else {
             *seq = Sequencer::new_unboxed();
         }
-        let t_sq = std::time::Instant::now();
+        let t_sq = tsc_now();
         sink.begin_pass();
-        let t_bp = std::time::Instant::now();
+        let t_bp = tsc_now();
         pass_replay.begin_pass();
-        let t_r2 = std::time::Instant::now();
+        let t_r2 = tsc_now();
         // R36 (probe): the pass-open split — the sequencer re-anchor vs
         // the sink's begin_pass (the eager window publish's coherence)
         // vs the replay ledger. Off the steady path by three Instant
         // pairs per pass (~120ns; the RXSCHED_DIAGNOSTIC pattern).
-        d_open_sq_ns += t_sq.duration_since(t_r1).as_nanos() as u64;
-        d_open_bp_ns += t_bp.duration_since(t_sq).as_nanos() as u64;
-        d_open_pr_ns += t_r2.duration_since(t_bp).as_nanos() as u64;
+        d_open_sq_ns += tsc_d(t_r1, t_sq);
+        d_open_bp_ns += tsc_d(t_sq, t_bp);
+        d_open_pr_ns += tsc_d(t_bp, t_r2);
         // R35 (probe): the boundary attribution — the transport re-arm
         // wait vs the sink's pass-open work. Off the steady path by one
         // Instant pair per pass (~40ns; the RXSCHED_DIAGNOSTIC pattern).
-        d_boundary_wait_ns += t_r1.duration_since(t_r).as_nanos() as u64;
-        d_boundary_open_ns += t_r2.duration_since(t_r1).as_nanos() as u64;
+        d_boundary_wait_ns += tsc_d(t_r, t_r1);
+        d_boundary_open_ns += tsc_d(t_r1, t_r2);
 
         // Fold drain every batch: keeps the result rings shallow and the
         // ordered fold close behind submission (the overlap's slack is the
         // in-flight ring capacity, not fold lag).
         loop {
-            let t_w = std::time::Instant::now();
+            let t_w = tsc_now();
             if !transport.next_batch() {
                 break;
             }
-            d_wait_ns += std::time::Instant::now().duration_since(t_w).as_nanos() as u64;
-            let t_b = std::time::Instant::now();
+            d_wait_ns += tsc_d(t_w, tsc_now());
+            let t_b = tsc_now();
             // R32: try the verdict replay first — a TRUE return means the
             // frozen-master regime proved this batch is byte-identical to
             // the recorded one and the recorded sink surface was re-issued
@@ -736,22 +763,22 @@ fn run_hydra_sustained_5s(
                 }
                 pass_replay.seal_batch(&seq);
             }
-            let t_i = std::time::Instant::now();
+            let t_i = tsc_now();
             sink.drain_ready();
-            d_work_ns += t_i.duration_since(t_b).as_nanos() as u64;
-            d_fold_ns += std::time::Instant::now().duration_since(t_i).as_nanos() as u64;
+            d_work_ns += tsc_d(t_b, t_i);
+            d_fold_ns += tsc_d(t_i, tsc_now());
             d_batches += 1;
         }
         pass_replay.note_pass_end();
-        let t_s = std::time::Instant::now();
+        let t_s = tsc_now();
         sink.end_pass(); // non-blocking: the tail folds during the next pass
         let n = sink.harvest_completed(&mut harvested);
-        let t_e = std::time::Instant::now();
+        let t_e = tsc_now();
         let _ = prebaked; // (the engagement line below reports the pre-bake)
         if diag {
-            d_reset_ns += t_r2.duration_since(t_r).as_nanos() as u64;
-            d_scan_ns += t_s.duration_since(t_r2).as_nanos() as u64;
-            d_end_ns += t_e.duration_since(t_s).as_nanos() as u64;
+            d_reset_ns += tsc_d(t_r, t_r2);
+            d_scan_ns += tsc_d(t_r2, t_s);
+            d_end_ns += tsc_d(t_s, t_e);
             d_pending_max = d_pending_max.max(sink.pending());
             d_passes += 1;
         }
@@ -994,6 +1021,53 @@ fn run_hydra_sustained_5s(
                 per_pass_open_ns,
                 prebaked,
                 reanchor_on,
+            );
+        }
+        // R36-E: THE EVAL-ELISION VERDICT — the worker res-record replay's
+        // engagement (the phase logs armed, every loop pass replaying,
+        // the records' throughput) + the main-side call fusion (the
+        // 344-call re-issue collapsed to ~22 fused calls per pass). The
+        // guards live in the worker (docs/48): the frozen-master regime
+        // (upstream), the length law, the phase alignment, the inline
+        // guard, and the per-pass tuple assert — the output gate.
+        {
+            let (replayed, live, fb, recs) = fabric.res_replay_totals();
+            let fused = pass_replay.fused_calls();
+            let n_workers = fabric.workers as u64;
+            // THE ENGAGEMENT LAWS (the exit-0 discipline — the bench
+            // asserts what the CI greps): on an armed run every loop
+            // pass replays (the per-worker boundary count == the pass
+            // count + the two gen re-anchors; the recording orbit and
+            // the fallbacks are the only live passes), the fallbacks
+            // stay at the assist's noise floor, and the fusion absorbs
+            // the emitter's per-32-span flush granularity.
+            if res_replay_on {
+                let crossed = replayed + live;
+                assert!(
+                    crossed >= n_workers * d_passes,
+                    "R36-E engagement: the workers crossed {crossed} boundaries \
+                     < {n_workers}x{d_passes} (replayed={replayed} live={live})"
+                );
+                assert!(
+                    crossed <= n_workers * (d_passes + 8),
+                    "R36-E engagement: the workers crossed {crossed} boundaries \
+                     > {n_workers}x{} (a re-record loop?)",
+                    d_passes + 8
+                );
+                assert!(
+                    replayed > 0,
+                    "R36-E engagement: zero replayed passes on an armed run"
+                );
+            }
+            println!(
+                "PR1_R36_EVAL_ELISION_VERDICT rate={} elision={} replayed_passes={} live_passes={} fallbacks={} res_records={} fused_calls={} (R36-E: the worker eval elision — the res-record replay over the phase-segment logs + the main-side call fusion; the per-pass worker cost collapses from the span walk to the record emission; the guards: the frozen-master regime, the length law, the phase alignment, the inline guard, the per-pass tuple assert — docs/48)",
+                sustained_rate,
+                replayed > 0,
+                replayed,
+                live,
+                fb,
+                recs,
+                fused,
             );
         }
     }

@@ -886,6 +886,12 @@ cargo test --release -p nf-testkit spanfold 2>&1 | tee /tmp/test_r36.txt
 grep -q "test result: ok" /tmp/test_r36.txt
 cargo test --release -p nf-testkit t_r36f 2>&1 | tee /tmp/test_r36f.txt
 grep -q "test result: ok" /tmp/test_r36f.txt
+# R36-E: the res-record replay cells (the phase machine's laws, the
+# sustained parity/engagement under the full-64 orbit, the span-id wrap).
+cargo test --release -p nf-testkit t_r36e 2>&1 | tee /tmp/test_r36e.txt
+grep -q "test result: ok" /tmp/test_r36e.txt
+cargo test --release -p nf-testkit t_r36w 2>&1 | tee /tmp/test_r36w.txt
+grep -q "test result: ok" /tmp/test_r36w.txt
 cargo test --release -p nf-arbitrator test_r36 2>&1 | tee /tmp/test_r36r.txt
 grep -q "test result: ok" /tmp/test_r36r.txt
 cargo run --release -p nf-testkit --bin spanbench 2>&1 | tee /tmp/bench_r36.txt
@@ -908,8 +914,30 @@ grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true" /tmp/bench_r36s.txt
 grep -q "SIGFABRIC_DIAGNOSTIC.*span_hash=0x" /tmp/bench_r36s.txt
 grep -q "SIGFABRIC_DIAGNOSTIC.*span_merge_ok=true" /tmp/bench_r36s.txt
 grep -q "BOUNDARY_DIAGNOSTIC.*open_split" /tmp/bench_r36s.txt
+# R36-E: THE EVAL-ELISION VERDICT — the res-record replay's engagement
+# (every loop pass replaying, the records' throughput) + the call
+# fusion (the main-side re-issue collapsed). The bench asserts the
+# engagement laws itself (exit 0); the greps pin the lines' presence.
+grep -q "PR1_R36_EVAL_ELISION_VERDICT rate=" /tmp/bench_r36s.txt
+grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=true" /tmp/bench_r36s.txt
+grep -q "RESREPLAY_DIAGNOSTIC sustained: .*elision=true" /tmp/bench_r36s.txt
+grep -q "RESREPLAY_DIAGNOSTIC.*replayed_passes=" /tmp/bench_r36s.txt
+grep "PR1_R36_EVAL_ELISION_VERDICT" /tmp/bench_r36s.txt | head -1
 grep "PR1_R36_RESFOLD_VERDICT" /tmp/bench_r36s.txt | head -1
 grep "BOUNDARY_DIAGNOSTIC sustained" /tmp/bench_r36s.txt | head -1
+
+# ── 11r36er. R36-E: the eval-elision rollback (the attribution arm) ──
+# HFT_RES_REPLAY=0 restores the live walk verbatim (the workers re-walk
+# every span of every pass); HFT_CALL_FUSION=0 restores the per-32-span
+# call re-issue. Same-draw delta 11r36 - 11r36er = the elision's
+# contribution (the worker eval collapse + the main-side call diet).
+HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_CALL_FUSION=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36er.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r36er.txt
+grep -q "allocs=0" /tmp/bench_r36er.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r36er.txt
+grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=false" /tmp/bench_r36er.txt
+grep -q "RESREPLAY_DIAGNOSTIC sustained: .*elision=false" /tmp/bench_r36er.txt
+grep "PR1_R36_EVAL_ELISION_VERDICT" /tmp/bench_r36er.txt | head -1
 
 # ── 11r36r. R36-B: the re-anchor rollback (the attribution arm) ──────
 # HFT_REANCHOR=0 restores the full per-pass sequencer construction
