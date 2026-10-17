@@ -1851,6 +1851,7 @@ fn lane_worker_rxdesc_diet(
     composite: bool,
     group: bool,
     sig_fabric: Arc<std::sync::OnceLock<Arc<crate::sigfabric::SigFabric>>>,
+    res_replay_override: Option<bool>,
 ) {
     stats
         .cpu
@@ -1870,13 +1871,16 @@ fn lane_worker_rxdesc_diet(
     // arm prices the steady shape (the global walk alone).
     let audit_mode = std::env::var("HFT_SIG_AUDIT").is_ok();
     // R36-E (docs/48): the res-record replay — the worker eval elision.
-    // HFT_RES_REPLAY=0 rolls back to the live walk verbatim (the
-    // attribution arm 11r36er); HFT_RES_AUDIT=1 is the differential twin
-    // (the live walk with the counters still tracking — the cells).
-    // Read once here, outside every window (law #9: env parsing is
-    // allocation). The log's 1 MB segment store allocates HERE (the
+    // OPT-IN (`HFT_RES_REPLAY=1`) — the elision's frozen-regime premise
+    // holds on the R32 champion shape; the pre-R32 multipass shapes keep
+    // the verbatim live walk (their inline-assist interleaving is
+    // timing-dependent). The tests force the flag through the fabric's
+    // spawn override (process-global env vars race the parallel
+    // transports' worker spawns). Read once here, outside every window
+    // (law #9). The log's 1 MB segment store allocates HERE (the
     // worker's spawn — pre-window, the allocs=0 gate law).
-    let reslog_enabled = std::env::var("HFT_RES_REPLAY").as_deref() == Ok("1")
+    let reslog_enabled = res_replay_override
+        .unwrap_or_else(|| std::env::var("HFT_RES_REPLAY").as_deref() == Ok("1"))
         && composite
         && !null;
     let reslog_audit = std::env::var("HFT_RES_AUDIT").is_ok();
@@ -2884,6 +2888,33 @@ impl HydraFabric {
         composite: bool,
         group: bool,
     ) -> Box<Self> {
+        Self::spawn_pinned_full_opts(
+            workers,
+            worker_cpus,
+            desc8,
+            rxdesc,
+            diet,
+            composite,
+            group,
+            None,
+        )
+    }
+
+    /// R36-E: the full spawn with the res-record replay's arming OVERRIDE
+    /// (the tests force the flag here — the process-global env races the
+    /// parallel transports' worker spawns; `None` defers to
+    /// `HFT_RES_REPLAY=1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_pinned_full_opts(
+        workers: usize,
+        worker_cpus: &[usize],
+        desc8: bool,
+        rxdesc: bool,
+        diet: bool,
+        composite: bool,
+        group: bool,
+        res_replay: Option<bool>,
+    ) -> Box<Self> {
         let kernel = CrcKernel::detect();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(workers);
@@ -2932,6 +2963,7 @@ impl HydraFabric {
                             if diet {
                                 lane_worker_rxdesc_diet(
                                     lane, sd, kern, stats, rx, lane_idx, n_lanes, comp, grp, sfc,
+                                    res_replay,
                                 )
                             } else {
                                 lane_worker_rxdesc(
@@ -8391,7 +8423,10 @@ mod tests {
         u64,
     ) {
         let construction = r32_prog(0);
-        let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, true, true);
+        // R36-E: the elision is FORCED through the spawn override (the
+        // env races the parallel tests' worker spawns).
+        let fabric =
+            HydraFabric::spawn_pinned_full_opts(1, &[], true, true, true, true, true, Some(true));
         let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             gt,
             sched.clone(),

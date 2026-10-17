@@ -888,11 +888,10 @@ cargo test --release -p nf-testkit t_r36f 2>&1 | tee /tmp/test_r36f.txt
 grep -q "test result: ok" /tmp/test_r36f.txt
 # R36-E: the res-record replay cells (the phase machine's laws, the
 # sustained parity/engagement under the full-64 orbit, the span-id wrap).
-# The elision is OPT-IN (HFT_RES_REPLAY=1): its frozen-regime premise
-# holds on the R32 champion shape; the pre-R32 multipass shapes keep
-# the verbatim live walk (the inline-claim interleaving there is
-# timing-dependent — the elision's guards address the frozen regime).
-HFT_RES_REPLAY=1 cargo test --release -p nf-testkit t_r36e 2>&1 | tee /tmp/test_r36e.txt
+# The cells force the elision through the fabric's spawn override
+# (the env would race the parallel tests' worker spawns); the
+# pre-R32 multipass shapes keep the verbatim live walk by default.
+cargo test --release -p nf-testkit t_r36e 2>&1 | tee /tmp/test_r36e.txt
 grep -q "test result: ok" /tmp/test_r36e.txt
 cargo test --release -p nf-testkit t_r36w 2>&1 | tee /tmp/test_r36w.txt
 grep -q "test result: ok" /tmp/test_r36w.txt
