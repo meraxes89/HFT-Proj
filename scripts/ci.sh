@@ -904,7 +904,7 @@ grep -q "dual_path=true" /tmp/bench_r36.txt
 grep -q "replay_ok=true" /tmp/bench_r36.txt
 grep -q "merge_ok=true" /tmp/bench_r36.txt
 grep "PR1_R36_RES_FOLD_VERDICT" /tmp/bench_r36.txt | head -1
-HFT_RXDESC=1 HFT_RES_REPLAY=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36s.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36s.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r36s.txt
 grep -q "allocs=0" /tmp/bench_r36s.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r36s.txt
@@ -934,7 +934,7 @@ grep "BOUNDARY_DIAGNOSTIC sustained" /tmp/bench_r36s.txt | head -1
 # every span of every pass); HFT_CALL_FUSION=0 restores the per-32-span
 # call re-issue. Same-draw delta 11r36 - 11r36er = the elision's
 # contribution (the worker eval collapse + the main-side call diet).
-HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_CALL_FUSION=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36er.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_CALL_FUSION=0 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36er.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r36er.txt
 grep -q "allocs=0" /tmp/bench_r36er.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r36er.txt

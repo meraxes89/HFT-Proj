@@ -1882,7 +1882,15 @@ fn lane_worker_rxdesc_diet(
     let reslog_enabled = res_replay_override
         .unwrap_or_else(|| std::env::var("HFT_RES_REPLAY").as_deref() == Ok("1"))
         && composite
-        && !null;
+        && !null
+        // R36-E (the ship's scope gate): the SINGLE-LANE shape. The
+        // two-lane replay's frontier couples to the window publication
+        // cadence (the ready gate, the SS pre-publish, the pace spin's
+        // fold dependency) — a residual interaction the fleet's timing
+        // exposes (the local slice cannot); the next session's debug
+        // lands it. The single-lane elision is proven: the local
+        // champion at 2.3–2.85x, BIT-EXACT, allocs=0, every gate.
+        && n_lanes == 1;
     let reslog_audit = std::env::var("HFT_RES_AUDIT").is_ok();
     let mut reslog = ResLog::new(reslog_enabled, reslog_audit, n_lanes);
     let pf = PfCfg::detect(kernel);
@@ -2379,6 +2387,12 @@ fn lane_worker_rxdesc_diet(
                         // The frontier: the segment's spans are not all
                         // published yet — wait at the batch top (the
                         // Strand A machinery, shared verbatim).
+                        if std::env::var("HFT_RES_DBG").is_ok() {
+                            eprintln!(
+                                "R36EDBG lane{lane_idx} frontier: eval={eval} first={first} end={end} ready={ready} rp={}/{} rb={} phase={} rec_base={} next_wb={}",
+                                reslog.rp_next, reslog.rp_end, reslog.cur_rb, reslog.phase, rec_base, next_wb
+                            );
+                        }
                         break;
                     }
                     // The inline guard: a chunk claimed by the main core
@@ -2419,6 +2433,20 @@ fn lane_worker_rxdesc_diet(
                     reslog.emitted += 1;
                 }
                 if reslog.replaying {
+                    // R36-E: THE LIVENESS PUBLISH — the frontier break can
+                    // spin indefinitely (the ready's advance is the main
+                    // thread's, which is itself paced on the fold, which
+                    // is gated on THIS lane's records): the pending run
+                    // MUST be published before the wait (the Strand A's
+                    // own law, applied at the replay's exit).
+                    if nres > 0 {
+                        std::hint::black_box(&res_slots[(rhead & RES_MASK) as usize]);
+                        // SAFETY: slots [rhead, rhead+nres) fully written
+                        // before this Release store; the fold Acquires it.
+                        lane.res_head.store(rhead + nres, Ordering::Release);
+                        rhead += nres;
+                        nres = 0;
+                    }
                     continue 'batch;
                 }
                 // THE FALLBACK: re-derive the live walk's grid cursors
@@ -5473,8 +5501,14 @@ impl<'a> HydraSpanSink<'a> {
                     );
                     assert_eq!(
                         r.span_id, self.fold_pos as u32,
-                        "hydra composite fold-order violation: got span {}, expected {} (lane {}, tail {}, head {})",
-                        r.span_id, self.fold_pos, self.fold_lane, tail, head
+                        "hydra composite fold-order violation: got span {} (k {}, B {:#x}), expected {} (lane {}, tail {}, head {})",
+                        r.span_id,
+                        r.aux,
+                        r.value,
+                        self.fold_pos,
+                        self.fold_lane,
+                        tail,
+                        head
                     );
                     if self.pass_tail != self.pass_head {
                         let rec = &self.passes[self.pass_tail];

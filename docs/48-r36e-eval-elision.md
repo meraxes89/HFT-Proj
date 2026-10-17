@@ -59,15 +59,19 @@ it.)
    fails loud the same pass. The SPANHASH surface (the O(1) P64
    application + the R36-C merge law's fail-stops) shadows it.
 
-Arming: OPT-IN (`HFT_RES_REPLAY=1`) — the elision's frozen-regime
-premise holds on the R32 champion shape (the sustained loop's
-frozen-master template); the pre-R32 multipass shapes (the direct
-live ingest, no pass-replay ledger) keep the verbatim walk — their
-inline-assist interleaving is timing-dependent and the fleet's faster
-silicon exposed the divergence class there (shard 59's draw:
-`t_rxdesc_sustained_multipass_parity`, the replay vs the mid-walk
-inline claims). The CI's champion arm (11r36) sets the flag
-explicitly; `HFT_RES_AUDIT=1` is the live-walk differential twin. The log's 1 MB segment store
+Arming: OPT-IN (`HFT_RES_REPLAY=1`) AND single-lane (`n_lanes == 1`) —
+the ship's scope gate. The frozen-regime premise holds on the R32
+champion shape; the pre-R32 multipass shapes keep the verbatim walk
+(their inline-assist interleaving is timing-dependent — the fleet's
+shard-59 draw proved it). The two-lane replay additionally couples to
+the window publication cadence (the ready gate, the self-serve
+pre-publish, the pace spin's fold dependency — the frontier deadlock
+class the local slice cannot reproduce; the liveness publish fixed one
+cycle, the residual lands next session). The single-lane elision is
+proven end-to-end: the local champion at 2.3–2.85×, BIT-EXACT,
+allocs=0, every gate. The CI's champion arm (11r36) runs the
+one-worker shape armed; `HFT_RES_AUDIT=1` is the live-walk
+differential twin. The log's 1 MB segment store
 allocates at worker spawn (pre-window; the allocs=0 gate law); the gen
 re-anchor clears it in place.
 
