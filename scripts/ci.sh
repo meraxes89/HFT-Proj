@@ -818,6 +818,58 @@ grep -q "bitexact=true" /tmp/bench_r34.txt
 grep -q "dual_path=true" /tmp/bench_r34.txt
 grep "PR1_R34_AFFINE_FOLD_VERDICT" /tmp/bench_r34.txt | head -1
 
+# ── 11r35. R35: the pass-boundary collapse + the A5.0 fabric wiring ──
+# THE R35 PROGRAM (docs/46): (A) the MARKER-DECOUPLED ADVANCE — under
+# the frozen-schedule regime the EOS-marker's LANDING performs the next
+# pass's bake (the consumer is ~NBUF turns back, so auto_pass is
+# already the boundary's target when reset_pass arrives — the 11.9µs
+# marker-free->wake->advance->wake round trip, 85% of the R33 record
+# draw's reset_ms=2,157.9 wall, leaves the critical path) with the
+# BOUNDED PRE-ARM GATE (the next marker lands only after the consumer
+# freed the current pass's first turn — the R16b cap-lock's
+# generalized invariant + the exact auto_pass contract at ANY ring
+# depth). (B) THE A5.0 SIGNATURE FABRIC — Worker 0 bakes the per-locate
+# 512-chunk signature table from the RX ledger's frame bodies (the
+# Phase-R order-ID cache with the §5.6 policies + the R34 kernel's
+# folds), then every pass's window boundary replays the global Σ walk
+# (~977 combines, the 230ns/pass class) with the fail-stop digest
+# assert. This arm lands the acceptance on target silicon: the lobstate
+# + sigfabric differential cells (the decoder vs the sequential
+# oracle, the §5.6 policy matrix, the dual-path digest, the golden
+# tape's count/L laws, the fabric integration cell), then the champion
+# sustained arm with BOTH verdict lines (PR1_R35_PREARM_VERDICT +
+# SIGFABRIC_DIAGNOSTIC) + the hard floor (bit-parity, allocs=0).
+cargo test --release -p nf-testkit sigfabric 2>&1 | tee /tmp/test_r35.txt
+grep -q "test result: ok" /tmp/test_r35.txt
+cargo test --release -p nf-testkit t_r35 2>&1 | tee /tmp/test_r35b.txt
+grep -q "test result: ok" /tmp/test_r35b.txt
+HFT_RXDESC=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r35.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r35.txt
+grep -q "allocs=0" /tmp/bench_r35.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r35.txt
+grep -q "PR1_R35_PREARM_VERDICT rate=" /tmp/bench_r35.txt
+grep -q "PR1_R35_PREARM_VERDICT.*armed=true" /tmp/bench_r35.txt
+grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true" /tmp/bench_r35.txt
+grep -q "SIGFABRIC_DIAGNOSTIC.*msgs=505849" /tmp/bench_r35.txt
+grep -q "SIGFABRIC_DIAGNOSTIC.*L=63" /tmp/bench_r35.txt
+grep "PR1_R35_PREARM_VERDICT" /tmp/bench_r35.txt | head -1
+grep "SIGFABRIC_DIAGNOSTIC sustained" /tmp/bench_r35.txt | head -1
+grep "BOUNDARY_DIAGNOSTIC sustained" /tmp/bench_r35.txt | head -1
+
+# ── 11r35r. R35-A: the pre-arm rollback (the attribution arm) ────────
+# HFT_PREARM=0 restores the synchronous marker-free advance verbatim
+# (the R33 boundary shape): same-draw delta 11r35 - 11r35r = the
+# boundary collapse's contribution (reset_ms + the rate). The A5.0
+# fabric stays armed on both arms (its own rollback is
+# HFT_SIG_FABRIC=0, priced separately if the fleet asks).
+HFT_RXDESC=1 HFT_PREARM=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r35r.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r35r.txt
+grep -q "allocs=0" /tmp/bench_r35r.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r35r.txt
+grep -q "PR1_R35_PREARM_VERDICT.*armed=false" /tmp/bench_r35r.txt
+grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true" /tmp/bench_r35r.txt
+grep "PR1_R35_PREARM_VERDICT" /tmp/bench_r35r.txt | head -1
+
 # R17 ARM RETIREMENT (settled attribution — roadmaps' shard-economics
 # ruling): 11x (pre-diet rxdesc) and 11y (strand-A isolation) priced the
 # diet across draws 12-15 (4 pricings: +1.4/+0.9/+0.0/+2.6%, median

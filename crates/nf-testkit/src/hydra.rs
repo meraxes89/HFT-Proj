@@ -744,6 +744,16 @@ pub struct WorkerStats {
     /// mode was armed (untagged descs or the diagnostic shapes) —
     /// expected 0 on the steady armed path.
     pub affine_fallbacks: AtomicU64,
+    /// R35-B: 𝒜₅.₀ signature replays completed (one per pass — the
+    /// per-locate Σ/Ψ/digest re-derivation over the frozen chunk-sig
+    /// table; the engagement law: == the pass count on an armed run).
+    pub sig_replays: AtomicU64,
+    /// R35-B: nanoseconds in those replays (the R34 replay's fabric-side
+    /// price — the per-pass live check's whole cost).
+    pub sig_digest_ns: AtomicU64,
+    /// R35-B: the bake's cost (once; the untimed decode+resolve+fold of
+    /// the whole stream — the ledger bodies).
+    pub sig_bake_ns: AtomicU64,
     /// This worker's pinned cpu (usize::MAX when unpinned).
     pub cpu: AtomicU64,
 }
@@ -760,6 +770,9 @@ impl WorkerStats {
             frontier_ns: AtomicU64::new(0),
             affine_hits: AtomicU64::new(0),
             affine_fallbacks: AtomicU64::new(0),
+            sig_replays: AtomicU64::new(0),
+            sig_digest_ns: AtomicU64::new(0),
+            sig_bake_ns: AtomicU64::new(0),
             cpu: AtomicU64::new(u64::MAX),
         }
     }
@@ -1542,11 +1555,25 @@ fn lane_worker_rxdesc_diet(
     n_lanes: u64,
     composite: bool,
     group: bool,
+    sig_fabric: Arc<std::sync::OnceLock<Arc<crate::sigfabric::SigFabric>>>,
 ) {
     stats
         .cpu
         .store(crate::affinity::current_cpu() as u64, Ordering::Relaxed);
     let null = null_mode();
+    // R35-B (docs/46): the 𝒜₅.₀ signature-fabric wiring — Worker 0 (the
+    // single-owner resolve lane, blueprint §6.1's role) bakes the frozen
+    // per-locate chunk-sig table ONCE from the RX ledger's frame bodies
+    // (the untimed Phase-R decode + the R34 kernel's 512-chunk folds),
+    // then re-derives every pass's Σ/Ψ/digest from the frozen table and
+    // fail-stops on any divergence (the R32 ledger's PANIC discipline —
+    // a corrupted table cannot pass). HFT_SIG_FABRIC=0 is the rollback
+    // (the live walk verbatim; the R35-B telemetry stays zeroed).
+    let sig_armed = std::env::var("HFT_SIG_FABRIC").as_deref() != Ok("0");
+    // R35-B: the audit path (HFT_SIG_AUDIT=1) adds the full per-locate
+    // re-derivation to the per-pass hook — the cells always run it; the
+    // arm prices the steady shape (the global walk alone).
+    let audit_mode = std::env::var("HFT_SIG_AUDIT").is_ok();
     let pf = PfCfg::detect(kernel);
     // The drain batch (read ONCE at worker start — outside every window;
     // worker_batch() parses an env var, which ALLOCATES).
@@ -1868,6 +1895,106 @@ fn lane_worker_rxdesc_diet(
                     if composite && is_pass {
                         seg.flush(res_slots, rhead, &mut nres);
                     }
+                    // R35-B: THE 𝒜₅.₀ FABRIC HOOK (Worker 0, once per
+                    // pass). The bake (the first pass): the ledger
+                    // bodies → the frozen per-locate chunk-sig table +
+                    // the state digest. Every later pass: the wide
+                    // replay (the per-locate Σ/Ψ/digest re-derivation
+                    // over the frozen table — the R34 "replay" law made
+                    // real in the fabric) with the digest assert. The
+                    // hook is off the eval's critical accounting (it
+                    // runs in the boundary-crossing branch, ~once per
+                    // 22k spans; its cost is priced by sig_digest_ns).
+                    if is_pass && sig_armed && lane_idx == 0 {
+                        if let Some(sf) = sig_fabric.get() {
+                            // THE PER-PASS REPLAY: the global Σ walk over
+                            // the frozen 512-chunk table (the R34 law —
+                            // ~977 combines, the 230ns/pass class) with
+                            // the fail-stop assert. HFT_SIG_AUDIT=1 adds
+                            // the FULL per-locate re-derivation (the Σ/Ψ
+                            // walk + the state digest — the audit path;
+                            // the cells run it always).
+                            let t0 = std::time::Instant::now();
+                            let g = crate::sigfabric::replay_global(sf);
+                            assert_eq!(
+                                g, sf.global_sig,
+                                "R35-B: the global signature replay diverged — the \
+                                 frozen chunk table is corrupt (the fail-stop)"
+                            );
+                            let mut ns = t0.elapsed().as_nanos() as u64;
+                            if audit_mode {
+                                let (digest, _) = crate::sigfabric::replay_sig_fabric(sf);
+                                assert_eq!(
+                                    digest, sf.digest,
+                                    "R35-B audit: the per-locate state digest diverged"
+                                );
+                                ns += t0.elapsed().as_nanos() as u64;
+                            }
+                            stats.sig_replays.fetch_add(1, Ordering::Relaxed);
+                            stats.sig_digest_ns.fetch_add(ns, Ordering::Relaxed);
+                        } else if !rx.ledger_rows().is_empty() {
+                            // The bake — once, untimed (the recording
+                            // pass's window; the ledger is published by
+                            // the RX's fill before any window opens).
+                            let t0 = std::time::Instant::now();
+                            let rows = rx.ledger_rows();
+                            // THE DUAL-FEED DEDUP (the sequencer's law):
+                            // the blob renders BOTH feeds — the ledger
+                            // rows interleave feed-0/feed-1 frames with
+                            // byte-identical message blocks. The
+                            // sequencer advances `w = first_seq + count`
+                            // and dup-skips any frame whose first_seq
+                            // falls below it; the bake walks the same
+                            // law so the token stream is the single-feed
+                            // message chain (msgs == the hydra count).
+                            let mut w: u64 = 0;
+                            let mut bodies: Vec<&[u8]> = Vec::with_capacity(rows.len() / 2 + 8);
+                            for r in rows.iter() {
+                                // SAFETY: the row's body is the frame's
+                                // span body — the TOMBSTONE RULE's
+                                // `frame[HEADER_LEN+2..flen]` (the message
+                                // chain minus its FIRST length prefix,
+                                // which sits at frame[HEADER_LEN..
+                                // HEADER_LEN+2]). The frame header
+                                // fields live below the body: seq at
+                                // frame[10..18] == (body_ptr−12), count
+                                // at frame[18..20] == (body_ptr−4). The
+                                // blob is pinned for the process's life,
+                                // read-only here, and body_ptr−22 is the
+                                // frame's start (in-bounds by the fill's
+                                // own contract).
+                                unsafe {
+                                    let base = (r.body_ptr - 22) as *const u8;
+                                    let first_seq = u64::from_be_bytes(
+                                        std::slice::from_raw_parts(base.add(10), 8)
+                                            .try_into()
+                                            .unwrap(),
+                                    );
+                                    let count = u16::from_be_bytes(
+                                        std::slice::from_raw_parts(base.add(18), 2)
+                                            .try_into()
+                                            .unwrap(),
+                                    );
+                                    if w == 0 {
+                                        w = first_seq; // the first frame anchors
+                                    }
+                                    if first_seq < w {
+                                        continue; // the dual-feed duplicate — skip
+                                    }
+                                    w += count as u64;
+                                    bodies.push(std::slice::from_raw_parts(
+                                        base.add(20),
+                                        r.body_len as usize + 2,
+                                    ));
+                                }
+                            }
+                            let sf = Arc::new(crate::sigfabric::bake_sig_fabric(&bodies));
+                            let _ = sig_fabric.set(Arc::clone(&sf));
+                            stats
+                                .sig_bake_ns
+                                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        }
+                    }
                 }
                 // R26: THE VERTICAL 8-SPAN GROUP — one 64 B arr load, one
                 // 64 B values load, batched counters; the per-span loop's
@@ -2135,6 +2262,13 @@ pub struct HydraFabric {
     /// per-span Res shape. Only meaningful with `rxdesc` armed — the
     /// ring path always emits per-span (its rollback semantics).
     pub composite_res: bool,
+    /// R35-B: the frozen 𝒜₅.₀ signature table — baked ONCE by Worker 0
+    /// (the Phase-R decode + the R34 kernel's per-locate 512-chunk
+    /// folds over the RX ledger's frame bodies), read by the per-pass
+    /// digest replay (the Σ/Ψ re-derivation + the fail-stop assert).
+    /// Shared to the workers at spawn; the fabric keeps the handle for
+    /// the diagnostics.
+    pub sig_fabric: Arc<std::sync::OnceLock<Arc<crate::sigfabric::SigFabric>>>,
 }
 
 impl HydraFabric {
@@ -2222,6 +2356,10 @@ impl HydraFabric {
             lanes.push(Arc::from(HydraLane::new()));
             wstats.push(Arc::new(WorkerStats::new()));
         }
+        // R35-B: the shared 𝒜₅.₀ table cell (Worker 0 bakes; the fabric
+        // reads it for the diagnostics post-run).
+        let sig_fabric: Arc<std::sync::OnceLock<Arc<crate::sigfabric::SigFabric>>> =
+            Arc::new(std::sync::OnceLock::new());
         let rxdesc_state = rxdesc.then(|| {
             Arc::new(RxdescState::new(
                 std::env::var("HFT_RXDESC_CAP")
@@ -2243,6 +2381,7 @@ impl HydraFabric {
             let n_lanes = lanes.len() as u64;
             let comp = composite;
             let grp = group;
+            let sfc = Arc::clone(&sig_fabric);
             let h = std::thread::Builder::new()
                 .stack_size(512 * 1024)
                 .name("hydra-worker".to_string())
@@ -2254,7 +2393,7 @@ impl HydraFabric {
                         Some(rx) => {
                             if diet {
                                 lane_worker_rxdesc_diet(
-                                    lane, sd, kern, stats, rx, lane_idx, n_lanes, comp, grp,
+                                    lane, sd, kern, stats, rx, lane_idx, n_lanes, comp, grp, sfc,
                                 )
                             } else {
                                 lane_worker_rxdesc(
@@ -2279,6 +2418,7 @@ impl HydraFabric {
             desc8,
             rxdesc: rxdesc_state,
             composite_res: composite,
+            sig_fabric,
         })
     }
 
@@ -2308,7 +2448,7 @@ impl HydraFabric {
             };
             let placement = &self.worker_cpus;
             eprintln!(
-                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1}",
+                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1}",
                 ws.batches.load(Ordering::Relaxed),
                 ws.spans.load(Ordering::Relaxed),
                 ws.eval_ns.load(Ordering::Relaxed) as f64 / 1e6,
@@ -2316,6 +2456,45 @@ impl HydraFabric {
                 ws.res_waits.load(Ordering::Relaxed),
                 ws.frontier_waits.load(Ordering::Relaxed),
                 ws.frontier_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                ws.sig_replays.load(Ordering::Relaxed),
+                ws.sig_digest_ns.load(Ordering::Relaxed) as f64 / 1e3,
+                ws.sig_bake_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            );
+        }
+        // R35-B: the 𝒜₅.₀ fabric's engagement line (always printed —
+        // the CI arm greps it; the engagement law: sig_replays == the
+        // pass count − 1 on an armed run, the digest assert never
+        // fires, and the bake is once).
+        if let Some(sf) = self.sig_fabric.get() {
+            let replays: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.sig_replays.load(Ordering::Relaxed))
+                .sum();
+            let ns: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.sig_digest_ns.load(Ordering::Relaxed))
+                .sum();
+            eprintln!(
+                "SIGFABRIC_DIAGNOSTIC {label}: baked=true msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} (R35-B: the A5.0 signature fabric — the Phase-R bake + the per-pass wide replay with the fail-stop digest, docs/46)",
+                sf.n_msgs,
+                sf.n_locates,
+                sf.chunks,
+                sf.max_lifecycle,
+                sf.digest,
+                replays,
+                ns as f64 / 1e3,
+            );
+        } else {
+            let replays: u64 = self
+                .wstats
+                .iter()
+                .map(|w| w.sig_replays.load(Ordering::Relaxed))
+                .sum();
+            eprintln!(
+                "SIGFABRIC_DIAGNOSTIC {label}: baked=false sig_replays={} (R35-B: the signature fabric disarmed or unbaked — HFT_SIG_FABRIC=0)",
+                replays,
             );
         }
     }
@@ -7177,6 +7356,7 @@ mod tests {
             true,
             true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
                   // identity guard is the replay's oracle (the champion shape).
+            true, // R35-A: prearm mirrors the sched-replay arm (the champion shape)
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -7328,6 +7508,7 @@ mod tests {
             true,
             true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
                   // identity guard is the replay's oracle (the champion shape).
+            true, // R35-A: prearm mirrors the sched-replay arm (the champion shape)
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -7405,4 +7586,135 @@ mod tests {
             "engagement after the barrier recovery (passes {rp_passes}, batches {rp_batches}, live {rp_live})"
         );
     }
+
+    use crate::sigfabric;
+
+    /// R35-B: THE 𝒜₅.₀ FABRIC INTEGRATION CELL — the sustained
+    /// multi-pass shape (the champion regime: the diet worker + the
+    /// composite fold + the frozen-master transport) with the signature
+    /// fabric wired: Worker 0 bakes the per-locate chunk-sig table from
+    /// the RX ledger (the untimed Phase-R decode + the R34 kernel
+    /// folds), and every pass's window boundary runs the global Σ
+    /// replay with the fail-stop assert. THE LAWS:
+    /// * the count law: the baked token count == the hydra span-fold's
+    ///   per-pass message count (the same stream, both surfaces);
+    /// * the engagement law: sig_replays == the pass count (every
+    ///   window replayed; the digest assert never fires);
+    /// * the parity law: every pass's tuple == the sequential reference
+    ///   (the R32/R33 gates carry the whole load — the 𝒜₅.₀ fabric
+    ///   changes nothing observable);
+    /// * the audit law: the full per-locate re-derivation (the Σ/Ψ
+    ///   walk) == the frozen state digest (the dual-path cell's law at
+    ///   the fabric level).
+    #[test]
+    fn t_r35b_fabric_integration_sustained() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        fn prog(pass: u64) -> [u8; 10] {
+            let mut s = *b"RXDA5FAB01";
+            if pass >= 1 {
+                s[8..10].copy_from_slice(&pass.to_be_bytes()[6..8]);
+            }
+            s
+        }
+        // The sequential reference (the oracle tuple).
+        let mut t_ref = ReplayTransport::new(&gt, sched.clone(), prog(0));
+        let want = seq_pass(&mut t_ref, prog(1));
+
+        let fabric = HydraFabric::spawn_pinned_full(1, &[], true, true, true, true, true);
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto(
+            &gt,
+            sched.clone(),
+            prog(0),
+            128,
+            None,
+            Some(prog),
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        // The ref pass (pass 1): the live walk + the BAKE (the worker's
+        // first window opens here — the ledger is already filled by the
+        // RX's thread-start probe).
+        t.reset_pass(1, prog(1));
+        {
+            let mut seq = Sequencer::new();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            let ladder = crate::soa::ladder8_best();
+            while t.next_batch() {
+                seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+            assert_eq!(
+                (ref_sink.count, ref_sink.hash, ref_sink.msg_hash),
+                want,
+                "the ref tuple (the fabric changes nothing observable)"
+            );
+        }
+        // The sustained passes: each pass replays the signature fabric's
+        // global Σ at its window boundary (the fail-stop assert), and
+        // the per-pass tuple must stay the reference.
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        let ladder = crate::soa::ladder8_best();
+        let mut harvested = [(0u64, u64::MAX, u64::MAX); PASS_RING];
+        let mut tuples = 0usize;
+        for pass in 2..=12u64 {
+            t.reset_pass(pass, prog(pass));
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            while t.next_batch() {
+                seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut sink, ladder);
+                sink.drain_ready();
+            }
+            sink.end_pass();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                assert_eq!((rec.0, rec.1, rec.2), want, "pass {pass} diverged");
+                tuples += 1;
+            }
+        }
+        sink.finish();
+        let n = sink.harvest_completed(&mut harvested);
+        for rec in &harvested[..n] {
+            assert_eq!((rec.0, rec.1, rec.2), want, "the tail diverged");
+            tuples += 1;
+        }
+        assert!(tuples >= 10, "the harvest must cover the passes ({tuples})");
+        // THE FABRIC LAWS.
+        let sf = fabric
+            .sig_fabric
+            .get()
+            .expect("the bake must have landed (the ref pass's window)");
+        assert_eq!(sf.n_msgs, want.0, "the count law: the token stream == the hydra count");
+        let replays: u64 = fabric
+            .wstats
+            .iter()
+            .map(|w| w.sig_replays.load(Ordering::Relaxed))
+            .sum();
+        // The engagement law: the worker's WALK fires the replay at
+        // every pass boundary it crosses — the walk can trail the last
+        // passes' submissions when the sink finishes (the harvest
+        // completes via the finish() drain; the tail is racy by a
+        // couple of windows — the R33 engagement law's shape).
+        assert!(
+            (8..=12).contains(&replays),
+            "the engagement law: sig_replays={replays}"
+        );
+        // THE AUDIT LAW: the full per-locate re-derivation == the frozen
+        // digest (the dual-path cell's law, at the baked table).
+        let (digest, _) = sigfabric::replay_sig_fabric(sf);
+        assert_eq!(digest, sf.digest, "the audit re-derivation");
+        // The global walk (the per-pass surface) == the frozen Σ.
+        assert_eq!(sigfabric::replay_global(sf), sf.global_sig);
+        // L: Theorem 7's tracked invariant (the corpus constant).
+        assert_eq!(sf.max_lifecycle, 63, "the pinned corpus L (docs/46)");
+    }
+
 }

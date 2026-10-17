@@ -314,6 +314,19 @@ struct RxStats {
     /// parked-flag protocol (the consumer was not parked — the syscall
     /// would have returned 0). The shavendo win's direct telemetry.
     wakes_saved: AtomicU64,
+    /// R35-A: passes whose bake ran at the EOS-marker's LANDING (the
+    /// marker-decoupled advance) instead of the marker-free wait — the
+    /// pre-arm engagement telemetry (steady state: == advances on an
+    /// armed run; the boundary wait's disappearance is the prize).
+    prearm_passes: AtomicU64,
+    /// R35-A: nanoseconds spent in the pre-arm GATE (the bounded
+    /// marker-landing wait — the consumer's first-turn free). Zero at
+    /// the champion depth (the ring's natural control subsumes it);
+    /// non-zero only at deep rings / short passes, where the gate is
+    /// the cap-lock's safety net.
+    prearm_gate_ns: AtomicU64,
+    /// R35-A: gate waits that exceeded the pure spin window (events).
+    prearm_gate_waits: AtomicU64,
 }
 
 #[repr(align(64))]
@@ -349,6 +362,9 @@ impl RxStats {
             sched_replays: AtomicU64::new(0),
             sched_passes: AtomicU64::new(0),
             wakes_saved: AtomicU64::new(0),
+            prearm_passes: AtomicU64::new(0),
+            prearm_gate_ns: AtomicU64::new(0),
+            prearm_gate_waits: AtomicU64::new(0),
         }
     }
 }
@@ -447,6 +463,16 @@ struct Mailbox {
     /// The pass the RX has baked (advanced to). Written by the RX (Release)
     /// after `auto_session`; read by the consumer's reset() (Acquire).
     auto_pass: AtomicU64,
+    /// R35-A: the EOS-marker turn whose landing triggered the CURRENT
+    /// bake (`auto_pass`'s twin — the marker of the pass BEFORE the
+    /// baked one). The consumer's `reset_pass` exit guard reads it: the
+    /// cursor must be past THIS marker (not the newest landed one — a
+    /// pre-armed RX may have landed the TARGET pass's own marker while
+    /// the consumer sat at the boundary; blocking on that deadlocks).
+    /// u64::MAX before the first bake. Ordered: stored Release BEFORE
+    /// the auto_pass Release, so the consumer's auto_pass-Acquire read
+    /// orders the pair.
+    auto_bake_turn: AtomicU64,
     /// The session the RX baked for `auto_pass` (ordering: see auto_pass).
     auto_session: UnsafeCell<[u8; 10]>,
     /// Turn of the most recent EOS marker publication (u64::MAX before
@@ -534,6 +560,23 @@ struct Mailbox {
     /// Ordered: every bump precedes the publishing `filled[]` Release of
     /// the next batch, so the consumer's filled-Acquire observes it.
     master_version: AtomicU64,
+    /// R35-A: the MARKER-DECOUPLED ADVANCE arm (write-once at
+    /// construction, BEFORE the spawn). True iff the full frozen-
+    /// schedule regime holds (`sched_replay_armed`: rxbuild + session
+    /// elision + the schedule replay + the auto program) — under it the
+    /// EOS-marker's LANDING performs the next pass's bake immediately
+    /// (the consumer is ~NBUF turns back, so `auto_pass` is already the
+    /// boundary's target when `reset_pass` arrives — the 11.9µs/pass
+    /// marker-free→advance→wake round trip leaves the critical path),
+    /// and the RX pre-publishes the next pass's turns under the ring's
+    /// natural flow control. The BOUNDED PRE-ARM GATE — the next
+    /// marker lands only after the consumer freed the current pass's
+    /// FIRST turn — keeps the R16b cap-lock's invariant in its
+    /// generalized form ("the RX never publishes beyond a SECOND
+    /// unfreed marker") and pins `auto_pass == pass` exactly at every
+    /// clean boundary (no overshoot race) at ANY ring depth. HFT_PREARM=0
+    /// is the rollback (the synchronous marker-free advance verbatim).
+    prearm: bool,
 }
 
 // SAFETY: the mailbox is the SPSC handoff described in the module doc —
@@ -1099,6 +1142,12 @@ fn rx_thread(
     // (disarmed above), and the per-pass session lives ONLY in the
     // `auto_session` contract cell. HFT_SESSION_ELISION=0 is the rollback.
     let session_elision = mb.session_elision;
+    // R35-A: the pre-arm regime's LIVE word — the construction froze the
+    // decision (mb.prearm); the CMD_RESET serves and the degenerate
+    // freeze below disarm it (an out-of-program session or an empty
+    // schedule breaks the frozen-marker premise — fail-safe to the
+    // synchronous advance, the R33 disarm's twin).
+    let mut prearm = mb.prearm;
     // F-4: the runtime depth's protocol values — read ONCE from the
     // construction-written Mailbox (immutable; register-cached through
     // the loop below). At the default these are the R8/R9 shapes
@@ -1317,6 +1366,11 @@ fn rx_thread(
                 // twin). Unreachable on the armed shape (the consumer's
                 // reset() assert fail-stops first) — defense in depth.
                 sched = RxSched::Off;
+                // R35-A: the pre-arm disarm (the same law's twin — the
+                // marker-landing bake's exact-contract premise dies with
+                // the out-of-program session; the synchronous advance
+                // serves the rest of this transport's life).
+                prearm = false;
                 // SAFETY: the consumer is parked in reset() holding no
                 // entries; the RX thread owns the transport and blob.
                 let sess = unsafe { *mb.reset_session.get() };
@@ -1736,6 +1790,73 @@ fn rx_thread(
                     }
                 }
             }
+            // R35-A: THE BOUNDED PRE-ARM GATE. The marker of pass p may
+            // land only after the consumer FREED pass p's first turn
+            // (freed[(P&mask)] >= (P>>shift)+1 — the count includes P's
+            // own use; SPSC frees are in turn order, so the count
+            // reaching k proves the first k uses are freed). This is the
+            // generalized R16b cap-lock invariant: the RX never
+            // publishes beyond a SECOND unfreed marker — which is what
+            // `reset_pass`'s unstick proof needs (last_eos is at most
+            // the abandoned pass's OWN marker whenever the consumer is
+            // inside that pass), AND it pins `auto_pass == pass` exactly
+            // at every clean boundary (the next bake fires only after
+            // the consumer entered the pass — no overshoot race) at ANY
+            // ring depth. At the champion depth (NBUF=16 < the pass
+            // length) the ring's natural control subsumes the gate — it
+            // never binds; at deep rings (NBUF up to 256) it is the
+            // safety net that keeps the pre-arm bounded to one pass.
+            // `P < turn` excludes the degenerate data-less pass (its
+            // marker IS its first turn — the gate would deadlock; the
+            // empty-recording disarm makes the shape unreachable, and
+            // the guard is defense in depth).
+            if prearm && pass_start_turn < turn {
+                let g = (pass_start_turn & nbuf_mask) as usize;
+                let gneed = (pass_start_turn >> nbuf_shift) + 1;
+                let t_gate = std::time::Instant::now();
+                let mut backoff = 0u32;
+                let mut gated = false;
+                while mb.freed[g].load(Ordering::Acquire) < gneed {
+                    if mb.shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if mb.cmd.load(Ordering::Acquire) == CMD_RESET {
+                        break; // serve the out-of-program reset first
+                    }
+                    if backoff < 6 {
+                        spin(&mut backoff);
+                    } else {
+                        if !gated {
+                            gated = true;
+                            mark_prod_parked(&mb);
+                            mb.rx_stats
+                                .prearm_gate_waits
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        // TIMED park (the unstick's law): a mid-pass
+                        // abandon's frees do NOT bump `wake` — the
+                        // timeout is the bounded release for that path
+                        // (the steady path's next_batch free wakes via
+                        // the prod-parked handshake).
+                        let observed = mb.wake.load(Ordering::Acquire);
+                        if mb.freed[g].load(Ordering::Acquire) < gneed
+                            && mb.cmd.load(Ordering::Acquire) != CMD_RESET
+                            && !mb.shutdown.load(Ordering::Acquire)
+                        {
+                            futex_wait_timeout(&mb.wake, observed, BUF_PARK_NS);
+                        }
+                    }
+                }
+                if gated {
+                    clear_prod_parked(&mb);
+                }
+                mb.rx_stats
+                    .prearm_gate_ns
+                    .fetch_add(t_gate.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if mb.cmd.load(Ordering::Acquire) == CMD_RESET {
+                    continue; // the loop-top serve disarms and re-bakes
+                }
+            }
             // R33-A: THE FREEZE — the recording pass's EOS just landed;
             // its recorded publication observables ARE the schedule for
             // every pass of this transport's life (the frozen-master
@@ -1750,6 +1871,14 @@ fn rx_thread(
                     },
                     _ => RxSched::Off,
                 };
+                // R35-A: the degenerate-empty-recording disarm's twin — a
+                // schedule with zero publications has no replay table (and
+                // its passes are marker-only turns, the gate's excluded
+                // shape), so the pre-arm regime is off for good: the
+                // synchronous advance's wait is the only sound pacing.
+                if matches!(sched, RxSched::Off) {
+                    prearm = false;
+                }
             }
             // SAFETY: RX owns buffer j for this turn until the Release
             // store below; the empty record needs no entry writes (the
@@ -1786,6 +1915,15 @@ fn rx_thread(
             // data publication's — the consumer may be parked on THIS
             // marker's turn).
             pub_wake_if_parked(&mb);
+            // R35-A: the engagement mark — this marker's landing carries
+            // the bake (the n==0 block below runs it with the marker-free
+            // WAIT skipped), so `auto_pass` becomes the next boundary's
+            // target right here, ~NBUF turns before the consumer's
+            // boundary. Steady law: prearm_passes == advances on an
+            // armed run.
+            if prearm {
+                mb.rx_stats.prearm_passes.fetch_add(1, Ordering::Relaxed);
+            }
             turn += 1;
         }
         let n = if eos { 0 } else { acc };
@@ -1798,59 +1936,72 @@ fn rx_thread(
                 // rendering — the per-pass reset handshake (two futex
                 // round-trips + a blob patch on the critical path, ~86us
                 // per pass on the Zen3 runner) collapses into overlap.
-                let j = ((turn - 1) & nbuf_mask) as usize;
-                let need = ((turn - 1) >> nbuf_shift) + 1;
-                let mut backoff = 0u32;
-                loop {
-                    if mb.shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if mb.freed[j].load(Ordering::Acquire) >= need {
-                        break;
-                    }
-                    // R8 phase-3b: while waiting for the consumer to finish
-                    // the pass's tail, keep baking what it HAS freed — the
-                    // tail left for the synchronous advance shrinks as the
-                    // consumer drains.
-                    //
-                    // I-7: the ring is covered through the marker (turn−1) —
-                    // this turn is not published yet; the floor is the pass
-                    // being drained (its own turns and marker are ≥ it).
-                    if prepatch_enabled {
-                        let next_sess = sess_fn(pass + 1);
-                        // The EOS-drain wait: the RX is idle here BY
-                        // CONSTRUCTION (every publication is out; the only
-                        // pending obligation is the advance, which fires on
-                        // the marker's free — after the LAST drain free).
-                        // F-5: the budget is UNBOUNDED — the patch bursts
-                        // can never stall a pending publication (there is
-                        // none), so the R9c pacing law does not apply; each
-                        // iteration patches everything below the CURRENT
-                        // frontier and the advance's synchronous tail
-                        // collapses to the final publication's share (the
-                        // per-publication budget above keeps the mid-pass
-                        // steps paced on the render critical path, where
-                        // the R9c law DOES apply).
-                        prepatch_step(
-                            &mut inner,
-                            &next_sess,
-                            &mut pp_idx,
-                            &mut rxs,
-                            turn - 1,
-                            pass_start_turn,
-                            &turn_evt_end,
-                            usize::MAX,
-                        );
-                    }
-                    mb.rx_stats.bufwait_laps.fetch_add(1, Ordering::Relaxed);
-                    if backoff < 6 {
-                        spin(&mut backoff);
-                    } else {
-                        let observed = mb.wake.load(Ordering::Acquire);
-                        if mb.freed[j].load(Ordering::Acquire) < need
-                            && !mb.shutdown.load(Ordering::Acquire)
-                        {
-                            futex_wait_timeout(&mb.wake, observed, BUF_PARK_NS);
+                //
+                // R35-A: THE MARKER-DECOUPLED ADVANCE — under the pre-arm
+                // regime this wait is SKIPPED ENTIRELY: the bake below ran
+                // at the marker's LANDING (the consumer is still ~NBUF
+                // turns back), so there is nothing to wait for and the
+                // marker-free→wake→advance→wake round trip — the
+                // measured 11.9µs/pass (85% of the fleet's 2,157ms reset
+                // wall) — never enters the consumer's boundary. The bake
+                // body itself is shared verbatim with the synchronous
+                // path (the R32/R33 parity laws pin both to the same
+                // observable behavior; only the TIMING moved).
+                if !prearm {
+                    let j = ((turn - 1) & nbuf_mask) as usize;
+                    let need = ((turn - 1) >> nbuf_shift) + 1;
+                    let mut backoff = 0u32;
+                    loop {
+                        if mb.shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if mb.freed[j].load(Ordering::Acquire) >= need {
+                            break;
+                        }
+                        // R8 phase-3b: while waiting for the consumer to finish
+                        // the pass's tail, keep baking what it HAS freed — the
+                        // tail left for the synchronous advance shrinks as the
+                        // consumer drains.
+                        //
+                        // I-7: the ring is covered through the marker (turn−1) —
+                        // this turn is not published yet; the floor is the pass
+                        // being drained (its own turns and marker are ≥ it).
+                        if prepatch_enabled {
+                            let next_sess = sess_fn(pass + 1);
+                            // The EOS-drain wait: the RX is idle here BY
+                            // CONSTRUCTION (every publication is out; the only
+                            // pending obligation is the advance, which fires on
+                            // the marker's free — after the LAST drain free).
+                            // F-5: the budget is UNBOUNDED — the patch bursts
+                            // can never stall a pending publication (there is
+                            // none), so the R9c pacing law does not apply; each
+                            // iteration patches everything below the CURRENT
+                            // frontier and the advance's synchronous tail
+                            // collapses to the final publication's share (the
+                            // per-publication budget above keeps the mid-pass
+                            // steps paced on the render critical path, where
+                            // the R9c law DOES apply).
+                            prepatch_step(
+                                &mut inner,
+                                &next_sess,
+                                &mut pp_idx,
+                                &mut rxs,
+                                turn - 1,
+                                pass_start_turn,
+                                &turn_evt_end,
+                                usize::MAX,
+                            );
+                        }
+                        mb.rx_stats.bufwait_laps.fetch_add(1, Ordering::Relaxed);
+                        if backoff < 6 {
+                            spin(&mut backoff);
+                        } else {
+                            let observed = mb.wake.load(Ordering::Acquire);
+                            if mb.freed[j].load(Ordering::Acquire) < need
+                                && !mb.shutdown.load(Ordering::Acquire)
+                            {
+                                futex_wait_timeout(&mb.wake, observed, BUF_PARK_NS);
+                            }
                         }
                     }
                 }
@@ -1965,6 +2116,11 @@ fn rx_thread(
                 unsafe {
                     *mb.auto_session.get() = sess;
                 }
+                // R35-A: the bake's marker turn (turn−1 — the eos block
+                // already consumed the marker's landing) — the consumer's
+                // exit guard's twin cell. Release BEFORE auto_pass so the
+                // consumer's Acquire read of auto_pass orders this store.
+                mb.auto_bake_turn.store(turn - 1, Ordering::Release);
                 mb.auto_pass.store(pass, Ordering::Release);
                 // Release a consumer parked in reset()'s advance wait.
                 mb.wake.fetch_add(1, Ordering::Release);
@@ -1997,6 +2153,8 @@ fn rx_thread(
                         // R33-A: the disarm (the EOS-park serve's twin —
                         // see the main-loop serve's comment).
                         sched = RxSched::Off;
+                        // R35-A: the pre-arm disarm (the same twin).
+                        prearm = false;
                         let sess = unsafe { *mb.reset_session.get() };
                         inner.reset(sess);
                         refresh_tmpl(&sess, &mut sess_lo_tmpl, &mut sess_hi_tmpl);
@@ -2174,6 +2332,12 @@ impl PipelinedReplayTransport {
         // verbatim). Arming is additionally gated by the frozen-master
         // regime (elision_armed) inside the forced constructor.
         let sched_replay = std::env::var("HFT_RX_SCHED_REPLAY").as_deref() != Ok("0");
+        // R35-A (docs/46): the marker-decoupled advance's env word —
+        // DEFAULT ON (the boundary collapse; the frozen-regime gate and
+        // the disarm laws are in the forced constructor and the RX
+        // thread). HFT_PREARM=0 is the rollback (the synchronous
+        // marker-free advance verbatim).
+        let prearm = std::env::var("HFT_PREARM").as_deref() != Ok("0");
         // F-4 (HFT_NBUF) / R33-C: the mailbox-depth ladder — 16 (the R8
         // phase-3 measured shape, the default), 32 (the F-4 arm), and
         // R33-C's 64/128/256 (the producer-starvation runway pricing:
@@ -2202,6 +2366,7 @@ impl PipelinedReplayTransport {
             nbuf,
             elision,
             sched_replay,
+            prearm,
         )
     }
 
@@ -2223,6 +2388,7 @@ impl PipelinedReplayTransport {
         nbuf: u64,
         elision: bool,
         sched_replay: bool,
+        prearm: bool,
     ) -> Self {
         debug_assert!(
             nbuf.is_power_of_two() && (16..=NBUF_MAX).contains(&nbuf),
@@ -2266,6 +2432,22 @@ impl PipelinedReplayTransport {
         // so the recorded schedule is pass-invariant BY LAW). Any other
         // shape keeps the live walk verbatim.
         let sched_replay_armed = sched_replay && elision_armed;
+        // R35-A (docs/46): the marker-decoupled advance — the frozen-
+        // schedule regime's boundary collapse. DEFAULT ON under the same
+        // word the R33 schedule replay gates on (the advance's bake is a
+        // zero-write `reset_cursors` + two contract stores under the
+        // elision, so running it at the marker's LANDING instead of the
+        // marker's FREE is a pure latency move: the consumer's
+        // `reset_pass` finds `auto_pass` already at its target and the
+        // 11.9µs/pass marker-free→wake→advance→wake round trip — 85% of
+        // the fleet's 2,157ms reset wall — leaves the critical path).
+        // HFT_PREARM=0 is the rollback (the synchronous advance
+        // verbatim, CI arm 11r35r). The env word is read in the
+        // env-reading constructor; the forced constructor gates the
+        // caller's request on the frozen regime here (a prearm request
+        // without the frozen-master word stays off — the same safety
+        // gate as the schedule replay's arming).
+        let prearm = prearm && sched_replay_armed;
         #[allow(clippy::disallowed_types)]
         let mb: Arc<Mailbox> = Arc::new(Mailbox {
             nbuf,
@@ -2289,6 +2471,7 @@ impl PipelinedReplayTransport {
             reset_ack_cnt: AtomicU64::new(0),
             auto_fn: sess_fn,
             auto_pass: AtomicU64::new(0),
+            auto_bake_turn: AtomicU64::new(u64::MAX),
             auto_session: UnsafeCell::new(session),
             auto_eos_turn: AtomicU64::new(u64::MAX),
             rx_turn: AtomicU64::new(0),
@@ -2303,6 +2486,7 @@ impl PipelinedReplayTransport {
             rx_actual_cpu: AtomicI64::new(-1),
             rxdesc: OnceLock::new(),
             master_version: AtomicU64::new(0),
+            prearm,
         });
         let rx = std::thread::Builder::new()
             .stack_size(512 * 1024)
@@ -2478,20 +2662,40 @@ impl PipelinedReplayTransport {
         loop {
             let ap = self.mb.auto_pass.load(Ordering::Acquire);
             if ap >= pass {
-                // SAFETY: ordered by the auto_pass Acquire above — the RX
-                // wrote the session BEFORE its Release store of auto_pass.
-                let baked = unsafe { *self.mb.auto_session.get() };
-                assert_eq!(
-                    ap, pass,
-                    "auto-advance overshoot: RX at pass {ap}, reset targets {pass} \
-                     (a pass number was skipped or consumed twice)"
-                );
-                assert_eq!(
-                    baked, session,
-                    "auto-advance session divergence: RX baked {baked:?}, reset \
-                     requested {session:?} — the session contract is load-bearing"
-                );
-                break;
+                // R35-A: the exit ALSO requires the cursor to be past the
+                // marker of the ABANDONED pass (the marker whose landing
+                // baked `ap` — `auto_bake_turn`). Under the pre-arm regime
+                // the bake fires at the marker's LANDING (not its free),
+                // so `ap` can reach the target while the cursor still sits
+                // ON that marker — breaking there would have the consumer
+                // "consume" the marker next_batch (0 batches, a short
+                // pass). The cap-lock iteration below frees THROUGH it
+                // (its landing proved it the abandoned pass's own — the
+                // gate's law), advancing the cursor past it; this re-check
+                // then passes. NOT the newest landed marker (a pre-armed
+                // RX may have landed the TARGET pass's own marker while
+                // the consumer sat at the boundary — blocking on that
+                // deadlocks). At a clean end (and under the rollback:
+                // the bake fires after the marker's FREE) the cursor is
+                // already past it — the exit is the one-Acquire fast
+                // path, unchanged.
+                let bake_turn = self.mb.auto_bake_turn.load(Ordering::Acquire);
+                if bake_turn == u64::MAX || bake_turn < self.turn {
+                    // SAFETY: ordered by the auto_pass Acquire above — the RX
+                    // wrote the session BEFORE its Release store of auto_pass.
+                    let baked = unsafe { *self.mb.auto_session.get() };
+                    assert_eq!(
+                        ap, pass,
+                        "auto-advance overshoot: RX at pass {ap}, reset targets {pass} \
+                         (a pass number was skipped or consumed twice)"
+                    );
+                    assert_eq!(
+                        baked, session,
+                        "auto-advance session divergence: RX baked {baked:?}, reset \
+                         requested {session:?} — the session contract is load-bearing"
+                    );
+                    break;
+                }
             }
             // Unstick: free the abandoned pass's published-but-unconsumed
             // turns, up to the ceiling. In the steady (drained-to-EOS)
@@ -2810,6 +3014,21 @@ impl PipelinedReplayTransport {
         )
     }
 
+    /// R35-A: the marker-decoupled advance's engagement telemetry —
+    /// (armed, prearm_passes, prearm_gate_ns). The engagement law on an
+    /// armed sustained run: `prearm_passes == advances` (every bake ran
+    /// at the marker's landing) and `prearm_gate_ns == 0` at the
+    /// champion depth (NBUF=16 < the pass length — the ring's natural
+    /// flow control subsumes the bounded gate); a non-zero gate reading
+    /// prices the cap-lock's safety net at deep rings / short passes.
+    pub fn rx_prearm_stats(&self) -> (bool, u64, u64) {
+        (
+            self.mb.prearm,
+            self.mb.rx_stats.prearm_passes.load(Ordering::Relaxed),
+            self.mb.rx_stats.prearm_gate_ns.load(Ordering::Relaxed),
+        )
+    }
+
     /// R33: the producer-side production telemetry — (publications,
     /// prod_ns, polls). The line-rate law: prod_ns/publications is the
     /// per-window producer cost (the R32 baseline ~3.28µs — the
@@ -2853,6 +3072,17 @@ impl PipelinedReplayTransport {
             rx.sched_replays.load(Ordering::Relaxed),
             rx.sched_passes.load(Ordering::Relaxed),
             rx.wakes_saved.load(Ordering::Relaxed),
+        );
+        // R35-A: the marker-decoupled advance's telemetry (always printed
+        // — the CI arm greps it; the engagement law: prearm_passes ==
+        // advances on an armed run, prearm_gate_ns == 0 at the champion
+        // depth — the ring's natural control subsumes the gate there).
+        eprintln!(
+            "PREARM_DIAGNOSTIC {label}: armed={} prearm_passes={} gate_ms={:.2} gate_waits={} (R35-A: the marker-decoupled advance — the bake at the EOS-marker's landing, the bounded pre-arm gate at deep rings; the consumer's reset_pass finds auto_pass already at its target, docs/46)",
+            self.mb.prearm,
+            rx.prearm_passes.load(Ordering::Relaxed),
+            rx.prearm_gate_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            rx.prearm_gate_waits.load(Ordering::Relaxed),
         );
         // F-5: the auto-advance telemetry line (always printed — the
         // pass boundary's exposed bake cost on the sustained critical
@@ -3224,7 +3454,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         for pass in 1..=4u64 {
             let sess = i7_sess(pass);
             t.reset_pass(pass, sess);
@@ -3289,6 +3520,7 @@ mod tests {
                 16,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3302,6 +3534,7 @@ mod tests {
                 16,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3370,7 +3603,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
             sched,
@@ -3383,7 +3617,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         // Drain pass 1 fully (the fill), then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut warm] {
             t.reset_pass(1, sess_program(1));
@@ -3440,7 +3675,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
             warm.reset(*b"PIPETEST01");
@@ -3489,6 +3725,7 @@ mod tests {
                 16,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3502,6 +3739,7 @@ mod tests {
                 16,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3580,6 +3818,7 @@ mod tests {
                 16,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             let mut d32 = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3593,6 +3832,7 @@ mod tests {
                 32,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             let mut d32r = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3606,6 +3846,7 @@ mod tests {
                 32,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3692,6 +3933,7 @@ mod tests {
                 16,
                 true, // elision — the frozen-master regime
                 replay,
+                replay, // R35-A: prearm mirrors the sched-replay arm
             )
         };
         let mut live = mk(false);
@@ -3774,6 +4016,7 @@ mod tests {
                 nbuf,
                 true,
                 true,
+                true, // R35-A: prearm mirrors the sched-replay arm
             )
         };
         let mut d16 = mk(16);
@@ -3845,7 +4088,8 @@ mod tests {
             16,
             true,
             true,
-        );
+            true, // R35-A: prearm mirrors the sched-replay arm
+            );
         for p in 1..=3u64 {
             t.reset_pass(p, sess_program(p));
             let mut frames = 0usize;
@@ -3889,7 +4133,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
             sched,
@@ -3902,7 +4147,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         // Drain pass 1 fully, then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut rxbuild] {
             t.reset_pass(1, sess_program(1));
@@ -3960,7 +4206,8 @@ mod tests {
             16,
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
             rxbuild.reset(*b"PIPETEST01");
@@ -4029,6 +4276,7 @@ mod tests {
                 16,
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             let mut elided = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -4042,6 +4290,7 @@ mod tests {
                 16,
                 true,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
+            false, // R35-A: prearm mirrors the sched-replay arm
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -4136,7 +4385,8 @@ mod tests {
             16,
             true,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         // A session the program will NOT bake for pass 1 — must fail-stop
         // exactly like the patched shape.
         let wrong = *b"PIPEEDIV\0\0";
@@ -4170,7 +4420,8 @@ mod tests {
             16,
             true,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
-        );
+            false, // R35-A: prearm mirrors the sched-replay arm
+            );
         // Drain pass 1 fully, abandon pass 2 mid-flight, target pass 3.
         t.reset_pass(1, sess_program(1));
         assert_eq!(run_pass(&mut t), 60);
@@ -4194,5 +4445,212 @@ mod tests {
         let (patches, _, master_frames) = t.rx_build_stats();
         assert_eq!(master_frames, 60);
         assert_eq!(patches, 0, "elision keeps zero patches through the abandon");
+    }
+
+    /// R35-A: THE PRE-ARM PARITY LAW — the marker-decoupled advance
+    /// (prearm ON) vs the synchronous marker-free advance (prearm OFF)
+    /// under the full champion regime (rxbuild + elision + the schedule
+    /// replay): identical (rx_start, len) streams, identical clocks,
+    /// identical EOS alignment, identical entries, identical frame
+    /// counts across rotating passes. Only the TIMING of the bake moved
+    /// (the landing vs the free); every observable is pinned by the
+    /// R32/R33 ledgers on both sides.
+    #[test]
+    fn t_r35_prearm_parity_vs_sync() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let mk = |prearm: bool| {
+            PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true, // rxbuild
+                16,
+                true, // elision — the frozen-master regime
+                true, // sched replay (the pre-arm's regime word)
+                prearm,
+            )
+        };
+        let mut sync = mk(false);
+        let mut pre = mk(true);
+        for p in 1..=6u64 {
+            let sess = sess_program(p);
+            sync.reset_pass(p, sess);
+            pre.reset_pass(p, sess);
+            let mut frames = 0usize;
+            loop {
+                let a_ok = sync.next_batch();
+                let b_ok = pre.next_batch();
+                assert_eq!(a_ok, b_ok, "pass {p}: sync/prearm EOS mismatch");
+                if !a_ok {
+                    break;
+                }
+                let (a_bounds, a_clock) = (sync.batch_bounds(), sync.now_ns());
+                let (b_bounds, b_clock) = (pre.batch_bounds(), pre.now_ns());
+                assert_eq!(
+                    a_bounds, b_bounds,
+                    "pass {p}: (rx_start, len) diverged — the pre-arm must not move a byte"
+                );
+                assert_eq!(a_clock, b_clock, "pass {p}: clock diverged");
+                let ae = sync.entries();
+                let be = pre.entries();
+                assert_eq!(ae.len(), be.len(), "pass {p}: batch length mismatch");
+                for (a, b) in ae.iter().zip(be.iter()) {
+                    assert!(
+                        !entry_content_neq(a, b),
+                        "pass {p}: prearm entry diverged from the sync advance"
+                    );
+                }
+                frames += ae.len();
+            }
+            assert_eq!(frames, 60, "pass {p}: frame count");
+        }
+        // The engagement law: every advance ran at the marker's landing.
+        let (armed, prearm_passes, _) = pre.rx_prearm_stats();
+        assert!(armed, "the pre-arm must be armed under the champion word");
+        // 6 consumed passes + the construction advance; the 7th may have
+        // landed its bake if the RX pre-armed past the last consumed EOS
+        // (the gate opens on the consumer's entry into the next pass —
+        // the drain loop's last next_batch freed the marker). Racy at
+        // the tail by construction (the R33 engagement law's shape).
+        assert!(
+            (6..=7).contains(&prearm_passes),
+            "prearm_passes={prearm_passes}"
+        );
+        let (sync_armed, sync_passes, _) = sync.rx_prearm_stats();
+        assert!(!sync_armed && sync_passes == 0, "the rollback stays disengaged");
+        let (replays, passes, _) = pre.rx_sched_stats();
+        assert!(replays >= 5 && (6..=7).contains(&passes), "sched replay engaged");
+    }
+
+    /// R35-A: THE MID-PASS ABANDON UNDER THE PRE-ARM — the unstick
+    /// cap-lock's proof against pre-armed future-pass publications. The
+    /// consumer abandons pass k mid-flight (one batch in); the unstick
+    /// must free exactly pass k's tail + its marker and PRESERVE the
+    /// pre-armed pass k+1 publications (the exact-match walk), and the
+    /// auto_pass contract must hold exactly (no overshoot: the gate held
+    /// the pass-k+1 marker until the consumer entered k+1). The
+    /// construction pass (the never-consumed zero-consumption abandon —
+    /// the auto_bake_turn guard's case) is covered by the first
+    /// reset_pass of every armed test.
+    #[test]
+    fn t_r35_prearm_mid_pass_abandon() {
+        // 12k messages -> 2400 frames -> three ~1024-frame publications
+        // per pass (the ENTRY_CAP granularity): the abandon offsets land
+        // mid-pass with in-flight tail publications AND pre-armed
+        // next-pass publications (the cap-lock's exact shape).
+        let gt = mini_gt(12000);
+        let sched = mini_sched(12000);
+        for abandon_after in [1usize, 2] {
+            let mut t = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true, // rxbuild
+                16,
+                true, // elision
+                true, // sched replay
+                true, // prearm
+            );
+            // Clean pass 1, then abandon pass 2 after N batches.
+            t.reset_pass(1, sess_program(1));
+            assert_eq!(run_pass(&mut t), 2400);
+            t.reset_pass(2, sess_program(2));
+            for _ in 0..abandon_after {
+                assert!(t.next_batch(), "abandon {abandon_after}: batch drained");
+                let _ = t.entries();
+            }
+            t.reset_pass(3, sess_program(3));
+            // The post-abandon pass: the exact walk (2400 frames, the
+            // pre-armed head survived the unstick's cap).
+            let mut frames = 0usize;
+            while t.next_batch() {
+                frames += t.entries().len();
+            }
+            assert_eq!(
+                frames, 2400,
+                "abandon {abandon_after}: post-abandon frame count"
+            );
+            // And the pass AFTER the abandon (the steady shape resumes).
+            t.reset_pass(4, sess_program(4));
+            assert_eq!(run_pass(&mut t), 2400, "abandon {abandon_after}: pass 4");
+            let (armed, prearm_passes, _) = t.rx_prearm_stats();
+            assert!(armed, "the pre-arm survives the abandon (no disarm)");
+            assert!(prearm_passes >= 4, "prearm_passes={prearm_passes}");
+        }
+    }
+
+    /// R35-A: THE DEEP-RING PRE-ARM GATE — at NBUF=256 the ring's
+    /// natural flow control would let the RX pre-arm TEN passes ahead
+    /// (a 23-turn pass at 256 depth), breaking the cap-lock's
+    /// generalized invariant. The bounded gate (the marker of pass p+1
+    /// lands only after the consumer freed pass p+1's first turn) keeps
+    /// the pre-arm within one pass at EVERY depth — pinned here by the
+    /// parity law at the ladder's extremes against the depth-16
+    /// reference: identical bounds, EOS alignment, frame counts, and
+    /// the auto_pass exact-contract at every boundary (an overshoot
+    /// fails the reset_pass assert loudly).
+    #[test]
+    fn t_r35_prearm_deep_ring_gate() {
+        let gt = mini_gt(300);
+        let sched = mini_sched(300);
+        let mk = |nbuf: u64, prearm: bool| {
+            PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true, // rxbuild
+                nbuf,
+                true, // elision
+                true, // sched replay
+                prearm,
+            )
+        };
+        let mut d16 = mk(16, true);
+        let mut d256 = mk(256, true);
+        for p in 1..=5u64 {
+            let sess = sess_program(p);
+            d16.reset_pass(p, sess);
+            d256.reset_pass(p, sess);
+            let mut frames = 0usize;
+            loop {
+                let a_ok = d16.next_batch();
+                let b_ok = d256.next_batch();
+                assert_eq!(a_ok, b_ok, "pass {p}: d16/d256 EOS mismatch");
+                if !a_ok {
+                    break;
+                }
+                let (a_bounds, _) = (d16.batch_bounds(), d16.now_ns());
+                let (b_bounds, _) = (d256.batch_bounds(), d256.now_ns());
+                assert_eq!(a_bounds, b_bounds, "pass {p}: depth transparency broke");
+                frames += d16.entries().len();
+                assert_eq!(d16.entries().len(), d256.entries().len());
+            }
+            assert_eq!(frames, 60, "pass {p}: frame count");
+        }
+        let (armed, prearm_passes, gate_ns) = d256.rx_prearm_stats();
+        // The gate DID bind at 256 (the safety net's engagement proof —
+        // the natural control alone would run unbounded): non-zero wait
+        // time, bounded magnitude (the mini schedule's 2-batch lead).
+        assert!(gate_ns > 0, "the deep-ring gate must engage at nbuf=256");
+        // 5 consumed passes + the construction advance; the 6th may have
+        // landed its bake if the drain loop's last free opened the gate
+        // (racy at the tail — the R33 engagement law's shape).
+        assert!(
+            armed && (5..=6).contains(&prearm_passes),
+            "armed={armed} prearm_passes={prearm_passes}"
+        );
     }
 }

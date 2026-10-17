@@ -10,6 +10,7 @@ pub mod golden;
 pub mod hydra;
 pub mod lobstate;
 pub mod passreplay;
+pub mod sigfabric;
 pub mod polyhash;
 pub mod reference;
 pub mod sched;
