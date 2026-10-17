@@ -43,6 +43,8 @@
 //! makes the frozen-table replay exact.
 
 use crate::lobstate::{sig_combine, sig_fold, Lob3, Sig, SigTokens, SIG_CHUNK};
+use std::sync::Arc;
+use crate::spanfold::{self, CHUNK as SPAN_CHUNK};
 
 /// The per-locate frozen signature table (the bake's product + the
 /// replay's input). One instance per fabric construction; read-only
@@ -107,6 +109,24 @@ pub struct SigFabric {
     /// Theorem 7(iv)'s L: the max per-id lifecycle event count (§5.4's
     /// tracked invariant — single-digit on real feeds).
     pub max_lifecycle: u64,
+    // ── THE R36 SPAN LAYER (docs/solution1.md §2/§4; the Res-fold's
+    // fabric face) ────────────────────────────────────────────────
+    /// The frozen GLOBAL 512-chunk R36 records (the span-hash layer:
+    /// 36 B per chunk over the same message-order token stream as
+    /// `global_sigs` — Theorem 10's fresh-fold product, composed here
+    /// ONCE at the bake; the per-pass surface is the O(1) application).
+    pub span_recs: Vec<spanfold::R36>,
+    /// The composed whole-stream P64 accumulator (Corollary 10.1's
+    /// composition of all chunk records — the memoized replay's input).
+    pub span_p64: spanfold::P64,
+    /// The frozen global SPANHASH (`H_seed ⊗ C ⊕ V`, seed 0).
+    pub span_hash: u64,
+    /// The R36-C TWO-WORKER SPLIT (§4.1): the early partial hash, the
+    /// late V, and the late span — the per-pass merge law's frozen
+    /// operands (`hash_merge(h_e, v_l, w_l) == span_hash`, Theorem 17).
+    pub span_h_early: u64,
+    pub span_h_late: u64,
+    pub span_w_late: u64,
 }
 
 /// The Phase-R order-ID cache (§5.7): open addressing, LINEAR probing,
@@ -345,6 +365,20 @@ fn digest_avalanche(h: u64) -> u64 {
     x
 }
 
+/// THE R36 PAYLOAD DIGEST `v_t(p)` (solution1.md Def 1.2: "any fixed
+/// function of the payload") — the first-8 ⊕ rotated-last-8 ⊕ type-tag
+/// fold, 0 for the non-book identity class (width 0 ∧ digest 0 = the
+/// exact monoid identity). Deterministic, payload-dependent, 2 loads.
+#[inline(always)]
+fn span_digest(t: u8, msg: &[u8]) -> u64 {
+    if msg.len() < 16 {
+        return 0; // the identity class's own law (short/degenerate)
+    }
+    let a = u64::from_le_bytes(msg[0..8].try_into().unwrap());
+    let b = u64::from_le_bytes(msg[msg.len() - 8..].try_into().unwrap());
+    a ^ b.rotate_left(29) ^ ((t as u64) << 56)
+}
+
 /// THE BAKE (§5.5 Phase R + Phase S, one pass): decode + resolve +
 /// fold. `bodies` are the frame message blocks in stream order (each a
 /// `[u16 len][msg]*` chain — the concatenated bodies ARE the ITCH
@@ -394,11 +428,22 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
     tok_off.push(acc);
     debug_assert_eq!(acc as u64, n_msgs);
 
-    // ---- pass 2: decode + resolve (Phase R) into the per-locate SoA ----
+    // ---- pass 2: decode + resolve (Phase R) into the per-locate SoA,
+    //      PLUS the R36 message-order span columns (the SPANHASH layer:
+    //      V is order-carrying — Theorem 9 — so the hash columns live in
+    //      TRUE message order, distinct from the locate-bucketed SoA) ----
     let mut seq = vec![0u64; n_msgs as usize];
     let mut px = vec![0u64; n_msgs as usize];
     let mut db = vec![0u64; n_msgs as usize];
     let mut da = vec![0u64; n_msgs as usize];
+    // The R36 message-order columns (ty: W_T index — 9 = the identity
+    // class; vd: the payload digest; setp: the K2 setter flag).
+    let mut ty36: Vec<u8> = Vec::with_capacity(n_msgs as usize);
+    let mut vd36: Vec<u64> = Vec::with_capacity(n_msgs as usize);
+    let mut db36: Vec<i64> = Vec::with_capacity(n_msgs as usize);
+    let mut da36: Vec<i64> = Vec::with_capacity(n_msgs as usize);
+    let mut px36: Vec<u32> = Vec::with_capacity(n_msgs as usize);
+    let mut setp36: Vec<u8> = Vec::with_capacity(n_msgs as usize);
     let mut cur = vec![0u32; n_locates as usize]; // per-locate write cursor
     let mut cache = OrderCache::new(16);
     let mut anomalies = 0u64;
@@ -430,7 +475,10 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
             let t = msg[0];
             // The generator table (§2.2) — resolved per type. `ν(s, x)`:
             // BUY adds to db, SELL to da (the side byte at offset 19).
-            match t {
+            // Each arm returns the token's (seq, px, db, da); the shared
+            // epilogue writes the locate-bucketed SoA AND the R36
+            // message-order columns (one source of truth — no drift).
+            let (sv, pv, d0, d1): (u64, u64, u64, u64) = match t {
                 b'A' | b'F' => {
                     let side = msg[19];
                     let shares = u32::from_be_bytes([msg[20], msg[21], msg[22], msg[23]]);
@@ -444,10 +492,7 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                     } else {
                         (shares as u64, 0)
                     };
-                    seq[w] = 0;
-                    px[w] = 0;
-                    db[w] = d0;
-                    da[w] = d1;
+                    (0, 0, d0, d1)
                 }
                 b'E' => {
                     let oref = u64::from_be_bytes([
@@ -473,13 +518,11 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                                 ((eff as u64).wrapping_neg(), 0)
                             };
                             // E_SETS_LAST = order_px (the default).
-                            seq[w] = pos;
-                            px[w] = rpx as u64;
-                            db[w] = d0;
-                            da[w] = d1;
+                            (pos, rpx as u64, d0, d1)
                         }
                         None => {
                             anomalies += 1;
+                            (0, 0, 0, 0)
                         }
                     }
                 }
@@ -505,13 +548,16 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                             };
                             // C_SETS_LAST, printable-gated.
                             let is_print = printable == b'Y' || printable == 1;
-                            seq[w] = if is_print { pos } else { 0 };
-                            px[w] = if is_print { exec_px as u64 } else { 0 };
-                            db[w] = d0;
-                            da[w] = d1;
+                            (
+                                if is_print { pos } else { 0 },
+                                if is_print { exec_px as u64 } else { 0 },
+                                d0,
+                                d1,
+                            )
                         }
                         None => {
                             anomalies += 1;
+                            (0, 0, 0, 0)
                         }
                     }
                 }
@@ -532,13 +578,11 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                             } else {
                                 ((eff as u64).wrapping_neg(), 0)
                             };
-                            seq[w] = 0;
-                            px[w] = 0;
-                            db[w] = d0;
-                            da[w] = d1;
+                            (0, 0, d0, d1)
                         }
                         None => {
                             anomalies += 1;
+                            (0, 0, 0, 0)
                         }
                     }
                 }
@@ -554,13 +598,11 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                             } else {
                                 ((rem as u64).wrapping_neg(), 0)
                             };
-                            seq[w] = 0;
-                            px[w] = 0;
-                            db[w] = d0;
-                            da[w] = d1;
+                            (0, 0, d0, d1)
                         }
                         None => {
                             anomalies += 1;
+                            (0, 0, 0, 0)
                         }
                     }
                 }
@@ -584,13 +626,11 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                             } else {
                                 (delta as u64, 0)
                             };
-                            seq[w] = 0;
-                            px[w] = 0;
-                            db[w] = d0;
-                            da[w] = d1;
+                            (0, 0, d0, d1)
                         }
                         None => {
                             anomalies += 1;
+                            (0, 0, 0, 0)
                         }
                     }
                 }
@@ -603,20 +643,26 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                     } else {
                         u32::from_be_bytes([msg[27], msg[28], msg[29], msg[30]])
                     };
-                    seq[w] = pos;
-                    px[w] = price as u64;
-                    db[w] = 0;
-                    da[w] = 0;
+                    (pos, price as u64, 0, 0)
                 }
                 _ => {
                     // The non-book types (S/H/L/N/R/Y/V/B…): ⊥ — the
                     // count law holds; no volume, no price.
-                    seq[w] = 0;
-                    px[w] = 0;
-                    db[w] = 0;
-                    da[w] = 0;
+                    (0, 0, 0, 0)
                 }
-            }
+            };
+            // The shared epilogue — BOTH layouts from one tuple (the
+            // no-drift law; the R34 discipline).
+            seq[w] = sv;
+            px[w] = pv;
+            db[w] = d0;
+            da[w] = d1;
+            ty36.push(crate::spanfold::ty36(t));
+            vd36.push(span_digest(t, msg));
+            db36.push(d0 as i64);
+            da36.push(d1 as i64);
+            px36.push(pv as u32);
+            setp36.push((sv != 0) as u8);
         }
     }
 
@@ -641,6 +687,50 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
         }
     }
     let global_sig = global_sigs.iter().copied().fold(Sig::IDENTITY, sig_combine);
+
+    // ---- Phase S0b: THE R36 SPAN FOLD (docs/solution1.md §2 — the
+    // Res-fold's fabric face). MESSAGE ORDER (V is order-carrying,
+    // Theorem 9 — this is the column pair the locate-bucketed SoA
+    // cannot express); 512-chunk records through the Theorem-10 kernel
+    // (the fresh fold — the 0.2–0.4 µs/chunk class), composed once by
+    // Corollary 10.1's O(1) hops into the P64, and split at the record
+    // midpoint for the R36-C merge law's frozen operands ----
+    debug_assert_eq!(ty36.len(), n);
+    let mut span_recs: Vec<spanfold::R36> = Vec::with_capacity(n.div_ceil(SPAN_CHUNK));
+    {
+        let mut i = 0usize;
+        while i < n {
+            let end = (i + SPAN_CHUNK).min(n);
+            let (rec, _) = spanfold::fold_cols(
+                &ty36[i..end],
+                &vd36[i..end],
+                &db36[i..end],
+                &da36[i..end],
+                &px36[i..end],
+                &setp36[i..end],
+                0,
+            );
+            span_recs.push(rec);
+            i = end;
+        }
+    }
+    let span_p64 = spanfold::compose_records(&span_recs);
+    let span_hash = spanfold::hash_apply_p64(0, &span_p64);
+    // The two-worker split at the record midpoint (§4.1: the early
+    // partial hash from seed 0 is its V; the late worker folds from
+    // zero so its partial value is just its V; the merge shifts by the
+    // LATE span — Appendix D item 1's convention, named in the code).
+    let k_split = span_recs.len() / 2;
+    let early_p = spanfold::compose_records(&span_recs[..k_split]);
+    let late_p = spanfold::compose_records(&span_recs[k_split..]);
+    let span_h_early = spanfold::hash_apply_p64(0, &early_p);
+    let span_h_late = late_p.v;
+    let span_w_late = late_p.deg as u64;
+    debug_assert_eq!(
+        spanfold::hash_merge(span_h_early, span_h_late, span_w_late),
+        span_hash,
+        "R36-C: the frozen two-worker merge law must hold at the bake"
+    );
 
     // ---- Phase S: the per-locate 512-chunk folds + the Ψ commits ----
     let mut sig_off = Vec::with_capacity(n_locates as usize + 1);
@@ -705,6 +795,12 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
         rehashes: cache.rehashes,
         max_chain: cache.max_chain,
         max_lifecycle: cache.max_lifecycle,
+        span_recs,
+        span_p64,
+        span_hash,
+        span_h_early,
+        span_h_late,
+        span_w_late,
     }
 }
 
@@ -738,6 +834,88 @@ pub fn replay_sig_fabric_scalar(f: &SigFabric) -> (u64, Sig) {
 /// is the audit path, [`replay_sig_fabric`]).
 pub fn replay_global(f: &SigFabric) -> Sig {
     f.global_sigs.iter().copied().fold(Sig::IDENTITY, sig_combine)
+}
+
+// ── THE R36 SPAN LAYER'S REPLAY SURFACES ─────────────────────────────
+//
+// The R36 per-pass check is the MEMOIZED regime (solution1.md §6's
+// operating point B): the O(1) application of the frozen P64 (1 ring
+// multiply + 1 XOR, ~15 cycles — Corollary 10.1) plus the R36-C merge
+// law (3 CLMUL + 1 XOR, Theorem 17). The R34 Σ walk stays the table-
+// integrity check; the deep re-composition (the 977-hop chain) is the
+// audit path.
+
+/// The memoized application: `H = 0 ⊗ C ⊕ V` from the frozen P64 —
+/// must equal [`SigFabric::span_hash`] every pass (the O(1) record
+/// application's fail-stop).
+#[inline]
+pub fn span_apply_hash(f: &SigFabric) -> u64 {
+    spanfold::hash_apply_p64(0, &f.span_p64)
+}
+
+/// THE R36-C MERGE (the per-pass Galois-shift law): the frozen
+/// two-worker split's merge — `H_E ⊗ x^{W_L} ⊕ V_L` — must equal
+/// [`SigFabric::span_hash`] (Theorem 17 on the live path; the
+/// convention is structural: the shift is by the LATE span).
+#[inline]
+pub fn span_merge_hash(f: &SigFabric) -> u64 {
+    spanfold::hash_merge(f.span_h_early, f.span_h_late, f.span_w_late)
+}
+
+/// THE AUDIT PATH (HFT_SIG_AUDIT=1): the full 977-hop record
+/// re-composition — every chunk record re-applied in tape order
+/// (Corollary 10.1's chain, ~4.2 µs for the 500k stream on the dev
+/// VM). Must equal the frozen [`SigFabric::span_p64`] bit-exactly;
+/// the per-message sequential oracle is the cells' judge.
+pub fn replay_span_full(f: &SigFabric) -> spanfold::P64 {
+    spanfold::compose_records(&f.span_recs)
+}
+
+/// THE BAKE-FROM-LEDGER — the one body for both bake callers (the
+/// worker hook's lazy path AND the harness's pre-bake; the no-drift
+/// law). `rows` are the RX's affine ledger entries (the blob's frame
+/// bodies); the walk applies THE DUAL-FEED DEDUP (the sequencer's
+/// law): the blob renders BOTH feeds — the ledger rows interleave
+/// feed-0/feed-1 frames with byte-identical message blocks. The
+/// sequencer advances `w = first_seq + count` and dup-skips any frame
+/// whose first_seq falls below it, so the token stream is the
+/// single-feed message chain (msgs == the hydra count).
+pub fn bake_from_ledger(
+    rows: &[nf_transport::rxdesc::AffineLedgerEntry],
+) -> Arc<SigFabric> {
+    let mut w: u64 = 0;
+    let mut bodies: Vec<&[u8]> = Vec::with_capacity(rows.len() / 2 + 8);
+    for r in rows.iter() {
+        // SAFETY: the row's body is the frame's span body — the
+        // TOMBSTONE RULE's `frame[HEADER_LEN+2..flen]` (the message
+        // chain minus its FIRST length prefix, which sits at
+        // frame[HEADER_LEN..HEADER_LEN+2]). The frame header fields
+        // live below the body: seq at frame[10..18] == (body_ptr−12),
+        // count at frame[18..20] == (body_ptr−4). The blob is pinned
+        // for the process's life, read-only here, and body_ptr−22 is
+        // the frame's start (in-bounds by the fill's own contract).
+        unsafe {
+            let base = (r.body_ptr - 22) as *const u8;
+            let first_seq = u64::from_be_bytes(
+                std::slice::from_raw_parts(base.add(10), 8).try_into().unwrap(),
+            );
+            let count = u16::from_be_bytes(
+                std::slice::from_raw_parts(base.add(18), 2).try_into().unwrap(),
+            );
+            if w == 0 {
+                w = first_seq; // the first frame anchors
+            }
+            if first_seq < w {
+                continue; // the dual-feed duplicate — skip
+            }
+            w += count as u64;
+            bodies.push(std::slice::from_raw_parts(
+                base.add(20),
+                r.body_len as usize + 2,
+            ));
+        }
+    }
+    Arc::new(bake_sig_fabric(&bodies))
 }
 
 /// THE REPLAY — the WIDE path (the single-chunk wave): 8 locates per
@@ -1111,5 +1289,267 @@ mod tests {
         assert!(net.0 > 0 && net.1 > 0, "net volumes positive: {net:?}");
         assert!(net.0 < 210_000_000 && net.1 < 210_000_000);
         assert_eq!(f.anomalies, 0, "the reference tape resolves clean");
+    }
+
+    // ── THE R36 SPAN LAYER'S CELLS ───────────────────────────────────
+
+    /// Rebuild the bake's message-order columns from a fabric (the
+    /// cells' re-derivation — the columns are not stored in the frozen
+    /// product; only the records are). Walks the SAME bodies.
+    fn rebuild_span_columns(bodies: &[&[u8]]) -> (Vec<u8>, Vec<u64>, Vec<i64>, Vec<i64>, Vec<u32>, Vec<u8>) {
+        let mut ty36 = Vec::new();
+        let mut vd36 = Vec::new();
+        let mut db36 = Vec::new();
+        let mut da36 = Vec::new();
+        let mut px36 = Vec::new();
+        let mut setp36 = Vec::new();
+        // A MINI resolve: the deltas only need the SAME cache walk the
+        // bake runs — reuse the bake itself as the oracle by calling it
+        // on the bodies and reading its token SoA is NOT message-order,
+        // so re-walk with a fresh cache (the decode is deterministic).
+        let mut cache = OrderCache::new(16);
+        let mut _anomalies = 0u64;
+        for &body in bodies {
+            let mut p = 0usize;
+            while p + 2 <= body.len() {
+                let l = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+                p += 2;
+                if p + l > body.len() {
+                    break;
+                }
+                let m = &body[p..p + l];
+                p += l;
+                if m.len() < 3 {
+                    continue;
+                }
+                let t = m[0];
+                let (d0, d1, pv, sv): (u64, u64, u64, u64) = match t {
+                    b'A' | b'F' => {
+                        let side = m[19];
+                        let shares = u32::from_be_bytes([m[20], m[21], m[22], m[23]]);
+                        let price = u32::from_be_bytes([m[32], m[33], m[34], m[35]]);
+                        let oref = u64::from_be_bytes([
+                            m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18],
+                        ]);
+                        let loc = u16::from_be_bytes([m[1], m[2]]);
+                        cache.insert(oref, shares, price, loc, side);
+                        if side_ask(side) { (0, shares as u64, 0, 0) } else { (shares as u64, 0, 0, 0) }
+                    }
+                    b'E' => {
+                        let oref = u64::from_be_bytes([
+                            m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18],
+                        ]);
+                        let q = u32::from_be_bytes([m[19], m[20], m[21], m[22]]);
+                        match cache.probe(oref) {
+                            Some((_l, side, rem, rpx)) => {
+                                let eff = q.min(rem);
+                                cache.set_rem(oref, rem.saturating_sub(q));
+                                let (d0, d1) = if side_ask(side) {
+                                    (0, (eff as u64).wrapping_neg())
+                                } else {
+                                    ((eff as u64).wrapping_neg(), 0)
+                                };
+                                (d0, d1, rpx as u64, 1)
+                            }
+                            None => {
+                                _anomalies += 1;
+                                (0, 0, 0, 0)
+                            }
+                        }
+                    }
+                    b'X' => {
+                        let oref = u64::from_be_bytes([
+                            m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18],
+                        ]);
+                        let q = u32::from_be_bytes([m[19], m[20], m[21], m[22]]);
+                        match cache.probe(oref) {
+                            Some((_l, side, rem, _rpx)) => {
+                                let eff = q.min(rem);
+                                cache.set_rem(oref, rem - eff);
+                                let (d0, d1) = if side_ask(side) {
+                                    (0, (eff as u64).wrapping_neg())
+                                } else {
+                                    ((eff as u64).wrapping_neg(), 0)
+                                };
+                                (d0, d1, 0, 0)
+                            }
+                            None => {
+                                _anomalies += 1;
+                                (0, 0, 0, 0)
+                            }
+                        }
+                    }
+                    b'D' => {
+                        let oref = u64::from_be_bytes([
+                            m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18],
+                        ]);
+                        match cache.probe(oref) {
+                            Some((_l, side, rem, _rpx)) => {
+                                cache.erase(oref);
+                                let (d0, d1) = if side_ask(side) {
+                                    (0, (rem as u64).wrapping_neg())
+                                } else {
+                                    ((rem as u64).wrapping_neg(), 0)
+                                };
+                                (d0, d1, 0, 0)
+                            }
+                            None => {
+                                _anomalies += 1;
+                                (0, 0, 0, 0)
+                            }
+                        }
+                    }
+                    b'U' => {
+                        let oref = u64::from_be_bytes([
+                            m[11], m[12], m[13], m[14], m[15], m[16], m[17], m[18],
+                        ]);
+                        let nref = u64::from_be_bytes([
+                            m[19], m[20], m[21], m[22], m[23], m[24], m[25], m[26],
+                        ]);
+                        let nq = u32::from_be_bytes([m[27], m[28], m[29], m[30]]);
+                        let npx = u32::from_be_bytes([m[31], m[32], m[33], m[34]]);
+                        let loc = u16::from_be_bytes([m[1], m[2]]);
+                        match cache.probe(oref) {
+                            Some((_l, side, rem, _rpx)) => {
+                                cache.erase(oref);
+                                cache.insert(nref, nq, npx, loc, side);
+                                let delta = (nq as i64) - (rem as i64);
+                                let (d0, d1) = if side_ask(side) {
+                                    (0, delta as u64)
+                                } else {
+                                    (delta as u64, 0)
+                                };
+                                (d0, d1, 0, 0)
+                            }
+                            None => {
+                                _anomalies += 1;
+                                (0, 0, 0, 0)
+                            }
+                        }
+                    }
+                    b'P' | b'Q' => {
+                        let price = if t == b'P' {
+                            u32::from_be_bytes([m[32], m[33], m[34], m[35]])
+                        } else {
+                            u32::from_be_bytes([m[27], m[28], m[29], m[30]])
+                        };
+                        (0, 0, price as u64, 1)
+                    }
+                    _ => (0, 0, 0, 0),
+                };
+                ty36.push(crate::spanfold::ty36(t));
+                vd36.push(span_digest(t, m));
+                db36.push(d0 as i64);
+                da36.push(d1 as i64);
+                px36.push(pv as u32);
+                setp36.push((sv != 0) as u8);
+            }
+        }
+        (ty36, vd36, db36, da36, px36, setp36)
+    }
+
+    /// THE R36 BAKE LAW: the fabric's frozen span layer == the
+    /// sequential span oracle over the same message-order columns
+    /// (Theorem 18 at the fabric level: bake == `fold_stream_sequential`),
+    /// the per-chunk records compose to the same P64, and the two-worker
+    /// split's merge law holds (R36-C, Theorem 17).
+    #[test]
+    fn t_r36f_bake_spanhash_matches_oracle() {
+        let m0 = add(1, 100, b'B', 500, 101);
+        let m1 = add(1, 101, b'S', 700, 102);
+        let m2 = exec(1, 100, 200);
+        let m3 = cancel(1, 101, 300);
+        let m4 = trade(1, 99);
+        let m5 = delete(1, 100);
+        let m6 = replace(1, 101, 200, 100, 55);
+        let bodies: Vec<&[u8]> = vec![&m0, &m1, &m2, &m3, &m4, &m5, &m6];
+        let f = bake_sig_fabric(&bodies);
+        let (ty, vd, db, da, px, sp) = rebuild_span_columns(&bodies);
+        // The sequential oracle (the 2-op chain, message order).
+        let (oracle, h_oracle) = spanfold::fold_stream_sequential(
+            &spanfold::SpanTokens { ty: ty.clone(), vd: vd.clone(), db: db.clone(), da: da.clone(), px: px.clone(), setp: sp.clone() },
+            0,
+        );
+        assert_eq!(f.span_p64, oracle, "the bake's P64 == the sequential span oracle");
+        assert_eq!(f.span_hash, h_oracle);
+        // The chunk-record composition (the memoized law).
+        let full = replay_span_full(&f);
+        assert_eq!(full, f.span_p64, "the record chain == the frozen P64");
+        // The O(1) application + the merge law (the per-pass surfaces).
+        assert_eq!(span_apply_hash(&f), f.span_hash, "the memoized application law");
+        assert_eq!(span_merge_hash(&f), f.span_hash, "the R36-C merge law");
+        // The span bookkeeping: W == Σ wire widths of the book messages.
+        let w_expected: u64 = ty.iter().map(|&t| spanfold::W_T[t as usize]).sum();
+        assert_eq!(f.span_p64.deg as u64, w_expected, "the degree == the byte span");
+        assert_eq!(f.span_p64.cnt as u64, ty.len() as u64);
+        assert_eq!(f.span_recs.len(), ty.len().div_ceil(SPAN_CHUNK));
+        // The commutative coordinates agree with the R34 Σ (the two
+        // layers are the same monoid's coordinates).
+        assert_eq!(f.span_p64.db as u64, f.global_sig.db, "db: span layer == R34 Σ");
+        assert_eq!(f.span_p64.da as u64, f.global_sig.da, "da: span layer == R34 Σ");
+        // The price coordinate: the LAST setter's price (dense-seq law).
+        assert_eq!(f.span_p64.px, f.global_sig.px as u32, "px: span layer == R34 Σ");
+    }
+
+    /// THE SPLIT SWEEP at the fabric level: for every split of the
+    /// chunk-record table, `hash_merge(H_E, V_L, W_L) == span_hash`
+    /// (Theorem 12 + 17 — partition invariance of the hash layer).
+    #[test]
+    fn t_r36f_split_sweep_merge_law() {
+        let m0 = add(1, 100, b'B', 500, 101);
+        let m1 = add(1, 101, b'S', 700, 102);
+        let m2 = exec(1, 100, 200);
+        let m3 = cancel(1, 101, 300);
+        let m4 = trade(1, 99);
+        let bodies: Vec<&[u8]> = vec![&m0, &m1, &m2, &m3, &m4];
+        let f = bake_sig_fabric(&bodies);
+        let n = f.span_recs.len();
+        for k in 0..=n {
+            let early = spanfold::compose_records(&f.span_recs[..k]);
+            let late = spanfold::compose_records(&f.span_recs[k..]);
+            let h_e = spanfold::hash_apply_p64(0, &early);
+            let merged = spanfold::hash_merge(h_e, late.v, late.deg as u64);
+            assert_eq!(merged, f.span_hash, "split at record {k}/{n}");
+        }
+        // The degenerate splits (0 and n) are the identity edges.
+        // (k=0: h_e = 0, merged = 0⊗x^W ⊕ V = V ✓; k=n: late = identity,
+        //  merged = H ⊗ 1 ⊕ 0 = H ✓.)
+    }
+
+    /// THE GOLDEN TAPE'S SPAN LAYER: the 505,849-message corpus bakes
+    /// the full span layer — the frozen laws (application, merge, the
+    /// audit chain) all hold, and the corpus constants (chunk count,
+    /// the degree == the byte-span law) are pinned.
+    #[test]
+    fn t_r36f_golden_tape_span_layer() {
+        let gt = std::fs::read("data/tests/sample-mini.itch")
+            .or_else(|_| std::fs::read("../../data/tests/sample-mini.itch"))
+            .or_else(|_| std::fs::read("../../../data/tests/sample-mini.itch"))
+            .expect("golden tape");
+        let bodies: Vec<&[u8]> = vec![&gt];
+        let f = bake_sig_fabric(&bodies);
+        assert_eq!(f.n_msgs, 505_849);
+        // The chunk grid: 977 records (the R34 global law's twin).
+        assert_eq!(f.span_recs.len(), (f.n_msgs as usize).div_ceil(SPAN_CHUNK));
+        // The degree == the book messages' total byte span (the span
+        // discipline's own count law).
+        let (ty, _vd, _db, _da, _px, _sp) = rebuild_span_columns(&bodies);
+        let w_expected: u64 = ty.iter().map(|&t| spanfold::W_T[t as usize]).sum();
+        assert_eq!(f.span_p64.deg as u64, w_expected, "the byte-span law on the golden tape");
+        assert_eq!(f.span_p64.cnt as u64, f.n_msgs);
+        // The per-pass surfaces: application, merge, and the audit chain.
+        assert_eq!(span_apply_hash(&f), f.span_hash);
+        assert_eq!(span_merge_hash(&f), f.span_hash);
+        let full = replay_span_full(&f);
+        assert_eq!(full, f.span_p64, "the 977-hop audit chain == the frozen P64");
+        // The commutative coordinates agree with the R34 Σ at 500k scale.
+        assert_eq!(f.span_p64.db as u64, f.global_sig.db);
+        assert_eq!(f.span_p64.da as u64, f.global_sig.da);
+        assert_eq!(f.span_p64.px, f.global_sig.px as u32);
+        // Determinism: a second bake is bit-identical.
+        let f2 = bake_sig_fabric(&bodies);
+        assert_eq!(f2.span_hash, f.span_hash);
+        assert_eq!(f2.span_recs.len(), f.span_recs.len());
+        assert_eq!(f2.span_p64, f.span_p64);
     }
 }

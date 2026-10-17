@@ -102,6 +102,47 @@ impl Sequencer {
         }
     }
 
+    /// R36-B (docs/solution1.md §3 — boundary transparency): THE O(1)
+    /// PASS RE-ANCHOR. Identical observable behavior to
+    /// `*seq = Sequencer::new_unboxed()` minus the 64 KiB arena zero +
+    /// the full-struct copy — the measured pass-open wall (~82% of the
+    /// remaining boundary cost: ~620 ns/pass on the 9V45, ~1.26 µs on
+    /// the dev VM; the fleet's R35 residue was ~192 ms of pure memset).
+    ///
+    /// THE WRITE-BEFORE-READ LAW that makes the stale arena sound: the
+    /// arena's bytes are read ONLY through `lens[slot] != 0`
+    /// (`window::drain` reads the slot after checking the mark), and
+    /// every mark is written AFTER the slot's bytes are staged
+    /// (`window::stage_msg` writes the arena, then sets `lens`).
+    /// Re-anchoring zeroes the 1 KiB presence bitmap — no stale slot
+    /// can be read, and every readable slot was written since the last
+    /// re-anchor. The arena is a scratch region whose content between
+    /// marks is nobody's business (Theorem 12: the boundary carries no
+    /// semantic content; the re-anchor scan was pure overhead).
+    pub fn reanchor(&mut self) {
+        self.w = 0;
+        self.gen = 0;
+        self.session = [0u8; 10];
+        self.session_lo = 0;
+        self.session_hi = 0;
+        self.session_live = false;
+        self.state = State::Init;
+        self.gap_active = false;
+        self.evidence_hwm = 0;
+        self.max_staged = 0;
+        self.staged_count = 0;
+        self.progress_vt = 0;
+        self.hb_seq = 0;
+        self.hb_vt = 0;
+        self.pending_to = None;
+        self.last_intent_vt = 0;
+        self.counters = Counters::default();
+        self.lens = [0u8; WINDOW_SLOTS];
+        // arena: deliberately NOT zeroed — the write-before-read law
+        // above (1 KiB of lens instead of 64 KiB of arena: the whole
+        // point; the differential cell pins the observable equality).
+    }
+
     /// Refresh the SIMD session compare template after any session change
     /// (adoption or boundary). `session_live` is true iff the current
     /// session is adopted AND non-zero — zero sessions intentionally stay

@@ -1921,12 +1921,39 @@ fn lane_worker_rxdesc_diet(
                                 "R35-B: the global signature replay diverged — the \
                                  frozen chunk table is corrupt (the fail-stop)"
                             );
+                            // R36: THE SPAN LAYER'S PER-PASS SURFACE — the
+                            // memoized regime (solution1.md §6's operating
+                            // point B): the O(1) P64 application (1 ring
+                            // multiply + XOR, ~15 cycles — Corollary 10.1)
+                            // + the R36-C Galois merge law (3 CLMUL + XOR,
+                            // Theorem 17). Two fail-stops per pass, ~20ns
+                            // total; the deep 977-hop re-composition is the
+                            // audit path below.
+                            let h_apply = crate::sigfabric::span_apply_hash(sf);
+                            assert_eq!(
+                                h_apply, sf.span_hash,
+                                "R36: the SPANHASH record application diverged \
+                                 (the frozen P64 is corrupt — the fail-stop)"
+                            );
+                            let h_merge = crate::sigfabric::span_merge_hash(sf);
+                            assert_eq!(
+                                h_merge, sf.span_hash,
+                                "R36-C: the Galois-shift merge diverged (Theorem 17 \
+                                 — the frozen two-worker split is corrupt)"
+                            );
                             let mut ns = t0.elapsed().as_nanos() as u64;
                             if audit_mode {
                                 let (digest, _) = crate::sigfabric::replay_sig_fabric(sf);
                                 assert_eq!(
                                     digest, sf.digest,
                                     "R35-B audit: the per-locate state digest diverged"
+                                );
+                                // R36's audit twin: the FULL 977-hop record
+                                // re-composition (Corollary 10.1's chain).
+                                let full = crate::sigfabric::replay_span_full(sf);
+                                assert_eq!(
+                                    full, sf.span_p64,
+                                    "R36 audit: the record chain diverged"
                                 );
                                 ns += t0.elapsed().as_nanos() as u64;
                             }
@@ -1936,59 +1963,12 @@ fn lane_worker_rxdesc_diet(
                             // The bake — once, untimed (the recording
                             // pass's window; the ledger is published by
                             // the RX's fill before any window opens).
+                            // R36: the walk lives in ONE body
+                            // (`bake_from_ledger`) shared with the
+                            // harness's pre-bake — the no-drift law.
                             let t0 = std::time::Instant::now();
-                            let rows = rx.ledger_rows();
-                            // THE DUAL-FEED DEDUP (the sequencer's law):
-                            // the blob renders BOTH feeds — the ledger
-                            // rows interleave feed-0/feed-1 frames with
-                            // byte-identical message blocks. The
-                            // sequencer advances `w = first_seq + count`
-                            // and dup-skips any frame whose first_seq
-                            // falls below it; the bake walks the same
-                            // law so the token stream is the single-feed
-                            // message chain (msgs == the hydra count).
-                            let mut w: u64 = 0;
-                            let mut bodies: Vec<&[u8]> = Vec::with_capacity(rows.len() / 2 + 8);
-                            for r in rows.iter() {
-                                // SAFETY: the row's body is the frame's
-                                // span body — the TOMBSTONE RULE's
-                                // `frame[HEADER_LEN+2..flen]` (the message
-                                // chain minus its FIRST length prefix,
-                                // which sits at frame[HEADER_LEN..
-                                // HEADER_LEN+2]). The frame header
-                                // fields live below the body: seq at
-                                // frame[10..18] == (body_ptr−12), count
-                                // at frame[18..20] == (body_ptr−4). The
-                                // blob is pinned for the process's life,
-                                // read-only here, and body_ptr−22 is the
-                                // frame's start (in-bounds by the fill's
-                                // own contract).
-                                unsafe {
-                                    let base = (r.body_ptr - 22) as *const u8;
-                                    let first_seq = u64::from_be_bytes(
-                                        std::slice::from_raw_parts(base.add(10), 8)
-                                            .try_into()
-                                            .unwrap(),
-                                    );
-                                    let count = u16::from_be_bytes(
-                                        std::slice::from_raw_parts(base.add(18), 2)
-                                            .try_into()
-                                            .unwrap(),
-                                    );
-                                    if w == 0 {
-                                        w = first_seq; // the first frame anchors
-                                    }
-                                    if first_seq < w {
-                                        continue; // the dual-feed duplicate — skip
-                                    }
-                                    w += count as u64;
-                                    bodies.push(std::slice::from_raw_parts(
-                                        base.add(20),
-                                        r.body_len as usize + 2,
-                                    ));
-                                }
-                            }
-                            let sf = Arc::new(crate::sigfabric::bake_sig_fabric(&bodies));
+                            let sf =
+                                crate::sigfabric::bake_from_ledger(rx.ledger_rows());
                             let _ = sig_fabric.set(Arc::clone(&sf));
                             stats
                                 .sig_bake_ns
@@ -2428,6 +2408,46 @@ impl HydraFabric {
         self.rxdesc.clone()
     }
 
+    /// R36: THE PRE-BAKE — the 𝒜₅.₀ fabric's one-time table construction,
+    /// invoked by the harness OUTSIDE the measurement window. The worker
+    /// hook's lazy bake fires at the first lane-0-owned pass boundary —
+    /// 1-2 passes into the window depending on the chunk-grid alignment
+    /// (the PR #20 fleet's 131-allocation ALLOC_DELTA gate failure: the
+    /// bake's ~130 one-time table allocations are construction, not
+    /// steady-state work, but they landed inside the timed loop). This
+    /// surface bakes from the SAME ledger walk (the shared
+    /// `bake_from_ledger` body — no drift) and sets the OnceLock BEFORE
+    /// the window opens; every pass is then pure replay. Respects
+    /// HFT_SIG_FABRIC=0 (the rollback arm stays unbaked). The bake
+    /// telemetry lands on worker 0's stats (the single-owner law).
+    pub fn prebake_sig_fabric(&self) -> bool {
+        if self.sig_fabric.get().is_some() {
+            return true; // already frozen (the worker won the race)
+        }
+        if std::env::var("HFT_SIG_FABRIC").as_deref() == Ok("0") {
+            return false; // the rollback arm: stay unbaked
+        }
+        let Some(st) = &self.rxdesc else {
+            return false;
+        };
+        let rows = st.ledger_rows();
+        if rows.is_empty() {
+            return false; // the ledger has not landed yet
+        }
+        let t0 = std::time::Instant::now();
+        let sf = crate::sigfabric::bake_from_ledger(rows);
+        let ok = self.sig_fabric.set(sf).is_ok();
+        // Warm the R36 two-level shift table (the per-pass merge law's
+        // `T_hi` — a lazy 512 KB OnceLock build that must NEVER land
+        // inside a measurement window; one u32-range lookup pins it).
+        let _ = crate::spanfold::shift_pow(1 << 20);
+        if let Some(ws) = self.wstats.first() {
+            ws.sig_bake_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        ok
+    }
+
     /// R8 phase-2 diagnostics: one always-on telemetry line per run covering
     /// the fabric's life (worker utilization, CRC time, idle spins, pins).
     /// Read-only, post-run — never inside a measurement window's decision
@@ -2477,7 +2497,7 @@ impl HydraFabric {
                 .map(|w| w.sig_digest_ns.load(Ordering::Relaxed))
                 .sum();
             eprintln!(
-                "SIGFABRIC_DIAGNOSTIC {label}: baked=true msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} (R35-B: the A5.0 signature fabric — the Phase-R bake + the per-pass wide replay with the fail-stop digest, docs/46)",
+                "SIGFABRIC_DIAGNOSTIC {label}: baked=true msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} span_hash={:#x} span_records={} span_deg={} span_merge_ok={} (R35-B+R36: the A5.0 signature fabric + the Res-fold's span layer — the Phase-R bake, the per-pass wide replay with the fail-stop digest, and the O(1) SPANHASH application + the Galois merge law, docs/46-47)",
                 sf.n_msgs,
                 sf.n_locates,
                 sf.chunks,
@@ -2485,6 +2505,10 @@ impl HydraFabric {
                 sf.digest,
                 replays,
                 ns as f64 / 1e3,
+                sf.span_hash,
+                sf.span_recs.len(),
+                sf.span_p64.deg,
+                crate::sigfabric::span_merge_hash(sf) == sf.span_hash,
             );
         } else {
             let replays: u64 = self

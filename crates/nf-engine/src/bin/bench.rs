@@ -569,16 +569,42 @@ fn run_hydra_sustained_5s(
     // pass; only the session id changes, which cannot affect the tuple).
     // Auto-advance pass accounting: construction = 0, this ref pass = 1,
     // the measured loop starts at pass 2 (counter 1000).
+    //
+    // R36 (PR #20's fleet defect — the 116 first-pass allocations): the
+    // ref pass now runs the FULL pass shape (begin_pass + end_pass), so
+    // the worker's window boundary fires HERE — the 𝒜₅.₀ fabric's BAKE
+    // (the Phase-R ledger walk and its one-time table allocations) lands
+    // in the untimed reference pass, and the 5.0s sustained loop enters
+    // with the fabric already frozen: every loop pass is pure replay,
+    // ALLOC_DELTA == 0 restored (the steady state's own law). The
+    // burst-shaped ref walk (no begin/end) could not publish a
+    // pass-start record, so the bake used to land inside the window —
+    // the fleet's 116-allocation gate failure.
     let ref_tuple = {
         transport.reset_pass(1, initial_sess);
         *seq = Sequencer::new_unboxed();
         let mut ref_sink = nf_testkit::hydra::HydraSpanSink::new(&fabric);
+        ref_sink.begin_pass();
         while transport.next_batch() {
             seq.ingest_entries_ladder(transport.entries(), transport.now_ns(), &mut ref_sink, ladder);
             ref_sink.drain_ready();
         }
+        ref_sink.end_pass();
         ref_sink.finish();
-        (ref_sink.count, ref_sink.hash, ref_sink.msg_hash)
+        // The pass shape's tuple comes from the pass record ring (the
+        // boundary crossing snapshots the fold chain into the record;
+        // the sink's own `hash` field resets to the seed at the boundary
+        // — the burst shape's direct field reads are the WRONG surface
+        // under begin/end, which is why the harvest is authoritative).
+        let mut ref_harvest = [(0u64, 0u64, 0u64); nf_testkit::hydra::PASS_RING];
+        let n = ref_sink.harvest_completed(&mut ref_harvest);
+        assert!(n >= 1, "the ref pass's record must complete");
+        assert_eq!(n, 1, "exactly one pass record (the ref pass)");
+        assert_eq!(
+            ref_harvest[0].0, ref_sink.count,
+            "the harvested count == the sink's count (the count law)"
+        );
+        (ref_harvest[0].0, ref_harvest[0].1, ref_harvest[0].2)
     };
 
     // NULL diagnostic mode: worker values are span-id-derived (wrong by
@@ -586,7 +612,22 @@ fn run_hydra_sustained_5s(
     // the per-pass hash assert is disabled (count/msg_hash still asserted).
     // (Read BEFORE the allocation window — env::var allocates.)
     let null_diag = std::env::var("HFT_HYDRA_NULL").as_deref() == Ok("1");
+    // R36-B: the re-anchor rollback (CI arm 11r36r) — restores the full
+    // per-pass sequencer construction (the 64 KiB arena zero + copy, the
+    // PR #20 boundary shape) for the same-draw attribution.
+    let reanchor_on = std::env::var("HFT_REANCHOR").as_deref() != Ok("0");
 
+    // R36 (PR #20's fleet defect — the 116-allocation ALLOC_DELTA gate
+    // failure): the fabric's one-time BAKE is moved OUT of the timed
+    // window. The ref pass now runs the full pass shape (begin/end —
+    // the worker's window boundary fires here), AND the harness pre-bakes
+    // explicitly (the chunk-grid alignment race made the lazy bake land
+    // 1–2 passes into the window; the pre-bake is deterministic, uses the
+    // SAME ledger walk as the worker hook, and respects HFT_SIG_FABRIC=0).
+    // The 5.0s sustained loop then enters with the fabric frozen: every
+    // loop pass is pure replay, ALLOC_DELTA == 0 restored — the steady
+    // state's own law. (env::var inside prebake allocates — pre-window.)
+    let prebaked = fabric.prebake_sig_fabric();
     let (a1, d1) = GLOBAL.snapshot();
     let start = Instant::now();
     let t_start_mono = read_monotonic_raw_ns();
@@ -600,6 +641,10 @@ fn run_hydra_sustained_5s(
     let mut d_reset_ns: u64 = 0;
     let mut d_boundary_wait_ns: u64 = 0;
     let mut d_boundary_open_ns: u64 = 0;
+    // R36 (probe): the pass-open split's accumulators.
+    let mut d_open_sq_ns: u64 = 0;
+    let mut d_open_bp_ns: u64 = 0;
+    let mut d_open_pr_ns: u64 = 0;
     let mut d_scan_ns: u64 = 0;
     let mut d_end_ns: u64 = 0;
     let mut d_pending_max: u64 = 0;
@@ -634,10 +679,28 @@ fn run_hydra_sustained_5s(
         let t_r = std::time::Instant::now();
         transport.reset_pass(pass, sess);
         let t_r1 = std::time::Instant::now();
-        *seq = Sequencer::new_unboxed();
+        // R36-B: THE O(1) RE-ANCHOR — the 64 KiB arena zero + full-struct
+        // copy of `*seq = Sequencer::new_unboxed()` was the pass-open wall
+        // (~82% of it: the write-before-read law makes the arena zero pure
+        // overhead; only the 1 KiB presence bitmap needs clearing).
+        // HFT_REANCHOR=0 (arm 11r36r) restores the full construction.
+        if reanchor_on {
+            seq.reanchor();
+        } else {
+            *seq = Sequencer::new_unboxed();
+        }
+        let t_sq = std::time::Instant::now();
         sink.begin_pass();
+        let t_bp = std::time::Instant::now();
         pass_replay.begin_pass();
         let t_r2 = std::time::Instant::now();
+        // R36 (probe): the pass-open split — the sequencer re-anchor vs
+        // the sink's begin_pass (the eager window publish's coherence)
+        // vs the replay ledger. Off the steady path by three Instant
+        // pairs per pass (~120ns; the RXSCHED_DIAGNOSTIC pattern).
+        d_open_sq_ns += t_sq.duration_since(t_r1).as_nanos() as u64;
+        d_open_bp_ns += t_bp.duration_since(t_sq).as_nanos() as u64;
+        d_open_pr_ns += t_r2.duration_since(t_bp).as_nanos() as u64;
         // R35 (probe): the boundary attribution — the transport re-arm
         // wait vs the sink's pass-open work. Off the steady path by one
         // Instant pair per pass (~40ns; the RXSCHED_DIAGNOSTIC pattern).
@@ -684,6 +747,7 @@ fn run_hydra_sustained_5s(
         sink.end_pass(); // non-blocking: the tail folds during the next pass
         let n = sink.harvest_completed(&mut harvested);
         let t_e = std::time::Instant::now();
+        let _ = prebaked; // (the engagement line below reports the pre-bake)
         if diag {
             d_reset_ns += t_r2.duration_since(t_r).as_nanos() as u64;
             d_scan_ns += t_s.duration_since(t_r2).as_nanos() as u64;
@@ -743,7 +807,7 @@ fn run_hydra_sustained_5s(
         // the sink pass-open work (the reset wall's split; the probe
         // Instant pair adds ~40ns/pass, inside the diag noise floor).
         eprintln!(
-            "BOUNDARY_DIAGNOSTIC sustained: reset_wait_ms={:.1} pass_open_ms={:.1} per_pass_reset_wait_ns={:.0} per_pass_open_ns={:.0}",
+            "BOUNDARY_DIAGNOSTIC sustained: reset_wait_ms={:.1} pass_open_ms={:.1} per_pass_reset_wait_ns={:.0} per_pass_open_ns={:.0} open_split[sequencer={:.0} begin_pass={:.0} replay={:.0}]",
             d_boundary_wait_ns as f64 / 1e6,
             d_boundary_open_ns as f64 / 1e6,
             if d_passes > 0 {
@@ -753,6 +817,21 @@ fn run_hydra_sustained_5s(
             },
             if d_passes > 0 {
                 d_boundary_open_ns / d_passes
+            } else {
+                0
+            },
+            if d_passes > 0 {
+                d_open_sq_ns / d_passes
+            } else {
+                0
+            },
+            if d_passes > 0 {
+                d_open_bp_ns / d_passes
+            } else {
+                0
+            },
+            if d_passes > 0 {
+                d_open_pr_ns / d_passes
             } else {
                 0
             },
@@ -880,6 +959,41 @@ fn run_hydra_sustained_5s(
                 d_boundary_wait_ns as f64 / 1e6,
                 per_pass_reset_ns,
                 gate_ns as f64 / 1e6,
+            );
+        }
+        // R36: THE RES-FOLD + BOUNDARY-TRANSPARENCY VERDICT — the span
+        // layer's engagement (baked, the record count, the merge law on
+        // the live path) + the O(1) re-anchor's boundary collapse (the
+        // PR #20 fleet residue: reset_ms=204.0 with pass_open dominated
+        // by the 64 KiB sequencer-arena zero — Theorem 12: the re-anchor
+        // scan had zero semantic content; the write-before-read law
+        // makes the arena zero pure overhead).
+        {
+            let (baked, span_records, span_deg, merge_ok) = match fabric.sig_fabric.get() {
+                Some(sf) => (
+                    true,
+                    sf.span_recs.len(),
+                    sf.span_p64.deg,
+                    nf_testkit::sigfabric::span_merge_hash(sf) == sf.span_hash,
+                ),
+                None => (false, 0usize, 0u32, false),
+            };
+            let per_pass_open_ns = if d_passes > 0 {
+                d_boundary_open_ns / d_passes
+            } else {
+                0
+            };
+            println!(
+                "PR1_R36_RESFOLD_VERDICT rate={} baked={} span_records={} span_deg={} span_merge_ok={} reset_ms={:.1} per_pass_open_ns={:.0} prebaked={} reanchor={} (R36: the Res-fold landed — the SPANHASH folds branch-free into O(1) 36-byte records, merges by the Galois shift on the live path, and the pass boundary's 64 KiB re-anchor zero is gone; the PR #20 baseline: reset_ms=204.0 pass_open≈620ns/pass, docs/47)",
+                sustained_rate,
+                baked,
+                span_records,
+                span_deg,
+                merge_ok,
+                d_reset_ns as f64 / 1e6,
+                per_pass_open_ns,
+                prebaked,
+                reanchor_on,
             );
         }
     }

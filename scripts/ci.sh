@@ -856,6 +856,72 @@ grep "PR1_R35_PREARM_VERDICT" /tmp/bench_r35.txt | head -1
 grep "SIGFABRIC_DIAGNOSTIC sustained" /tmp/bench_r35.txt | head -1
 grep "BOUNDARY_DIAGNOSTIC sustained" /tmp/bench_r35.txt | head -1
 
+# ── 11r36. R36: the Res-fold + the boundary transparency ────────────
+# THE R36 PROGRAM (docs/solution1.md + docs/47): (A) THE RES-FOLD —
+# the SPANHASH's affine algebra (Lemma 5's suffix formula) collapses
+# the per-message serialized CLMUL chain into Theorem 10's branch-free
+# V-fold (VPCLMULQDQ 4-lane, the port's compress-mask + operand-build
+# fixes) with the 36-byte composite record (R36) whose composition is
+# ONE carry-less multiply + ONE XOR (Corollary 10.1) and the 48-byte
+# P64 accumulator for pass-scale degrees; the fabric bakes the message-
+# order span columns into 988 frozen chunk records + the global
+# SPANHASH, and every pass's window boundary runs the O(1) record
+# application (~15 cycles) + the R36-C Galois merge law (3 CLMUL + XOR,
+# Theorem 17 — the shift by the LATER worker's span, never a material-
+# ized matrix). (B) THE BOUNDARY TRANSPARENCY — the sequencer's per-
+# pass 64 KiB arena zero was the PR #20 fleet's remaining reset wall
+# (pass_open ~620 ns/pass, ~192 ms of the 204): the write-before-read
+# law (arena bytes only readable through lens marks, marks only
+# writable after staging) makes the zero pure overhead — the O(1)
+# re-anchor clears the 1 KiB presence bitmap (11.6 ns measured). The
+# pre-bake lands the fabric's one-time tables OUTSIDE the timed window
+# (PR #20's 131-allocation ALLOC_DELTA gate failure: the lazy bake's
+# chunk-grid alignment race). This arm lands the acceptance: the
+# spanfold differential cells (the mulmod 3-oracle fuzz, the type-order
+# adversary, the partition sweep, the split-degree sweep, the 500k
+# compose law), the fabric span cells, the reanchor differential, the
+# spanbench roofline, then the champion sustained arm with the R36
+# verdict line + the hard floor (bit-parity, allocs=0, the merge law).
+cargo test --release -p nf-testkit spanfold 2>&1 | tee /tmp/test_r36.txt
+grep -q "test result: ok" /tmp/test_r36.txt
+cargo test --release -p nf-testkit t_r36f 2>&1 | tee /tmp/test_r36f.txt
+grep -q "test result: ok" /tmp/test_r36f.txt
+cargo test --release -p nf-arbitrator test_r36 2>&1 | tee /tmp/test_r36r.txt
+grep -q "test result: ok" /tmp/test_r36r.txt
+cargo run --release -p nf-testkit --bin spanbench 2>&1 | tee /tmp/bench_r36.txt
+grep -q "PR1_R36_RES_FOLD_VERDICT" /tmp/bench_r36.txt
+grep -q "bitexact=true" /tmp/bench_r36.txt
+grep -q "dual_path=true" /tmp/bench_r36.txt
+grep -q "replay_ok=true" /tmp/bench_r36.txt
+grep -q "merge_ok=true" /tmp/bench_r36.txt
+grep "PR1_R36_RES_FOLD_VERDICT" /tmp/bench_r36.txt | head -1
+HFT_RXDESC=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36s.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r36s.txt
+grep -q "allocs=0" /tmp/bench_r36s.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r36s.txt
+grep -q "PR1_R36_RESFOLD_VERDICT rate=" /tmp/bench_r36s.txt
+grep -q "PR1_R36_RESFOLD_VERDICT.*baked=true" /tmp/bench_r36s.txt
+grep -q "PR1_R36_RESFOLD_VERDICT.*span_records=988" /tmp/bench_r36s.txt
+grep -q "PR1_R36_RESFOLD_VERDICT.*span_merge_ok=true" /tmp/bench_r36s.txt
+grep -q "PR1_R36_RESFOLD_VERDICT.*prebaked=true" /tmp/bench_r36s.txt
+grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true" /tmp/bench_r36s.txt
+grep -q "SIGFABRIC_DIAGNOSTIC.*span_hash=0x" /tmp/bench_r36s.txt
+grep -q "SIGFABRIC_DIAGNOSTIC.*span_merge_ok=true" /tmp/bench_r36s.txt
+grep -q "BOUNDARY_DIAGNOSTIC.*open_split" /tmp/bench_r36s.txt
+grep "PR1_R36_RESFOLD_VERDICT" /tmp/bench_r36s.txt | head -1
+grep "BOUNDARY_DIAGNOSTIC sustained" /tmp/bench_r36s.txt | head -1
+
+# ── 11r36r. R36-B: the re-anchor rollback (the attribution arm) ──────
+# HFT_REANCHOR=0 restores the full per-pass sequencer construction
+# (the 64 KiB arena zero + copy — the PR #20 boundary shape): the
+# same-draw delta 11r36 - 11r36r prices the boundary collapse (the
+# reset_ms split + the rate). The span layer stays armed on both arms.
+HFT_RXDESC=1 HFT_REANCHOR=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36rr.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r36rr.txt
+grep -q "allocs=0" /tmp/bench_r36rr.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r36rr.txt
+grep "PR1_R36_RESFOLD_VERDICT" /tmp/bench_r36rr.txt | head -1
+
 # ── 11r35r. R35-A: the pre-arm rollback (the attribution arm) ────────
 # HFT_PREARM=0 restores the synchronous marker-free advance verbatim
 # (the R33 boundary shape): same-draw delta 11r35 - 11r35r = the
