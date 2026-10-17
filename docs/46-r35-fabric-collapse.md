@@ -176,7 +176,6 @@ tens/hundreds, `gate_ms ≈ 0` at the champion depth,
 `L == 63` (the corpus constant), and the digest assert never fires.
 Rollbacks: `HFT_PREARM=0` (arm `11r35r`), `HFT_SIG_FABRIC=0` (the
 fabric), `HFT_SIG_AUDIT=1` (the deep audit).
-<<<<<<< HEAD
 
 ---
 
@@ -213,5 +212,3 @@ Publications (5.0s)      3,868,936               6,808,488                1.76x 
 Total Messages (5.0s)    89.9 Billion            156.5 Billion            +66.6 Billion msgs
 Gate PR1_R29_SELF_SERVE  17,791,404,158          31,309,406,435           PASS (3.1x over 10B target)
 ```
-=======
->>>>>>> origin/feat/run750-r35-fabric-collapse
