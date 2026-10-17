@@ -577,6 +577,36 @@ impl ResLog {
     }
 }
 
+/// R37b: THE FALLBACK GRID LAW — the replay fallback's cursor
+/// re-derivation, extracted pure (the unit cell's target). Given the
+/// eval cursor (the last emitted segment's end — an OWN-chunk
+/// position: segments never cross chunk ends, so eval ∈ [own_start,
+/// own_end]), re-derive the walk's grid: the next OWN chunk at-or-above
+/// eval, and the walk's start — `max(eval, chunk_lo)`.
+///
+/// THE LAW (the CI 13-shard failure's arithmetic): when eval sits
+/// EXACTLY at its own chunk's end, it is simultaneously a FOREIGN
+/// chunk's start (the other lane's turn) — the naive `gid = eval` walk
+/// would evaluate the foreign chunk's spans [eval, chunk_lo) into THIS
+/// lane's res ring (the fold's composite order assert: "got span
+/// 98880, expected 98944, lane 0"). The clamp guarantees the walk
+/// never starts below its lane's grid. Structurally a no-op at
+/// n_lanes == 1 (no foreign chunks — the R36-E scope gate's mask).
+fn fallback_grid(eval: u64, lane_idx: u64, n_lanes: u64) -> (u64, u64) {
+    // The modular advance to the lane's next OWN chunk — the pre-R37b
+    // code's `chunk_id += 1` is exact ONLY at n_lanes <= 2 (the
+    // odd/even flip); at 3+ lanes a foreign chunk needs +k (the unit
+    // cell's catch: lane 0/3 at chunk 2), and the 8/16-lane CI arms
+    // (HFT_SUSTAINED_WORKERS) would walk foreign chunks on the fallback.
+    let chunk_id = eval / CHUNK;
+    let lane_of = chunk_id % n_lanes;
+    let advance = (lane_idx + n_lanes - lane_of) % n_lanes;
+    let chunk_lo = (chunk_id + advance) * CHUNK;
+    // THE CLAMP: spans below chunk_lo belong to the OTHER lanes' grid
+    // (the owner's res ring, or main's inline claim).
+    (chunk_lo, eval.max(chunk_lo))
+}
+
 /// One pass's deferred-result record (GIGAHFT Lever 4). `count`/`msg_hash`
 /// are captured synchronously at `end_pass`; `hash` is captured when the
 /// ordered fold crosses the pass's final span — possibly DURING a later
@@ -2481,8 +2511,27 @@ fn lane_worker_rxdesc_diet(
                         rhead += nres;
                         nres = 0;
                     }
+                    // R37b: THE REPLAY CYCLE'S SHUTDOWN ESCAPE — the
+                    // cycle (the frontier break / the exhausted-script
+                    // force-cross defer) re-enters `'batch` while
+                    // `eval < ready`, so the outer loop's idle path
+                    // (the ONLY shutdown-checked park) is never reached.
+                    // At a full-tape ending the multi-lane gap holds
+                    // this lane's eval BELOW ready forever (the other
+                    // lane owns the tail spans; no further record will
+                    // ever land) — the join spins hot and the fabric
+                    // drop hangs. The bench's 5s window almost always
+                    // ends mid-pass (eval == ready, the idle path, the
+                    // clean park); the boundary-aligned ending and the
+                    // full-tape cells hit it deterministically. Publish
+                    // FIRST (above — the Strand A law), THEN check: the
+                    // exit leaves nothing unpublished.
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
                     continue 'batch;
                 }
+
                 // THE FALLBACK: re-derive the live walk's grid cursors
                 // from the eval cursor (the R29 derived-grid discipline
                 // — position-derived, drift-impossible) and fall through
@@ -2494,11 +2543,22 @@ fn lane_worker_rxdesc_diet(
                 // covering the eval is re-found by a scan — the gen
                 // re-anchor's pattern (the fallback is the rare path;
                 // the scan's cost is irrelevant here).
-                chunk_id = eval / CHUNK;
-                if chunk_id % n_lanes != lane_idx {
-                    chunk_id += 1;
-                }
-                chunk_lo = chunk_id * CHUNK;
+                // R37b: the grid re-derivation + THE OWN-CHUNK-END
+                // COINCIDENCE CLAMP (the pure law, `fallback_grid`):
+                // when eval sits exactly at its own chunk's end it is
+                // simultaneously a FOREIGN chunk's start — the walk
+                // must start at the lane's own grid, never below it
+                // (the foreign chunk's spans belong to the owning
+                // lane's ring / main's inline claim — the naive
+                // `gid = eval` walk emitted the foreign record into
+                // THIS lane's ring, the fold's order assert: "got span
+                // 98880, expected 98944, lane 0" — the 13-shard CI
+                // failure class; impossible at n_lanes == 1, the R36-E
+                // scope gate's mask).
+                let (lo, walk_start) = fallback_grid(eval, lane_idx, n_lanes);
+                chunk_id = walk_start / CHUNK;
+                chunk_lo = lo;
+                eval = walk_start;
                 {
                     let mut best = 0u64;
                     let mut got = false;
@@ -3916,6 +3976,17 @@ impl<'a> HydraSpanSink<'a> {
         self.force_inline = true;
     }
 
+    /// R37b: the assist-watermark override — the in-process form of
+    /// `HFT_ASSIST_WATERMARK` (the env is process-global and races the
+    /// parallel tests' fabrics; the spawn-override law, applied to the
+    /// sink-side dial). The claim-stress cells drive it LOW (the claims
+    /// fire on the submission's transient lead) to exercise the replay
+    /// fallback's grid re-derivation under real interleaving — the
+    /// two-lane shape the R36-E single-lane scope gate never ran.
+    pub fn set_assist_watermark(&mut self, wm: u64) {
+        self.rx_assist_wm = wm;
+    }
+
     /// Sequential-equivalent mode: no fabric, no threads — evaluates and
     /// folds synchronously. Used for differential bit-parity testing and as
     /// the single-core fallback (`HFT_HYDRA_WORKERS=0`).
@@ -4901,7 +4972,19 @@ impl<'a> HydraSpanSink<'a> {
                     }
                     true
                 } else {
-                    self.rx_assist_wm > 0
+                    // R37b: THE SELF-SERVE GUARD, TWINNED — the per-span
+                    // path (`submit_span_rx`) has carried `!rx_win_ss`
+                    // since R29; the batched twins dropped it (the
+                    // no-drift law violation). In an SS window the whole
+                    // span range is pre-published at the open, so a
+                    // mid-scan claim's mark lands AFTER the workers
+                    // (running the replay ~a window ahead of the scan
+                    // cursor) entered the chunk: both sides evaluate it
+                    // and the lane ring carries a duplicate the fold's
+                    // order law rejects. The workers own the ingest;
+                    // the pace gate stays the flow control.
+                    !self.rx_win_ss
+                        && self.rx_assist_wm > 0
                         && self.pending() > self.rx_assist_wm
                         && self.try_claim_inline()
                 };
@@ -5268,7 +5351,15 @@ impl<'a> HydraSpanSink<'a> {
                     }
                     true
                 } else {
-                    self.rx_assist_wm > 0
+                    // R37b: THE SELF-SERVE GUARD, TWINNED — the packed
+                    // batched twin (see `submit_span_rx`'s R29 block and
+                    // `submit_span_batch_rx`'s R37b fix): an SS window
+                    // never takes mid-scan inline claims — the exposure
+                    // is up-front, the mark cannot precede it, and the
+                    // duplicate lands in the lane ring (the fold's
+                    // order law).
+                    !self.rx_win_ss
+                        && self.rx_assist_wm > 0
                         && self.pending() > self.rx_assist_wm
                         && self.try_claim_inline()
                 };
@@ -8965,6 +9056,116 @@ mod tests {
         )
     }
 
+    /// R37b: drive the TWO-LANE sustained shape — the R36-E champion stack
+    /// (the R32 ledger + the call fusion + the worker eval elision) with
+    /// TWO workers / TWO lanes — the arm 11r37 champion's shape (the R37
+    /// unlock). `wm_ramp` = (from_pass, wm): the claim watermark's LATE
+    /// ramp — the default (None) keeps the production watermark; the ramp
+    /// drops it LOW from `from_pass` (AFTER the phase scripts arm — the
+    /// early claim-free orbit records hole-free; a from-pass-2 low
+    /// watermark discards every phase via the hole guard and the replay
+    /// never arms). A LOW value converts the submission's
+    /// transient lead into inline claims, driving the replay fallback's
+    /// grid re-derivation under real interleaving — the path class the
+    /// R36-E single-lane scope gate never exercised. Returns the in-order
+    /// harvested tuples + the elision's engagement instruments.
+    fn r37_drive_2lane(
+        gt: &[u8],
+        sched: &nf_transport::sched_types::ReplaySchedule,
+        passes: u64,
+        wm_ramp: Option<(u64, u64)>,
+    ) -> (Vec<(u64, u64, u64)>, (u64, u64, u64, u64), u64, u64) {
+        let construction = r32_prog(0);
+        // TWO lanes — the elision forced through the spawn override (the
+        // env races the parallel tests' worker spawns).
+        let fabric =
+            HydraFabric::spawn_pinned_full_opts(2, &[], true, true, true, true, true, Some(true));
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            gt,
+            sched.clone(),
+            construction,
+            128,
+            None,
+            Some(r32_prog),
+            false,
+            true,
+            16,
+            true,
+            true,
+            true,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        if wm_ramp.is_some() {
+            // The claim-stress shape: the SELF-SERVE DISARMED for the
+            // whole run (the R29 cells' field override — the env is
+            // process-global). Classic windows publish per chunk, so the
+            // chunk-open claim's mark precedes the exposure (the LEGAL
+            // claim regime) and the replay's inline guard + fallback run
+            // under real interleaving.
+            sink.rx_selfserve = false;
+        }
+        let ladder = crate::soa::ladder8_best();
+        let mut replay = crate::passreplay::PassReplay::new_forced(true);
+        let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+        let mut got = Vec::new();
+        // The ref pass (pass 1) runs live with a separate sink — the
+        // sustained bench's shape (also the generation boundary).
+        t.reset_pass(1, r32_prog(1));
+        {
+            let mut rseq = Sequencer::new_unboxed();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            while t.next_batch() {
+                rseq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+        }
+        for pass in 2..=passes + 1 {
+            if let Some((from, wm)) = wm_ramp {
+                if pass == from {
+                    // THE RAMP: the claims start only now — the claim-free
+                    // orbit kept the phase scripts recordable (a from-pass-2
+                    // low watermark discards every phase via the hole
+                    // guard and the replay never arms).
+                    sink.set_assist_watermark(wm);
+                }
+            }
+            t.reset_pass(pass, r32_prog(pass));
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            replay.begin_pass();
+            while t.next_batch() {
+                if !replay.try_replay(&t, &mut seq, &mut sink) {
+                    replay.begin_record(&t, &seq);
+                    {
+                        let mut rec_sink = replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut rec_sink, ladder);
+                    }
+                    replay.seal_batch(&seq);
+                }
+                sink.drain_ready();
+            }
+            replay.note_pass_end();
+            sink.end_pass();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+        }
+        let totals = fabric.res_replay_totals();
+        let assists = sink.assist_chunks();
+        sink.finish();
+        let n = sink.harvest_completed(&mut harvested);
+        for rec in &harvested[..n] {
+            got.push(*rec);
+        }
+        (got, totals, replay.fused_calls(), assists)
+    }
+
     /// R36-E: THE ELLISION'S BIT-EXACTNESS + ENGAGEMENT LAW — under the
     /// full-64 phase orbit (the adversarial rotation), the recorded
     /// phase scripts arm after one orbit and every later pass REPLAYS:
@@ -9017,6 +9218,183 @@ mod tests {
         assert!(
             fused > 0,
             "R36-E the call fusion never engaged (fused {fused})"
+        );
+    }
+
+    /// R37b: THE TWO-LANE REPLAY PARITY — the champion arm 11r37's shape
+    /// (two workers / two lanes, the elision + the tree fold, all
+    /// defaults): the harvested tuples stay BIT-EXACT against the
+    /// sequential references, the phase machine steps every boundary at
+    /// the halved grid (the boundary orbit is 128 — the two-lane grid's
+    /// full rotation), and the replays dominate after the orbit. The
+    /// standing matrix's only two-lane elision coverage was the 121-shard
+    /// fleet itself — the 13-shard fold-order failures landed there with
+    /// no cell to catch them; this one pins the protocol at the cell
+    /// scale.
+    #[test]
+    fn t_r37_two_lane_replay_parity() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        // The two-lane grid: the boundary orbit is 128 (n_lanes × 64, the
+        // 47-rotation covering every offset) — 136 passes = the orbit +
+        // 8 replayed passes.
+        const PASSES: u64 = 136;
+        let (got, (replayed, live, _fb, recs), _fused, _assists) =
+            r37_drive_2lane(&gt, &sched, PASSES, None);
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R37b: the two-lane replayed tuples diverged from the sequential references"
+        );
+        let crossed = replayed + live;
+        // The totals SUM over the two workers: every boundary is crossed
+        // by BOTH (the ref pass + the measured passes + the gen
+        // re-anchor each), so the pair-sum is ~2× the pass count.
+        assert!(
+            crossed >= 2 * PASSES && crossed <= 2 * PASSES + 16,
+            "R37b two-lane boundary count: crossed {crossed}, passes {PASSES} \
+             (replayed {replayed}, live {live})"
+        );
+        assert!(
+            replayed >= 8,
+            "R37b two-lane engagement: only {replayed} replayed passes (the orbit 128 needs 136 passes)"
+        );
+        assert!(recs > 0, "R37b two-lane: no records emitted");
+    }
+
+    /// R37b: THE FALLBACK GRID LAW — the re-derivation's pure
+    /// arithmetic (the extracted `fallback_grid`), adversarial: every
+    /// eval position class (the own-chunk start, the mid-own-chunk
+    /// resume, the own-chunk END — the foreign-chunk START coincidence,
+    /// the exact geometry of the CI 13-shard failure: lane 0 holding
+    /// span 98880's record) × the lane counts 1/2/3/4 × every lane
+    /// index. THE LAW: the walk's start is never below the lane's own
+    /// grid — `walk_start >= chunk_lo` and `walk_start < chunk_lo +
+    /// CHUNK` (the walk stays inside its own chunk) — and at n_lanes ==
+    /// 1 the clamp is the identity (no foreign chunks: the R36-E scope
+    /// gate's mask). The pre-clamp arithmetic (the naive `gid = eval`)
+    /// violates the law exactly at the coincidence — the unit pin of
+    /// the two-lane unlock's exposed class.
+    #[test]
+    fn t_r37_fallback_grid_law() {
+        for n_lanes in [1u64, 2, 3, 4] {
+            for lane_idx in 0..n_lanes {
+                // The eval cursor is an OWN-chunk position by
+                // construction (segments never cross chunk ends): every
+                // own chunk c of this lane, at every offset within it.
+                let first_own = lane_idx; // the gen re-anchor's start
+                for c in first_own..first_own + 9 * n_lanes {
+                    if c % n_lanes != lane_idx {
+                        continue;
+                    }
+                    let base = c * CHUNK;
+                    for off in 0..=CHUNK {
+                        let eval = base + off;
+                        let (chunk_lo, walk_start) = fallback_grid(eval, lane_idx, n_lanes);
+                        // THE LAW: the walk never starts below the lane's
+                        // own grid, and stays within its own chunk.
+                        assert!(
+                            walk_start >= chunk_lo,
+                            "walk below the lane grid: eval {eval} lane {lane_idx}/{n_lanes} \
+                             -> lo {chunk_lo} start {walk_start}"
+                        );
+                        assert!(
+                            walk_start < chunk_lo + CHUNK,
+                            "walk past the lane chunk: eval {eval} lane {lane_idx}/{n_lanes} \
+                             -> lo {chunk_lo} start {walk_start}"
+                        );
+                        assert!(
+                            chunk_lo % (n_lanes * CHUNK) / CHUNK % n_lanes == lane_idx,
+                            "chunk_lo left the lane grid: lo {chunk_lo} lane {lane_idx}/{n_lanes}"
+                        );
+                        // The own-chunk interior: the identity (eval stays).
+                        // The own-chunk END (the coincidence): the clamp.
+                        if off < CHUNK {
+                            assert_eq!(
+                                walk_start, eval,
+                                "interior eval must be preserved (the mid-chunk resume)"
+                            );
+                        } else {
+                            // THE COINCIDENCE: eval at the own chunk's end
+                            // == the next (foreign) chunk's start — the
+                            // clamp jumps to the lane's next own chunk.
+                            if n_lanes == 1 {
+                                // The next chunk is ALSO this lane's: the
+                                // re-derivation lands on eval itself.
+                                assert_eq!(chunk_lo, eval);
+                                assert_eq!(walk_start, eval);
+                            } else {
+                                assert!(
+                                    walk_start > eval,
+                                    "the coincidence must clamp (eval {eval} lane \
+                                     {lane_idx}/{n_lanes} start {walk_start})"
+                                );
+                                assert_eq!(
+                                    walk_start % CHUNK,
+                                    0,
+                                    "the clamp lands on a chunk boundary"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// R37b: THE CLASSIC-CLAIMS PARITY — the two-lane shape with the
+    /// self-serve windows disarmed and the claim watermark ramped LOW
+    /// mid-run (pass 25 of 48): the classic windows publish per chunk,
+    /// so the chunk-open claims are the LEGAL regime (the mark precedes
+    /// the exposing spans_ready store) — the walk's inline-skip + the
+    /// hole guard + the recording's discard paths all run under real
+    /// claim pressure. The tuples stay BIT-EXACT and the claims ENGAGE
+    /// (assists > 0 — the watermark converted the ingest lead; a zero
+    /// would leave the cell vacuous).
+    #[test]
+    fn t_r37_two_lane_classic_claims_parity() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        const PASSES: u64 = 48;
+        let (got, (replayed, live, _fb, recs), _fused, assists) =
+            r37_drive_2lane(&gt, &sched, PASSES, Some((25, 8)));
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R37b classic-claims: the tuples diverged under claim pressure"
+        );
+        assert!(
+            assists > 0,
+            "R37b classic-claims engagement: {assists} inline chunks — the ramped \
+             watermark never converted the lead on this host (vacuous cell)"
+        );
+        assert!(
+            recs > 0 || replayed + live > 0,
+            "no boundary crossings at all"
         );
     }
 

@@ -194,3 +194,65 @@ proves, and the fleet's dedicated-core draws price the corridor
 The next walls, in the blueprint's order: the decode stage's ~6.49 µs
 pass floor (L4's amortization), the order-cache probe path (Part III's
 push-scan), and the SMT co-lane configuration (L5).
+
+## §7 R37b — the 13-shard fix (the two-lane grid's three laws)
+
+The fleet's verdict on PR #22: 87/121 shards green, 13 failed at
+`bench --hydra-only` (arm 11r37, the two-worker champion) with
+`hydra composite fold-order violation: got span 98880, expected 98944
+(lane 0)` — the delta exactly one composite record. The geometry:
+fold_pos 98,944 = chunk 1546's start (lane 0's turn); the pending
+record [98,880, 98,944) = chunk 1545 — LANE 1's chunk — sitting in
+LANE 0's ring. Worker 0 emitted a record covering the other lane's
+chunk. Three laws close the class:
+
+1. **THE BATCHED TWINS' SELF-SERVE GUARD (the no-drift law).** The
+   per-span submit path has carried `!rx_win_ss` on its chunk-open
+   assist claim since R29 (its own comment documents the duplicate
+   class: in an SS window the whole span range is pre-published at the
+   open, so a mid-scan claim's mark lands AFTER the workers entered
+   the chunk — both sides evaluate it and the lane ring carries a
+   duplicate the fold's order law rejects). The batched twins
+   (`submit_span_batch_rx`, `submit_packed_batch_rx` — the champion's
+   actual steady paths) dropped the guard. The champion runs 188,765
+   self-serve windows in 188,767 passes; the 13-shard rate is the
+   probability that the two-lane interference drives `pending()` past
+   the assist watermark at a mid-SS-window chunk-open.
+
+2. **THE FALLBACK GRID LAW (`fallback_grid`, the extracted pure
+   function).** The R36-E replay fallback re-derives the walk's grid
+   from `eval` — but `eval` is the last emitted segment's end, and a
+   segment that ended exactly at its chunk's end leaves `eval` at a
+   FOREIGN chunk's start (the other lane's turn). The re-derivation
+   points `chunk_lo` at the lane's next own chunk — but the walk then
+   started at `gid = eval` and evaluated the foreign chunk's spans
+   [eval, chunk_lo) into THIS lane's ring: the exact CI failure
+   (worker 0's record covering chunk 1545). The clamp — the walk
+   starts at `max(eval, chunk_lo)` — plus the modular advance to the
+   next OWN chunk (the pre-R37b `chunk_id += 1` is exact only at
+   n_lanes ≤ 2; the 8/16-lane CI arms would walk foreign chunks on
+   the fallback — the unit cell's catch). Structurally impossible at
+   n_lanes == 1: the R36-E single-lane scope gate's mask.
+
+3. **THE REPLAY CYCLE'S SHUTDOWN ESCAPE.** The replay's
+   `continue 'batch` cycle (the frontier break / the exhausted-script
+   force-cross defer) re-enters the batch loop while `eval < ready`,
+   so the outer loop's idle path — the ONLY shutdown-checked park —
+   is never reached. At a full-tape ending the multi-lane gap holds
+   the lane's eval below ready forever (the other lane owns the tail
+   spans; no further record will ever land): the join spins hot and
+   the fabric drop hangs. The bench's 5s window almost always ends
+   mid-pass (eval == ready, the idle path, the clean park); the
+   boundary-aligned ending — and any full-tape cell — hit it
+   deterministically. The escape: publish first (the Strand A law),
+   then check.
+
+The cells: `t_r37_two_lane_replay_parity` (the two-lane champion's
+end-to-end BIT-EXACTNESS — the standing matrix's only two-lane
+coverage was the 121-shard fleet itself), `t_r37_fallback_grid_law`
+(the pure arithmetic, adversarial: every eval position class × the
+lane counts 1/2/3/4 — the own-chunk-END coincidence pinned), and
+`t_r37_two_lane_classic_claims_parity` (the legal claim regime: the
+classic windows' per-chunk publishes, the mark preceding the
+exposure — the walk's inline-skip + the hole guard under real claim
+pressure, assists > 0).
