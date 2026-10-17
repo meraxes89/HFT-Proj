@@ -616,7 +616,7 @@ fn run_hydra_sustained_5s(
     // worker reads its own copy at spawn, this copy drives the verdict
     // line's engagement asserts). Read BEFORE the window (env::var
     // allocates).
-    let res_replay_on = std::env::var("HFT_RES_REPLAY").as_deref() != Ok("0");
+    let res_replay_on = std::env::var("HFT_RES_REPLAY").as_deref() == Ok("1");
     // R36-E: THE DIAG CLOCK DIET — the per-batch Instant pairs (~2.4 µs
     // per pass at the 22-batch cadence on the 9V45, ~17% of the projected
     // post-elision main-thread budget) become calibrated TSC reads: one

@@ -1876,7 +1876,7 @@ fn lane_worker_rxdesc_diet(
     // Read once here, outside every window (law #9: env parsing is
     // allocation). The log's 1 MB segment store allocates HERE (the
     // worker's spawn — pre-window, the allocs=0 gate law).
-    let reslog_enabled = std::env::var("HFT_RES_REPLAY").as_deref() != Ok("0")
+    let reslog_enabled = std::env::var("HFT_RES_REPLAY").as_deref() == Ok("1")
         && composite
         && !null;
     let reslog_audit = std::env::var("HFT_RES_AUDIT").is_ok();

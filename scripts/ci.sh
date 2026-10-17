@@ -888,7 +888,11 @@ cargo test --release -p nf-testkit t_r36f 2>&1 | tee /tmp/test_r36f.txt
 grep -q "test result: ok" /tmp/test_r36f.txt
 # R36-E: the res-record replay cells (the phase machine's laws, the
 # sustained parity/engagement under the full-64 orbit, the span-id wrap).
-cargo test --release -p nf-testkit t_r36e 2>&1 | tee /tmp/test_r36e.txt
+# The elision is OPT-IN (HFT_RES_REPLAY=1): its frozen-regime premise
+# holds on the R32 champion shape; the pre-R32 multipass shapes keep
+# the verbatim live walk (the inline-claim interleaving there is
+# timing-dependent — the elision's guards address the frozen regime).
+HFT_RES_REPLAY=1 cargo test --release -p nf-testkit t_r36e 2>&1 | tee /tmp/test_r36e.txt
 grep -q "test result: ok" /tmp/test_r36e.txt
 cargo test --release -p nf-testkit t_r36w 2>&1 | tee /tmp/test_r36w.txt
 grep -q "test result: ok" /tmp/test_r36w.txt
@@ -901,7 +905,7 @@ grep -q "dual_path=true" /tmp/bench_r36.txt
 grep -q "replay_ok=true" /tmp/bench_r36.txt
 grep -q "merge_ok=true" /tmp/bench_r36.txt
 grep "PR1_R36_RES_FOLD_VERDICT" /tmp/bench_r36.txt | head -1
-HFT_RXDESC=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36s.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r36s.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r36s.txt
 grep -q "allocs=0" /tmp/bench_r36s.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r36s.txt

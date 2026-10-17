@@ -59,9 +59,15 @@ it.)
    fails loud the same pass. The SPANHASH surface (the O(1) P64
    application + the R36-C merge law's fail-stops) shadows it.
 
-Rollbacks: `HFT_RES_REPLAY=0` (the live walk verbatim — the attribution
-arm 11r36er), `HFT_RES_AUDIT=1` (the live walk with the counters
-tracking — the differential twin). The log's 1 MB segment store
+Arming: OPT-IN (`HFT_RES_REPLAY=1`) — the elision's frozen-regime
+premise holds on the R32 champion shape (the sustained loop's
+frozen-master template); the pre-R32 multipass shapes (the direct
+live ingest, no pass-replay ledger) keep the verbatim walk — their
+inline-assist interleaving is timing-dependent and the fleet's faster
+silicon exposed the divergence class there (shard 59's draw:
+`t_rxdesc_sustained_multipass_parity`, the replay vs the mid-walk
+inline claims). The CI's champion arm (11r36) sets the flag
+explicitly; `HFT_RES_AUDIT=1` is the live-walk differential twin. The log's 1 MB segment store
 allocates at worker spawn (pre-window; the allocs=0 gate law); the gen
 re-anchor clears it in place.
 
