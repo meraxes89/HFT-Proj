@@ -3258,7 +3258,8 @@ impl HydraFabric {
                 .map(|w| w.sig_digest_ns.load(Ordering::Relaxed))
                 .sum();
             eprintln!(
-                "SIGFABRIC_DIAGNOSTIC {label}: baked=true msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} span_hash={:#x} span_records={} span_deg={} span_merge_ok={} (R35-B+R36: the A5.0 signature fabric + the Res-fold's span layer — the Phase-R bake, the per-pass wide replay with the fail-stop digest, and the O(1) SPANHASH application + the Galois merge law, docs/46-47)",
+                "SIGFABRIC_DIAGNOSTIC {label}: baked=true order_scan={} msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} span_hash={:#x} span_records={} span_deg={} span_merge_ok={} (R35-B+R36+R38: the A5.0 signature fabric + the Res-fold's span layer — the Phase-R bake (R38/L3: the Theorem-29 push scan or the OrderCache pull — HFT_ORDER_SCAN's arm), the per-pass wide replay with the fail-stop digest, and the O(1) SPANHASH application + the Galois merge law, docs/46-49)",
+                if sf.resolve_push { "push" } else { "pull" },
                 sf.n_msgs,
                 sf.n_locates,
                 sf.chunks,

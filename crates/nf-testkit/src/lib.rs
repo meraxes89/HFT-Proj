@@ -20,6 +20,7 @@ pub mod lobstate;
 pub mod passreplay;
 pub mod orderscan;
 pub mod sigfabric;
+pub mod sigpush;
 pub mod polyhash;
 pub mod spanfold;
 pub mod reference;

@@ -127,6 +127,11 @@ pub struct SigFabric {
     pub span_h_early: u64,
     pub span_h_late: u64,
     pub span_w_late: u64,
+    /// R38/L3: the resolve mode that baked this fabric (true = the
+    /// Theorem-29 push scan — HFT_ORDER_SCAN's active path; false =
+    /// the Phase-R OrderCache pull). Mode metadata only — the tables
+    /// are pinned identical by t_r38_bake_push_pull_parity.
+    pub resolve_push: bool,
 }
 
 /// The Phase-R order-ID cache (§5.7): open addressing, LINEAR probing,
@@ -388,63 +393,16 @@ fn span_digest(t: u8, msg: &[u8]) -> u64 {
 /// Returns the frozen [`SigFabric`]. Deterministic: the same bodies →
 /// the identical tables (the cells pin this against the sequential
 /// oracle).
-pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
-    // ---- pass 1: the locate histogram + the message count ----
-    let mut locate_index = vec![u16::MAX; 65536]; // locate -> index
-    let mut locate_ids: Vec<u16> = Vec::new();
-    let mut counts: Vec<u32> = Vec::new();
-    let mut n_msgs: u64 = 0;
-    for &body in bodies {
-        let mut p = 0usize;
-        while p + 2 <= body.len() {
-            let l = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
-            p += 2;
-            if p + l > body.len() {
-                break; // a truncated trailing unit
-            }
-            let msg = &body[p..p + l];
-            p += l;
-            n_msgs += 1;
-            if msg.len() < 3 {
-                continue;
-            }
-            let loc = u16::from_be_bytes([msg[1], msg[2]]);
-            let idx = locate_index[loc as usize];
-            if idx == u16::MAX {
-                locate_index[loc as usize] = locate_ids.len() as u16;
-                locate_ids.push(loc);
-                counts.push(0);
-            }
-            counts[locate_index[loc as usize] as usize] += 1;
-        }
-    }
-    let n_locates = locate_ids.len() as u32;
-    let mut tok_off = Vec::with_capacity(n_locates as usize + 1);
-    let mut acc = 0u32;
-    for &c in &counts {
-        tok_off.push(acc);
-        acc += c;
-    }
-    tok_off.push(acc);
-    debug_assert_eq!(acc as u64, n_msgs);
-
-    // ---- pass 2: decode + resolve (Phase R) into the per-locate SoA,
-    //      PLUS the R36 message-order span columns (the SPANHASH layer:
-    //      V is order-carrying — Theorem 9 — so the hash columns live in
-    //      TRUE message order, distinct from the locate-bucketed SoA) ----
-    let mut seq = vec![0u64; n_msgs as usize];
-    let mut px = vec![0u64; n_msgs as usize];
-    let mut db = vec![0u64; n_msgs as usize];
-    let mut da = vec![0u64; n_msgs as usize];
-    // The R36 message-order columns (ty: W_T index — 9 = the identity
-    // class; vd: the payload digest; setp: the K2 setter flag).
-    let mut ty36: Vec<u8> = Vec::with_capacity(n_msgs as usize);
-    let mut vd36: Vec<u64> = Vec::with_capacity(n_msgs as usize);
-    let mut db36: Vec<i64> = Vec::with_capacity(n_msgs as usize);
-    let mut da36: Vec<i64> = Vec::with_capacity(n_msgs as usize);
-    let mut px36: Vec<u32> = Vec::with_capacity(n_msgs as usize);
-    let mut setp36: Vec<u8> = Vec::with_capacity(n_msgs as usize);
-    let mut cur = vec![0u32; n_locates as usize]; // per-locate write cursor
+/// THE PULL RESOLVE (the Phase-R cache path — the bake's original
+/// pass-2 loop VERBATIM, the parity cell's oracle). Produces the
+/// message-order token columns + the §5.6 telemetry + the cache's own
+/// instruments (probes / rehashes / max_chain / max_lifecycle — the
+/// push path reports zeros for those: its attribution law).
+fn resolve_pull(bodies: &[&[u8]]) -> crate::sigpush::ResolveOut {
+    let mut tsv: Vec<u64> = Vec::new();
+    let mut tpv: Vec<u64> = Vec::new();
+    let mut td0: Vec<u64> = Vec::new();
+    let mut td1: Vec<u64> = Vec::new();
     let mut cache = OrderCache::new(16);
     let mut anomalies = 0u64;
     let mut clamps = 0u64;
@@ -469,9 +427,6 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                 continue;
             }
             let loc = u16::from_be_bytes([msg[1], msg[2]]);
-            let loc_idx = locate_index[loc as usize] as usize;
-            let w = tok_off[loc_idx] as usize + cur[loc_idx] as usize;
-            cur[loc_idx] += 1;
             let t = msg[0];
             // The generator table (§2.2) — resolved per type. `ν(s, x)`:
             // BUY adds to db, SELL to da (the side byte at offset 19).
@@ -651,19 +606,157 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
                     (0, 0, 0, 0)
                 }
             };
-            // The shared epilogue — BOTH layouts from one tuple (the
-            // no-drift law; the R34 discipline).
-            seq[w] = sv;
-            px[w] = pv;
-            db[w] = d0;
-            da[w] = d1;
-            ty36.push(crate::spanfold::ty36(t));
-            vd36.push(span_digest(t, msg));
-            db36.push(d0 as i64);
-            da36.push(d1 as i64);
-            px36.push(pv as u32);
-            setp36.push((sv != 0) as u8);
+            tsv.push(sv);
+            tpv.push(pv);
+            td0.push(d0);
+            td1.push(d1);
         }
+    }
+    crate::sigpush::ResolveOut {
+        sv: tsv,
+        pv: tpv,
+        d0: td0,
+        d1: td1,
+        anomalies,
+        clamps,
+        zero_rem_keeps,
+        probes: cache.probes,
+        rehashes: cache.rehashes,
+        max_chain: cache.max_chain,
+        max_lifecycle: cache.max_lifecycle,
+    }
+}
+
+pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
+    // R38/L3 (Gate 13's engine wiring): the resolve stage's arm —
+    // HFT_ORDER_SCAN (default ON: the Theorem-29 push scan is the
+    // ACTIVE engine resolution — the B3 wall's dataflow inversion,
+    // [S1] §6.4's prohibition lifted at the fabric level); `=0`
+    // restores the Phase-R OrderCache pull verbatim (the attribution
+    // / rollback arm). Both paths are pinned bit-exact by
+    // t_r38_bake_push_pull_parity (the no-drift law).
+    let push = std::env::var("HFT_ORDER_SCAN").as_deref() != Ok("0");
+    bake_sig_fabric_forced(bodies, push)
+}
+
+/// The bake with the resolve path FORCED — the cells' explicit path
+/// (the env arm is process-global and racy across parallel tests; the
+/// forced constructor is the project's own law, cf. the transport's
+/// forced constructors).
+pub fn bake_sig_fabric_forced(bodies: &[&[u8]], push: bool) -> SigFabric {
+    // ---- pass 1: the locate histogram + the message count ----
+    let mut locate_index = vec![u16::MAX; 65536]; // locate -> index
+    let mut locate_ids: Vec<u16> = Vec::new();
+    let mut counts: Vec<u32> = Vec::new();
+    let mut n_msgs: u64 = 0;
+    for &body in bodies {
+        let mut p = 0usize;
+        while p + 2 <= body.len() {
+            let l = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+            p += 2;
+            if p + l > body.len() {
+                break; // a truncated trailing unit
+            }
+            let msg = &body[p..p + l];
+            p += l;
+            n_msgs += 1;
+            if msg.len() < 3 {
+                continue;
+            }
+            let loc = u16::from_be_bytes([msg[1], msg[2]]);
+            let idx = locate_index[loc as usize];
+            if idx == u16::MAX {
+                locate_index[loc as usize] = locate_ids.len() as u16;
+                locate_ids.push(loc);
+                counts.push(0);
+            }
+            counts[locate_index[loc as usize] as usize] += 1;
+        }
+    }
+    let n_locates = locate_ids.len() as u32;
+    let mut tok_off = Vec::with_capacity(n_locates as usize + 1);
+    let mut acc = 0u32;
+    for &c in &counts {
+        tok_off.push(acc);
+        acc += c;
+    }
+    tok_off.push(acc);
+    debug_assert_eq!(acc as u64, n_msgs);
+
+    // ---- pass 2: decode + resolve (Phase R) into the per-locate SoA,
+    //      PLUS the R36 message-order span columns (the SPANHASH layer:
+    //      V is order-carrying — Theorem 9 — so the hash columns live in
+    //      TRUE message order, distinct from the locate-bucketed SoA) ----
+    let mut seq = vec![0u64; n_msgs as usize];
+    let mut px = vec![0u64; n_msgs as usize];
+    let mut db = vec![0u64; n_msgs as usize];
+    let mut da = vec![0u64; n_msgs as usize];
+    // The R36 message-order columns (ty: W_T index — 9 = the identity
+    // class; vd: the payload digest; setp: the K2 setter flag).
+    let mut ty36: Vec<u8> = Vec::with_capacity(n_msgs as usize);
+    let mut vd36: Vec<u64> = Vec::with_capacity(n_msgs as usize);
+    let mut db36: Vec<i64> = Vec::with_capacity(n_msgs as usize);
+    let mut da36: Vec<i64> = Vec::with_capacity(n_msgs as usize);
+    let mut px36: Vec<u32> = Vec::with_capacity(n_msgs as usize);
+    let mut setp36: Vec<u8> = Vec::with_capacity(n_msgs as usize);
+    let mut cur = vec![0u32; n_locates as usize]; // per-locate write cursor
+    // R38/L3: THE RESOLVE STAGE — the pull oracle (the Phase-R cache,
+    // the §5.7 hash-table probe per reference — verbatim in
+    // `resolve_pull`) or the push scan (orderscan's Theorem-29 kernel:
+    // the id-bucketed segmented scan whose closed forms carry each
+    // register's prefix state TO its reference positions — the B3
+    // wall's dataflow inversion, the dual-lane resolution's
+    // prerequisite). Both produce the message-order token columns;
+    // the shared epilogue below writes the two layouts (the
+    // locate-bucketed SoA + the R36 message-order columns) from the
+    // one tuple stream — the no-drift law, the R34 discipline.
+    let resolved = if push {
+        crate::sigpush::resolve_push(bodies)
+    } else {
+        resolve_pull(bodies)
+    };
+    let anomalies = resolved.anomalies;
+    let clamps = resolved.clamps;
+    let zero_rem_keeps = resolved.zero_rem_keeps;
+    {
+        // The shared epilogue — BOTH layouts from the tuple columns.
+        let mut i = 0usize;
+        for &body in bodies {
+            let mut p = 0usize;
+            while p + 2 <= body.len() {
+                let l = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+                p += 2;
+                if p + l > body.len() {
+                    break; // a truncated trailing unit (pass 1's law)
+                }
+                let msg = &body[p..p + l];
+                p += l;
+                if msg.len() < 3 {
+                    continue;
+                }
+                let loc = u16::from_be_bytes([msg[1], msg[2]]);
+                let loc_idx = locate_index[loc as usize] as usize;
+                let w = tok_off[loc_idx] as usize + cur[loc_idx] as usize;
+                cur[loc_idx] += 1;
+                let t = msg[0];
+                let sv = resolved.sv[i];
+                let pv = resolved.pv[i];
+                let d0v = resolved.d0[i];
+                let d1v = resolved.d1[i];
+                i += 1;
+                seq[w] = sv;
+                px[w] = pv;
+                db[w] = d0v;
+                da[w] = d1v;
+                ty36.push(crate::spanfold::ty36(t));
+                vd36.push(span_digest(t, msg));
+                db36.push(d0v as i64);
+                da36.push(d1v as i64);
+                px36.push(pv as u32);
+                setp36.push((sv != 0) as u8);
+            }
+        }
+        debug_assert_eq!(i, resolved.sv.len());
     }
 
     let mut emit = SigTokens::default();
@@ -791,10 +884,11 @@ pub fn bake_sig_fabric(bodies: &[&[u8]]) -> SigFabric {
         anomalies,
         clamps,
         zero_rem_keeps,
-        probes: cache.probes,
-        rehashes: cache.rehashes,
-        max_chain: cache.max_chain,
-        max_lifecycle: cache.max_lifecycle,
+        probes: resolved.probes,
+        rehashes: resolved.rehashes,
+        max_chain: resolved.max_chain,
+        max_lifecycle: resolved.max_lifecycle,
+        resolve_push: push,
         span_recs,
         span_p64,
         span_hash,
@@ -1063,6 +1157,19 @@ mod tests {
         msg(b'U', locate, &rest)
     }
 
+    /// C (36B): [type][loc][track(8)][oref(8)][shares(4)][pad(8)]
+    /// [printable][px(4)] — the printable flag at [31], the exec px
+    /// at [32..36] (the bake's field law).
+    fn cancel_print(locate: u16, oref: u64, shares: u32, px: u32, printable: u8) -> Vec<u8> {
+        let mut rest = vec![0u8; 8];
+        rest.extend_from_slice(&oref.to_be_bytes());
+        rest.extend_from_slice(&shares.to_be_bytes());
+        rest.extend_from_slice(&[0u8; 8]);
+        rest.push(printable);
+        rest.extend_from_slice(&px.to_be_bytes());
+        msg(b'C', locate, &rest)
+    }
+
     fn trade(locate: u16, px: u32) -> Vec<u8> {
         // P (44B): [type][loc][track][ts][oref(8)][side][shares(4)]
         // [stock(8)][px(4)][match(8)]
@@ -1074,6 +1181,286 @@ mod tests {
         rest.extend_from_slice(&px.to_be_bytes());
         rest.extend_from_slice(&[0u8; 8]);
         msg(b'P', locate, &rest)
+    }
+
+    /// R38/L3: THE PUSH/PULL PARITY CELL — the bake's two resolve
+    /// paths (the Phase-R OrderCache pull — the ORACLE, §5.7's probe
+    /// law — and the Theorem-29 push scan, `HFT_ORDER_SCAN`'s active
+    /// path) must produce the IDENTICAL fabric: every frozen table,
+    /// the digest, the span products, and the §5.6 telemetry. The
+    /// corpus: the adversarial hand shapes the golden tape never
+    /// shows (the clamp/anomaly/phantom/straddle faces) + the fuzz
+    /// draws (the generator laws: ids 1..6, retire on D/U, fresh
+    /// A-after-retire and U-new ids, 1/3 over-budget references —
+    /// ~1.9k anomalies per 3k draw). The pull-only instruments
+    /// (probes/rehashes/max_chain/max_lifecycle) are excluded by
+    /// design (the push path's attribution law).
+    /// R38/L3: THE TAPE-LEVEL PARITY — the full golden tape
+    /// (505,849 messages) baked through BOTH resolve paths: every
+    /// frozen table, the digest, the span products, and the telemetry
+    /// identical. The tape's own face is well-formed (anomalies = 0,
+    /// clamps = 0 — the twin's pre-port law), so this pins the CLEAN
+    /// path at the real stream's scale (988 scan batches, threads
+    /// straddling the 512-row budget, the U chains, the id reuse
+    /// distance). The bodies: the raw `[u16 len]` unit chain chunked
+    /// into 4,096-unit blocks (the concatenated bodies ARE the ITCH
+    /// stream — the golden tape's own format).
+    #[test]
+    fn t_r38b_bake_push_pull_parity_tape() {
+        let gt = std::fs::read("../../data/tests/sample-mini.itch")
+            .unwrap_or_else(|_| std::fs::read("data/tests/sample-mini.itch").expect("tape"));
+        // The unit walk (the golden walker's law): [u16 len][unit]*.
+        let mut units: Vec<&[u8]> = Vec::new();
+        {
+            let mut p = 0usize;
+            while p + 2 <= gt.len() {
+                let l = u16::from_be_bytes([gt[p], gt[p + 1]]) as usize;
+                p += 2;
+                if l == 0 || p + l > gt.len() {
+                    break; // the truncated trailing unit
+                }
+                units.push(&gt[p..p + l]);
+                p += l;
+            }
+        }
+        assert_eq!(units.len(), 505_849, "the tape's unit count");
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        for i in (0..units.len()).step_by(4096) {
+            let hi = (i + 4096).min(units.len());
+            let mut b = Vec::new();
+            for u in &units[i..hi] {
+                b.extend_from_slice(&(u.len() as u16).to_be_bytes());
+                b.extend_from_slice(u);
+            }
+            bodies.push(b);
+        }
+        let refs: Vec<&[u8]> = bodies.iter().map(|v| v.as_slice()).collect();
+        let a = bake_sig_fabric_forced(&refs, false);
+        let b = bake_sig_fabric_forced(&refs, true);
+        assert_eq!(a.n_msgs, b.n_msgs);
+        assert_eq!(a.n_msgs, 505_849);
+        assert_eq!(a.n_locates, b.n_locates);
+        assert_eq!(a.tok_counts, b.tok_counts);
+        assert_eq!(a.tok_off, b.tok_off);
+        assert_eq!(a.tok_seq, b.tok_seq);
+        assert_eq!(a.tok_px, b.tok_px);
+        assert_eq!(a.tok_db, b.tok_db);
+        assert_eq!(a.tok_da, b.tok_da);
+        assert_eq!(a.sig_off, b.sig_off);
+        assert_eq!(a.sigs, b.sigs);
+        assert_eq!(a.sig0, b.sig0);
+        assert_eq!(a.states, b.states);
+        assert_eq!(a.digest, b.digest);
+        assert_eq!(a.global_sigs, b.global_sigs);
+        assert_eq!(a.global_sig, b.global_sig);
+        assert_eq!(a.chunks, b.chunks);
+        assert_eq!(a.anomalies, b.anomalies);
+        assert_eq!(a.clamps, b.clamps);
+        assert_eq!(a.zero_rem_keeps, b.zero_rem_keeps);
+        assert_eq!(a.span_recs.len(), b.span_recs.len());
+        assert_eq!(a.span_p64, b.span_p64);
+        assert_eq!(a.span_hash, b.span_hash);
+        assert_eq!(a.span_h_early, b.span_h_early);
+        assert_eq!(a.span_h_late, b.span_h_late);
+        assert_eq!(a.span_w_late, b.span_w_late);
+        // The tape's clean-face law (the pre-port twin's finding).
+        assert_eq!(a.anomalies, 0);
+        assert_eq!(a.clamps, 0);
+    }
+
+    #[test]
+    fn t_r38_bake_push_pull_parity() {
+        let cmp = |bodies: &[Vec<u8>], label: &str| {
+            let refs: Vec<&[u8]> = bodies.iter().map(|v| v.as_slice()).collect();
+            let a = bake_sig_fabric_forced(&refs, false);
+            let b = bake_sig_fabric_forced(&refs, true);
+            assert_eq!(a.n_msgs, b.n_msgs, "{label}: n_msgs");
+            assert_eq!(a.n_locates, b.n_locates, "{label}: n_locates");
+            assert_eq!(a.tok_counts, b.tok_counts, "{label}: tok_counts");
+            assert_eq!(a.tok_off, b.tok_off, "{label}: tok_off");
+            assert_eq!(a.tok_seq, b.tok_seq, "{label}: tok_seq");
+            assert_eq!(a.tok_px, b.tok_px, "{label}: tok_px");
+            assert_eq!(a.tok_db, b.tok_db, "{label}: tok_db");
+            assert_eq!(a.tok_da, b.tok_da, "{label}: tok_da");
+            assert_eq!(a.sig_off, b.sig_off, "{label}: sig_off");
+            assert_eq!(a.sigs, b.sigs, "{label}: sigs");
+            assert_eq!(a.sig0, b.sig0, "{label}: sig0");
+            assert_eq!(a.states, b.states, "{label}: states");
+            assert_eq!(a.digest, b.digest, "{label}: digest");
+            assert_eq!(a.global_sigs, b.global_sigs, "{label}: global_sigs");
+            assert_eq!(a.global_sig, b.global_sig, "{label}: global_sig");
+            assert_eq!(a.chunks, b.chunks, "{label}: chunks");
+            assert_eq!(a.anomalies, b.anomalies, "{label}: anomalies");
+            assert_eq!(a.clamps, b.clamps, "{label}: clamps");
+            assert_eq!(
+                a.zero_rem_keeps, b.zero_rem_keeps,
+                "{label}: zero_rem_keeps"
+            );
+            assert_eq!(a.span_recs.len(), b.span_recs.len(), "{label}: span_recs len");
+            assert_eq!(
+                a.span_p64, b.span_p64,
+                "{label}: span_p64 (the records' composition — R36 has no PartialEq)"
+            );
+            assert_eq!(a.span_hash, b.span_hash, "{label}: span_hash");
+            assert_eq!(a.span_h_early, b.span_h_early, "{label}: span_h_early");
+            assert_eq!(a.span_h_late, b.span_h_late, "{label}: span_h_late");
+            assert_eq!(a.span_w_late, b.span_w_late, "{label}: span_w_late");
+        };
+
+        // The adversarial hand shapes (the pre-port twin's corpus).
+        let hands: Vec<Vec<Vec<u8>>> = vec![
+            // 0: the over-execute clamp + the zero-rem keep + the later E.
+            vec![
+                add(1, 100, b'B', 500, 101),
+                exec(1, 100, 700),
+                exec(1, 100, 10),
+                delete(1, 100),
+            ],
+            // 1: the ask-side chain with U inheritance.
+            vec![
+                add(1, 200, b'S', 700, 102),
+                exec(1, 200, 50),
+                replace(1, 200, 201, 75, 103),
+                exec(1, 201, 25),
+                delete(1, 201),
+            ],
+            // 2: post-D references (the anomaly face).
+            vec![
+                add(1, 400, b'B', 100, 100),
+                delete(1, 400),
+                exec(1, 400, 10),
+                cancel(1, 400, 10),
+                replace(1, 400, 401, 10, 10),
+            ],
+            // 3: never-born references (the phantom-U face: the new
+            // register is never born — a later ref on it anomalies).
+            vec![
+                exec(1, 999, 10),
+                delete(1, 999),
+                replace(1, 999, 998, 10, 10),
+                exec(1, 998, 5),
+            ],
+            // 4: the C printable gate (Y vs N).
+            vec![
+                add(1, 500, b'B', 100, 1000),
+                cancel_print(1, 500, 40, 999, b'Y'),
+                cancel_print(1, 500, 40, 998, b'N'),
+                trade(1, 77),
+            ],
+            // 5: the batch straddle (the X-chain crossing the 512-row
+            // budget — the carry-in law, Theorem 30).
+            {
+                let mut v = vec![add(1, 600, b'B', 2000, 100)];
+                for _ in 0..1200 {
+                    v.push(cancel(1, 600, 1));
+                }
+                v.push(exec(1, 600, 100));
+                v.push(delete(1, 600));
+                v
+            },
+            // 6: the hot-id chain (the adversarial single-thread scan,
+            // Theorem 29(b): 9 levels whatever the distribution).
+            {
+                let mut v = vec![add(1, 700, b'S', 700, 200)];
+                for _ in 0..600 {
+                    v.push(exec(1, 700, 3));
+                }
+                v.push(delete(1, 700));
+                v
+            },
+        ];
+        for (k, bodies) in hands.iter().enumerate() {
+            cmp(bodies, &format!("hand-{k}"));
+        }
+
+        // The fuzz draws — the generator laws (the twin's): ids 1..6,
+        // retire on D/U, fresh ids for the A-after-retire and the
+        // U-new, 1/3 over-budget references (the clamp face).
+        let mut s: u64 = 0x5EED_3838_0000_0001;
+        let mut xs = move || -> u64 {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(2685821657736338717)
+        };
+        for draw in 0..6u32 {
+            let mut stream: Vec<Vec<u8>> = Vec::with_capacity(3000);
+            let mut sim: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+            let mut retired: Vec<u64> = Vec::new();
+            let mut fresh: u64 = 10;
+            for _ in 0..3000 {
+                let r = xs() % 100;
+                let act: u8 = if r < 25 {
+                    0 // A
+                } else if r < 45 {
+                    1 // E
+                } else if r < 55 {
+                    2 // C
+                } else if r < 65 {
+                    3 // X
+                } else if r < 80 {
+                    4 // D
+                } else if r < 90 {
+                    5 // U
+                } else {
+                    6 // P
+                };
+                if act == 6 {
+                    stream.push(trade(1, (xs() % 10000) as u32));
+                    continue;
+                }
+                let mut id = xs() % 6 + 1;
+                if act == 0 && retired.contains(&id) {
+                    fresh += 1;
+                    id = fresh;
+                }
+                if act == 4 || act == 5 {
+                    retired.push(id);
+                }
+                let rho = sim.get(&id).copied().unwrap_or(0);
+                match act {
+                    0 => {
+                        let q = (xs() % 300) as u32;
+                        let side = if xs() % 2 == 0 { b'S' } else { b'B' };
+                        sim.insert(id, q as u64);
+                        stream.push(add(1, id, side, q, (xs() % 100000) as u32));
+                    }
+                    1 | 2 | 3 => {
+                        // 1/3 over-budget (the clamp arm), 2/3 in-budget.
+                        let q = if xs() % 3 == 0 {
+                            (rho + xs() % 100) as u32
+                        } else {
+                            (xs() % (rho + 1)) as u32
+                        };
+                        match act {
+                            1 => stream.push(exec(1, id, q)),
+                            2 => stream.push(cancel_print(
+                                1,
+                                id,
+                                q,
+                                (xs() % 100000) as u32,
+                                if xs() % 2 == 0 { b'Y' } else { b'N' },
+                            )),
+                            _ => stream.push(cancel(1, id, q)),
+                        }
+                        sim.insert(id, rho.saturating_sub(q as u64));
+                    }
+                    4 => {
+                        sim.remove(&id);
+                        stream.push(delete(1, id));
+                    }
+                    _ => {
+                        fresh += 1;
+                        let new_id = fresh;
+                        let nq = (xs() % 200) as u32;
+                        sim.remove(&id);
+                        sim.insert(new_id, nq as u64);
+                        stream.push(replace(1, id, new_id, nq, (xs() % 100000) as u32));
+                    }
+                }
+            }
+            cmp(&stream, &format!("fuzz-{draw}"));
+        }
     }
 
     /// The sequential oracle: apply every RESOLVED token one at a time

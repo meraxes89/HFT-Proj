@@ -1052,7 +1052,14 @@ fn run_hydra_sustained_5s(
             // the fallbacks are the only live passes), the fallbacks
             // stay at the assist's noise floor, and the fusion absorbs
             // the emitter's per-32-span flush granularity.
-            if res_replay_on {
+            // R38: the engagement law scopes to the SINGLE-LANE shape —
+            // at 2+ lanes the R37c coverage law discards the per-lane
+            // partial scripts by construction (a lane's round-robin
+            // chunk sub-grid is not a pass tiling), so the elision
+            // stays disarmed and the workers run the verbatim live
+            // walk; the per-lane phase scripts (the two-lane elision)
+            // are the R38 queue's item 3.
+            if res_replay_on && n_workers == 1 {
                 let crossed = replayed + live;
                 assert!(
                     crossed >= n_workers * d_passes,

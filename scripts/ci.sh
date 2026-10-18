@@ -982,6 +982,14 @@ grep -q "PR1_R37_TREE_FOLD_VERDICT.*tree_ok=true" /tmp/bench_r37k.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*engine_tree_ok=true" /tmp/bench_r37k.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*two_level_ok=true" /tmp/bench_r37k.txt
 grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37k.txt | head -1
+# R38/L3 (Gate 13's engine wiring): the push-scan parity cells — the
+# bake's two resolve paths bit-exact on the adversarial corpus AND the
+# full golden tape (the no-drift law at the fabric level; the fuzz
+# draws carry the anomaly/clamp/phantom faces the tape never shows).
+cargo test --release -p nf-testkit t_r38 2>&1 | tee /tmp/test_r38.txt
+grep -q "t_r38_bake_push_pull_parity ... ok" /tmp/test_r38.txt
+grep -q "t_r38b_bake_push_pull_parity_tape ... ok" /tmp/test_r38.txt
+grep "test result: ok" /tmp/test_r38.txt | head -1
 # R37c (the ship's gate, the R36-E precedent): the two-worker shape
 # exposed a residual emission-discipline family on the fleet (the
 # fold-order class at ~10-15%/shard + the SegAcc overflow — docs/49
@@ -990,7 +998,17 @@ grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37k.txt | head -1
 # (the three R37b fixes) stay merged — HFT_SUSTAINED_WORKERS=2 runs
 # them on the hardened hosts (the local A/B ran the two-lane shape
 # 5/5 BIT-EXACT).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
+# R38 (the 200B corridor): the champion arm carries L3 + L4 — the
+# bake runs the Theorem-29 push scan (HFT_ORDER_SCAN's default — the
+# B3 wall's dataflow inversion, the dual-lane resolution's soundness
+# lift) and the RX ring widens 4x (HFT_NBUF=64 — the deep-ring runway
+# absorbing consumer-side scheduler noise; 11nb6 prices the depth).
+# The worker shape stays the PROVEN single-lane elision (the R37c
+# ship's gate): the dev-slice measurement priced the two-lane LIVE
+# walk at 3.2B vs the elision's 9.9B (the eval dominates — the
+# two-lane ELISION, the per-lane phase scripts, is the R38 queue's
+# item 3; 11r38w prices the lane shape on the fleet's real silicon).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37.txt
 grep -q "allocs=0" /tmp/bench_r37.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37.txt
@@ -1001,9 +1019,42 @@ grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=1" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC sustained: tree=true" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC.*live_len=0" /tmp/bench_r37.txt
 grep -q "RESREPLAY_DIAGNOSTIC sustained: .*elision=true" /tmp/bench_r37.txt
+grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true order_scan=push" /tmp/bench_r37.txt
+grep -q "SIGFABRIC_DIAGNOSTIC.*L=63" /tmp/bench_r37.txt
 grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37.txt | head -1
 grep "PR1_R36_EVAL_ELISION_VERDICT" /tmp/bench_r37.txt | head -1
 grep "FOLDTREE_DIAGNOSTIC" /tmp/bench_r37.txt | head -1
+
+# ── 11r38w. R38/L2: the two-lane live-walk pricing (the attribution
+# arm) — the fleet prices the lane shape on the real silicon (2
+# physical Zen 5 cores). The elision CANNOT arm at 2 lanes (the R37c
+# coverage law discards the per-lane partial scripts by construction)
+# so the workers run the verbatim live walk (HFT_RES_REPLAY=0 — no
+# recording overhead); the same-draw delta 11r37 - 11r38w prices the
+# lane shape + the elision's contribution. The two-lane ELISION (the
+# per-lane phase scripts) is the R38 queue's item 3.
+HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38w.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38w.txt
+grep -q "allocs=0" /tmp/bench_r38w.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r38w.txt
+grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=2" /tmp/bench_r38w.txt
+grep -q "RESREPLAY_DIAGNOSTIC sustained: workers=2 elision=false" /tmp/bench_r38w.txt
+grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true order_scan=push" /tmp/bench_r38w.txt
+grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r38w.txt | head -1
+grep "RESREPLAY_DIAGNOSTIC sustained" /tmp/bench_r38w.txt | head -1
+
+# ── 11r38r. R38/L3: the order-scan rollback (the attribution arm) ───
+# HFT_ORDER_SCAN=0 restores the Phase-R OrderCache pull verbatim — the
+# same-draw delta 11r37 - 11r38r prices the push scan's bake-time
+# contribution (sig_bake_ms; the tables are pinned identical by the
+# parity cells — the rate stays the same-draw verdict's).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=0 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38r.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38r.txt
+grep -q "allocs=0" /tmp/bench_r38r.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r38r.txt
+grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true order_scan=pull" /tmp/bench_r38r.txt
+grep "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38r.txt | head -1
+grep "SIGFABRIC_DIAGNOSTIC sustained" /tmp/bench_r38r.txt | head -1
 
 # ── 11r37r. R37: the tree-fold rollback (the attribution arm) ────────
 # HFT_TREE_FOLD=0 restores the R36 serial per-record apply verbatim
@@ -1011,7 +1062,7 @@ grep "FOLDTREE_DIAGNOSTIC" /tmp/bench_r37.txt | head -1
 # the tree's contribution (the fold's critical path + the drain's
 # pipelining). The two-lane elision stays armed on both arms (its own
 # rollback is HFT_RES_REPLAY=0 — arm 11r36er's law).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=1 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37r.txt
 grep -q "allocs=0" /tmp/bench_r37r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37r.txt
