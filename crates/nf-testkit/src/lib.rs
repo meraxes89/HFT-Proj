@@ -18,6 +18,7 @@ pub mod golden;
 pub mod hydra;
 pub mod lobstate;
 pub mod passreplay;
+pub mod orderscan;
 pub mod sigfabric;
 pub mod polyhash;
 pub mod spanfold;

@@ -447,6 +447,75 @@ fn main() {
     println!(
         "R37_TREE_P64 serial_pass_ns={serial_p64_ns} tree_scalar_ns={tree_scalar_ns} tree_dispatch_ns={tree_dispatch_ns} records={K_PASS} depth=9 speedup={tree_speedup:.1}x (Theorem 20/21: the up-sweep vs the serial left spine, the CLMUL ring)"
     );
+
+    // ── R38's regime (solution2.md Part III — Gate 13, the kernel
+    //    instrument): the segmented order scan over B = 512 row-ops —
+    //    the scalar SoA reference vs the vector dispatch, the dual-
+    //    path law, and the per-reference cost (Theorem 29(c)'s ~1.2
+    //    ns/reference class on dedicated cores; this shared dev slice
+    //    reports, never gates).
+    let os_b = 512usize;
+    let mut os_rng: u64 = 0x5EED_C0DE_3838_BEC5;
+    let os_next = || {
+        os_rng ^= os_rng << 13;
+        os_rng ^= os_rng >> 7;
+        os_rng ^= os_rng << 17;
+        os_rng
+    };
+    let os_rows: Vec<nf_testkit::orderscan::RowOp> = (0..os_b)
+        .map(|i| nf_testkit::orderscan::RowOp {
+            // A hot-ID E-chain: row 0 the A, the rest E's — the
+            // adversarial Theorem 29(b) shape.
+            f: if i == 0 { 1 } else { 0 },
+            m: if i == 0 { [0; 3] } else { [u64::MAX; 3] },
+            b: if i == 0 { [1, 0x0000_A5A5_0000_0042, 100_000] } else { [0, 0, (-3i64) as u64] },
+            dead: 0,
+        })
+        .collect();
+    let mut os_soa = nf_testkit::orderscan::ScanSoa::with_capacity(os_b);
+    os_soa.load(&os_rows);
+    let os_want = {
+        let mut aos = os_rows.clone();
+        nf_testkit::orderscan::order_scan(&mut aos);
+        aos
+    };
+    // The scalar SoA timing (best of 20).
+    let os_scalar_ns = {
+        // The SoA buffer allocates ONCE; the load sits OUTSIDE the
+        // timed window (the kernel-only cost — the honest instrument).
+        let mut soa = nf_testkit::orderscan::ScanSoa::with_capacity(os_b);
+        let mut best = u64::MAX;
+        for _ in 0..20 {
+            soa.load(&os_rows);
+            let t0 = std::time::Instant::now();
+            nf_testkit::orderscan::order_scan_soa(&mut soa);
+            let ns = t0.elapsed().as_nanos() as u64;
+            best = best.min(ns);
+            assert_eq!(soa.store(), os_want, "R38 spanbench: SoA scalar != AoS");
+        }
+        best
+    };
+    // The vector dispatch timing (best of 20) + the dual-path law.
+    let (os_vec_ns, os_scan_ok) = {
+        let mut soa = nf_testkit::orderscan::ScanSoa::with_capacity(os_b);
+        let mut best = u64::MAX;
+        let mut ok = true;
+        for _ in 0..20 {
+            soa.load(&os_rows);
+            let t0 = std::time::Instant::now();
+            nf_testkit::orderscan::order_scan_dispatch(&mut soa);
+            let ns = t0.elapsed().as_nanos() as u64;
+            best = best.min(ns);
+            ok = ok && soa.store() == os_want;
+        }
+        (best, ok)
+    };
+    let os_speedup = os_scalar_ns as f64 / os_vec_ns.max(1) as f64;
+    let os_ns_per_ref = os_vec_ns as f64 / os_b as f64;
+    println!(
+        "R38_ORDER_SCAN scalar_ns={os_scalar_ns} dispatch_ns={os_vec_ns} batch={os_b} levels=9 speedup={os_speedup:.1}x ns_per_ref={os_ns_per_ref:.3} scan_ok={os_scan_ok} (Theorem 29: the segmented Hillis-Steele over the hot-ID chain — the B3 probe's replacement, the [S1] 6.4 prohibition's lift; docs/solution2.md Part III)"
+    );
+
     println!(
         "R37_TREE_ENGINE serial_pass_ns={engine_serial_ns} tree_ns={engine_tree_ns} speedup={engine_speedup:.1}x (the rotation ring — the fold journal's law, the 2.08us/pass barrier's replacement)"
     );
@@ -475,6 +544,7 @@ fn main() {
     assert!(tree_ok, "Theorem 22 violated (CLMUL ring): tree != serial chain");
     assert!(engine_tree_ok, "Theorem 22 violated (rotation ring): tree != serial chain");
     assert!(two_level_ok, "Theorem 19/§2.7 violated: two-level split != flat chain");
+    assert!(os_scan_ok, "Theorem 29 violated: the order scan's dispatch != the AoS reference");
     let _ = W_T;
     let _ = P64::IDENTITY; // (API-surface pin)
 }
