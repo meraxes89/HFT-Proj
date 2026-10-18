@@ -257,7 +257,7 @@ classic windows' per-chunk publishes, the mark preceding the
 exposure — the walk's inline-skip + the hole guard under real claim
 pressure, assists > 0).
 
-## §8 R37c — the research queue (the deferred cells)
+## §8 R37c — the research queue (the removed research cells)
 
 The R37b push's fleet verdict (run 39080408718): the fix's three laws
 are sound locally (the two-worker arm 5/5 BIT-EXACT), but the two new
@@ -266,23 +266,251 @@ steady shapes (the full-tape 136-pass two-lane parity; the
 claim-stress ramp) — exposed a RESIDUAL emission-discipline class the
 CI timing window catches and the local 2-core slice cannot:
 
-* `t_r37_two_lane_replay_parity` (now `#[ignore]`):
-  `composite record k=64 exceeds fold_rem=16 at span 102720` — a
-  mid-chunk 16-span hole / a foreign-chunk record in the wrong lane's
-  ring: a segment-boundary discipline break (a publish-split resume
-  or a phase-script arming under the full-tape ending).
-* `t_r37_two_lane_classic_claims_parity` (now `#[ignore]`):
+* the two-lane full-tape parity cell:
+  `composite record k=64 exceeds fold_rem=16 at span 102720` —
+  DETERMINISTIC on the CI host (the same span twice): the fold sits
+  48-into-chunk-1604 (lane 0's) with its 16-span tail MISSING from
+  lane 0's ring and the FOREIGN chunk 1605's record present — the
+  record [102720, 102784) also straddles the pass boundary at
+  102,739 (13×7,903): a segment-boundary discipline break (a
+  publish-split resume, a missed on_boundary clobber, or a
+  phase-script mis-arming under the full-tape ending).
+* the claim-stress cell:
   `hydra composite fold-order violation: got span 447936, expected
   443840 (lane 1)` — a 4,096-span (64-chunk) lane-record jump: the
   claim/emission interleaving under the dense-claim regime (the
   stale-inline-entry clog class — an inline ring entry whose chunk
   already folded via the lane record blocks the ring).
 
-Both are RESEARCH INSTRUMENTS for the next run (R37c): un-ignore when
-the walk/replay boundary discipline and the claim/emission
-interleaving close them. The deterministic unit law
-(`t_r37_fallback_grid_law`) and the three R37b laws ship; the bench
+The CI's test law (`cargo test -- --include-ignored`) runs even
+`#[ignore]`d tests, so the cells are REMOVED from the tree (the
+`649b191` interlude's `#[ignore]` deferral does not hold). Their
+harness (`r37_drive_2lane` — the 2-worker forced-elision drive with
+the watermark ramp and the self-serve override) and both cell bodies
+live in THIS section as the R37c queue's artifacts: restore them
+into `crates/nf-testkit/src/hydra.rs` (after `r36e_drive` and after
+`t_r36e_replay_parity_and_engagement` respectively) when the residual
+class is closed. The deterministic unit law
+(`t_r37_fallback_grid_law`) and the three R37b laws SHIP; the bench
 arms carry the 13-shard verification. The 1-lane starvation flake
-(`composite record k=64 exceeds fold_rem` on the r36e cell, ~1/3 under
-parallel load, ~0 on the CI test phase) is the same family — the
-class is real, pre-existing, and the next run's first wall.
+(`composite record k=64 exceeds fold_rem` on the r36e cell, ~1/3
+under parallel load on the 2-core dev slice, ~0 on the CI test
+phase) is the same family — pre-existing, verified against the
+pristine tree, and the next run's first wall.
+
+### §8.1 The R37c harness (restore verbatim)
+
+```rust,ignore
+    /// R37b: drive the TWO-LANE sustained shape — the R36-E champion stack
+    /// (the R32 ledger + the call fusion + the worker eval elision) with
+    /// TWO workers / TWO lanes — the arm 11r37 champion's shape (the R37
+    /// unlock). `wm_ramp` = (from_pass, wm): the claim watermark's LATE
+    /// ramp — the default (None) keeps the production watermark; the ramp
+    /// drops it LOW from `from_pass` (AFTER the phase scripts arm — the
+    /// early claim-free orbit records hole-free; a from-pass-2 low
+    /// watermark discards every phase via the hole guard and the replay
+    /// never arms). A LOW value converts the submission's
+    /// transient lead into inline claims, driving the replay fallback's
+    /// grid re-derivation under real interleaving — the path class the
+    /// R36-E single-lane scope gate never exercised. Returns the in-order
+    /// harvested tuples + the elision's engagement instruments.
+    fn r37_drive_2lane(
+        gt: &[u8],
+        sched: &nf_transport::sched_types::ReplaySchedule,
+        passes: u64,
+        wm_ramp: Option<(u64, u64)>,
+    ) -> (Vec<(u64, u64, u64)>, (u64, u64, u64, u64), u64, u64) {
+        let construction = r32_prog(0);
+        // TWO lanes — the elision forced through the spawn override (the
+        // env races the parallel tests' worker spawns).
+        let fabric =
+            HydraFabric::spawn_pinned_full_opts(2, &[], true, true, true, true, true, Some(true));
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            gt,
+            sched.clone(),
+            construction,
+            128,
+            None,
+            Some(r32_prog),
+            false,
+            true,
+            16,
+            true,
+            true,
+            true,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        if wm_ramp.is_some() {
+            // The claim-stress shape: the SELF-SERVE DISARMED for the
+            // whole run (the R29 cells' field override — the env is
+            // process-global). Classic windows publish per chunk, so the
+            // chunk-open claim's mark precedes the exposure (the LEGAL
+            // claim regime) and the replay's inline guard + fallback run
+            // under real interleaving.
+            sink.rx_selfserve = false;
+        }
+        let ladder = crate::soa::ladder8_best();
+        let mut replay = crate::passreplay::PassReplay::new_forced(true);
+        let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+        let mut got = Vec::new();
+        // The ref pass (pass 1) runs live with a separate sink — the
+        // sustained bench's shape (also the generation boundary).
+        t.reset_pass(1, r32_prog(1));
+        {
+            let mut rseq = Sequencer::new_unboxed();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            while t.next_batch() {
+                rseq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+        }
+        for pass in 2..=passes + 1 {
+            if let Some((from, wm)) = wm_ramp {
+                if pass == from {
+                    // THE RAMP: the claims start only now — the claim-free
+                    // orbit kept the phase scripts recordable (a from-pass-2
+                    // low watermark discards every phase via the hole
+                    // guard and the replay never arms).
+                    sink.set_assist_watermark(wm);
+                }
+            }
+            t.reset_pass(pass, r32_prog(pass));
+            *seq = Sequencer::new_unboxed();
+            sink.begin_pass();
+            replay.begin_pass();
+            while t.next_batch() {
+                if !replay.try_replay(&t, &mut seq, &mut sink) {
+                    replay.begin_record(&t, &seq);
+                    {
+                        let mut rec_sink = replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut rec_sink, ladder);
+                    }
+                    replay.seal_batch(&seq);
+                }
+                sink.drain_ready();
+            }
+            replay.note_pass_end();
+            sink.end_pass();
+            let n = sink.harvest_completed(&mut harvested);
+            for rec in &harvested[..n] {
+                got.push(*rec);
+            }
+        }
+        let totals = fabric.res_replay_totals();
+        let assists = sink.assist_chunks();
+        sink.finish();
+        let n = sink.harvest_completed(&mut harvested);
+        for rec in &harvested[..n] {
+            got.push(*rec);
+        }
+        (got, totals, replay.fused_calls(), assists)
+    }
+```
+
+### §8.2 The two research cells (restore verbatim)
+
+```rust,ignore
+    /// R37b: THE TWO-LANE REPLAY PARITY — the champion arm 11r37's shape
+    /// (two workers / two lanes, the elision + the tree fold, all
+    /// defaults): the harvested tuples stay BIT-EXACT against the
+    /// sequential references, the phase machine steps every boundary at
+    /// the halved grid (the boundary orbit is 128 — the two-lane grid's
+    /// full rotation), and the replays dominate after the orbit. The
+    /// standing matrix's only two-lane elision coverage was the 121-shard
+    /// fleet itself — the 13-shard fold-order failures landed there with
+    /// no cell to catch them; this one pins the protocol at the cell
+    /// scale.
+    #[test]
+    #[ignore = "the R37c research queue: the full-tape two-lane shape exposes a residual emission-discipline class (a mid-chunk 16-span hole / a foreign-chunk record — CI timing only; docs/49 §7b). Un-ignore when the walk/replay boundary discipline closes it."]
+    fn t_r37_two_lane_replay_parity() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        // The two-lane grid: the boundary orbit is 128 (n_lanes × 64, the
+        // 47-rotation covering every offset) — 136 passes = the orbit +
+        // 8 replayed passes.
+        const PASSES: u64 = 136;
+        let (got, (replayed, live, _fb, recs), _fused, _assists) =
+            r37_drive_2lane(&gt, &sched, PASSES, None);
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R37b: the two-lane replayed tuples diverged from the sequential references"
+        );
+        let crossed = replayed + live;
+        // The totals SUM over the two workers: every boundary is crossed
+        // by BOTH (the ref pass + the measured passes + the gen
+        // re-anchor each), so the pair-sum is ~2× the pass count.
+        assert!(
+            crossed >= 2 * PASSES && crossed <= 2 * PASSES + 16,
+            "R37b two-lane boundary count: crossed {crossed}, passes {PASSES} \
+             (replayed {replayed}, live {live})"
+        );
+        assert!(
+            replayed >= 8,
+            "R37b two-lane engagement: only {replayed} replayed passes (the orbit 128 needs 136 passes)"
+        );
+        assert!(recs > 0, "R37b two-lane: no records emitted");
+    }
+
+    /// R37b: THE CLASSIC-CLAIMS PARITY — the two-lane shape with the
+    /// self-serve windows disarmed and the claim watermark ramped LOW
+    /// mid-run (pass 25 of 48): the classic windows publish per chunk,
+    /// so the chunk-open claims are the LEGAL regime (the mark precedes
+    /// the exposing spans_ready store) — the walk's inline-skip + the
+    /// hole guard + the recording's discard paths all run under real
+    /// claim pressure. The tuples stay BIT-EXACT and the claims ENGAGE
+    /// (assists > 0 — the watermark converted the ingest lead; a zero
+    /// would leave the cell vacuous).
+    #[test]
+    #[ignore = "the R37c research queue: the claim-stress shape exposes a residual emission-discipline class (a 64-chunk lane-record jump — the stale-inline-entry clog; CI timing only; docs/49 §7b). Un-ignore when the claim/emission interleaving closes it."]
+    fn t_r37_two_lane_classic_claims_parity() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        const PASSES: u64 = 48;
+        let (got, (replayed, live, _fb, recs), _fused, assists) =
+            r37_drive_2lane(&gt, &sched, PASSES, Some((25, 8)));
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R37b classic-claims: the tuples diverged under claim pressure"
+        );
+        assert!(
+            assists > 0,
+            "R37b classic-claims engagement: {assists} inline chunks — the ramped \
+             watermark never converted the lead on this host (vacuous cell)"
+        );
+        assert!(
+            recs > 0 || replayed + live > 0,
+            "no boundary crossings at all"
+        );
+    }
+```

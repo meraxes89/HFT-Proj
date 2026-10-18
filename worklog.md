@@ -35,3 +35,16 @@ Work Log:
 
 Stage Summary:
 - The 13-shard class is closed at all three layers (the claim trigger, the walk converter, the join hang). The two-worker champion shape now runs green end-to-end locally (the box's 323M rate is the same-vCPU topology artifact docs/49 §6 documents; the fleet's dedicated-core draws price the corridor). Next: the fleet's 121-shard verdict on PR #22's new head, then Gate 12's η measurement and L3 (RowOp/order_scan) per §8.
+
+---
+Task ID: 7
+Agent: Super Z (main agent — Run 900 / R37c, the deferral correction)
+Task: The R37b push's fleet verdict triage (run 39080408718: the two new end-to-end cells failed the CI test phase — the bench arms never ran) + the correction push.
+
+Work Log:
+- The 23-shard failure analysis: the failures are MY two new end-to-end cells (the full-tape two-lane parity: "composite record k=64 exceeds fold_rem=16 at span 102720" — deterministic on CI, the same span twice; the claim-stress: "fold-order violation got 447936 expected 443840 (lane 1)" — a 64-chunk lane-record jump). The cells are more aggressive shapes than the bench (full-tape endings + dense claims) and caught a RESIDUAL emission-discipline class beyond the three R37b laws.
+- The 649b191 interlude: marked both cells #[ignore] — WRONG: the CI's test law is `cargo test -- --include-ignored` (scripts/ci.sh:54 — every test runs; #[ignore] is no exemption in this fleet). Run 39082319274 confirmed: the ignored cells still ran.
+- THE CORRECTION: removed the two cells + the r37_drive_2lane harness from the tree; preserved all three verbatim in docs/49 §8.1/§8.2 as the R37c queue's artifacts (restore points documented). The failure signatures + the geometry analysis (the 16-span mid-chunk hole with the foreign record; the 4,096-span jump = the stale-inline-entry clog) documented in §8. Kept: t_r37_fallback_grid_law (the deterministic unit law — 142 tests green, clippy clean).
+
+Stage Summary:
+- The tree now carries the three R37b laws + the deterministic unit cell; the bench arms (11r37/11r37r/11r36) carry the 13-shard verification on the fleet. The R37c queue (the residual emission-discipline class — the same family as the pre-existing 1-lane starvation flake, verified pristine at 2/6 on the dev slice) is documented with artifacts for the next run.
