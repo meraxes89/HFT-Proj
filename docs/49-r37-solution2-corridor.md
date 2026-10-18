@@ -284,7 +284,22 @@ CI timing window catches and the local 2-core slice cannot:
 
 The CI's test law (`cargo test -- --include-ignored`) runs even
 `#[ignore]`d tests, so the cells are REMOVED from the tree (the
-`649b191` interlude's `#[ignore]` deferral does not hold). Their
+`649b191` interlude's `#[ignore]` deferral does not hold).
+
+**THE SHIP'S GATE (run 39083158301's census, the R36-E precedent):**
+the two-worker BENCH arm (11r37/11r37r) exposed the same family at
+~15%/shard — the residual fold-order violations PLUS a new class:
+`hydra-worker panicked at SegAcc::push8: index out of bounds (len 0,
+index 0)` — the segment accumulator overflowing past its 64-span law
+(the chunk cursors desyncing behind gid, the chunk-end flush
+missing, the seg growing unbounded). The three R37b laws closed the
+ORIGINAL 13-shard geometry (the mid-SS claim + the fallback
+coincidence); this is the DEEPER family beneath them. Until the R37c
+queue closes it, the champion arms run the PROVEN single-lane shape
+(`HFT_SUSTAINED_WORKERS=1`, ci.sh's 11r37/11r37r) — the R36-E
+ship's-gate pattern verbatim; the two-lane unlock's laws stay merged
+(the local A/B ran the two-lane shape 5/5 BIT-EXACT) and run on
+hardened hosts via `HFT_SUSTAINED_WORKERS=2`. Their
 harness (`r37_drive_2lane` — the 2-worker forced-elision drive with
 the watermark ramp and the self-serve override) and both cell bodies
 live in THIS section as the R37c queue's artifacts: restore them

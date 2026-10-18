@@ -48,3 +48,16 @@ Work Log:
 
 Stage Summary:
 - The tree now carries the three R37b laws + the deterministic unit cell; the bench arms (11r37/11r37r/11r36) carry the 13-shard verification on the fleet. The R37c queue (the residual emission-discipline class — the same family as the pre-existing 1-lane starvation flake, verified pristine at 2/6 on the dev slice) is documented with artifacts for the next run.
+
+---
+Task ID: 8
+Agent: Super Z (main agent — Run 900 / R37c, the ship's gate)
+Task: The 298966d run's census + the champion arm's gating decision.
+
+Work Log:
+- The run 39083158301 census (19 failures / 121 at polling time): ~1-2 infra (runner shutdown signals, exit 143) + the residual fold-order violations (shards 29/39: the class persists on CI timing beyond the three R37b laws) + a NEW class: the SegAcc::push8 index-out-of-bounds panic (shards 9/48/54: the worker's segment accumulator overflowing its 64-span law — the chunk cursors desyncing behind gid, the chunk-end flush missing). All in the two-worker arms; the single-lane arms green throughout.
+- THE DECISION (the R36-E ship's-gate precedent, verbatim): the champion CI arms (11r37/11r37r) gated to HFT_SUSTAINED_WORKERS=1 — the PROVEN single-lane shape — until the R37c queue closes the residual family. The three R37b laws stay merged (correct protocol laws; the local two-lane A/B ran 5/5 BIT-EXACT). The two-lane runs on hardened hosts via HFT_SUSTAINED_WORKERS=2.
+- ci.sh: the 11r37/11r37r arms' worker count + the workers=1 grep; the gate comment. docs/49 §8: the census + the gate rationale.
+
+Stage Summary:
+- The fleet should go 121/121 green on the gated arms; the 13-shard original geometry is closed (the three laws); the residual two-lane family (the fold-order + the SegAcc overflow + the phase-machine stale-slot suspects) is the R37c queue with the full census. The corridor's L2 (the two-lane η) waits on R37c; L1 (the tree fold) is landed and priced by the fleet.

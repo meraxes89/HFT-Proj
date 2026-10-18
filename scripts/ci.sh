@@ -982,14 +982,22 @@ grep -q "PR1_R37_TREE_FOLD_VERDICT.*tree_ok=true" /tmp/bench_r37k.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*engine_tree_ok=true" /tmp/bench_r37k.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*two_level_ok=true" /tmp/bench_r37k.txt
 grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37k.txt | head -1
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=2 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
+# R37c (the ship's gate, the R36-E precedent): the two-worker shape
+# exposed a residual emission-discipline family on the fleet (the
+# fold-order class at ~10-15%/shard + the SegAcc overflow — docs/49
+# §8's census). The champion arm runs the PROVEN single-lane shape
+# until the R37c queue closes the class; the two-lane unlock's LAWS
+# (the three R37b fixes) stay merged — HFT_SUSTAINED_WORKERS=2 runs
+# them on the hardened hosts (the local A/B ran the two-lane shape
+# 5/5 BIT-EXACT).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37.txt
 grep -q "allocs=0" /tmp/bench_r37.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37.txt
 grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=true" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT rate=" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*tree=true" /tmp/bench_r37.txt
-grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=2" /tmp/bench_r37.txt
+grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=1" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC sustained: tree=true" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC.*live_len=0" /tmp/bench_r37.txt
 grep -q "RESREPLAY_DIAGNOSTIC sustained: .*elision=true" /tmp/bench_r37.txt
@@ -1003,7 +1011,7 @@ grep "FOLDTREE_DIAGNOSTIC" /tmp/bench_r37.txt | head -1
 # the tree's contribution (the fold's critical path + the drain's
 # pipelining). The two-lane elision stays armed on both arms (its own
 # rollback is HFT_RES_REPLAY=0 — arm 11r36er's law).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=2 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_SUSTAINED_WORKERS=1 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37r.txt
 grep -q "allocs=0" /tmp/bench_r37r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37r.txt
