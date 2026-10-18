@@ -257,6 +257,88 @@ classic windows' per-chunk publishes, the mark preceding the
 exposure — the walk's inline-skip + the hole guard under real claim
 pressure, assists > 0).
 
+## §8-pre. R37c — THE COVERAGE LAW (the 4-shard class closed)
+
+The gated run 39086154969's verdict: 117/121 shards green; the four
+failures (shards 12/22/33/77 + 100, all `t_r36e_replay_parity_and_
+engagement`) panic at the fold's k-exceeds assert —
+`composite record k=64 exceeds fold_rem=16 at span 58240` — the
+pre-existing 1-lane starvation flake's deterministic span. The
+reproduction (CPU-contended dev slice, 8/25 runs) + a lock-free event
+trace (claims/seals/inline-folds/walk-skips/replay-emissions/
+boundary-opens) pinned the full mechanism:
+
+* THE EPISODE: the fold trails the scan (the pace/starvation window);
+  `pending()` crosses the assist watermark; main claims a run of
+  chunks inline (the mid-window classic-path claims + the straddle
+  continuation at the window boundary). The worker's walk hits the
+  marked chunks and SKIPS them wholesale (`eval = chunk_lo +
+  n_lanes * CHUNK`) — carrying its eval cursor ACROSS a pass
+  boundary without a boundary crossing: the skipped spans
+  [boundary, walk_resume) are provided by the INLINE ring and NEVER
+  ENTER THE PHASE SCRIPT.
+* THE HOLED SCRIPT: the new pass's recording bracket opens at the
+  walk's resume — the script's first rel is the skip gap (e.g. the
+  CI geometry: rel 16 at span 58,240; the local geometry: rel 3,744
+  — a 63-chunk episode). The walk's `discard_phase` hole guard
+  misses this class: the skips fire BEFORE the boundary crossing
+  (they hit the PREVIOUS pass's bracket), and the new bracket opens
+  clean at the resume, born with the hole.
+* THE JUMP: the phase's next boundary arms the holed script (the
+  arming checks only the phase key + the length alignment — never
+  the script's SPAN COVERAGE); the replay emits the recorded
+  segments verbatim (rel 16/3744..) — the emission jumps the fold
+  cursor past the un-provided head spans; the fold's k-exceeds
+  assert catches the jump (or, on shapes where the hole lands
+  differently, the order assert — the removed cells' 4,096-span
+  jump face).
+
+THE FIX — `on_boundary`'s close-side **COVERAGE LAW**: a phase
+script seals (`phase_n > 0`) only when it TILES the pass it
+recorded — the first segment's rel is 0, the segments are
+contiguous (`rel_{i+1} == rel_i + k_i`), and the tiling ends
+exactly at the pass length (`rb − cur_rb`). Head-holed, gapped,
+and tail-holed recordings are discarded (phase_n = 0 — the next
+orbit's same-phase pass re-records; the steady self-serve regime
+records hole-free). The arming's alignment law stays; the tiling
+law makes it exact.
+
+VERIFICATION (the contended dev slice, the reproduction shape):
+the r36e cell 0/30 and 0/25 failures under 6-hog CPU contention
+(pre-fix: 8/25); the assist-watermark sweep 2048/512/128/64 3×
+green each; the full nf-testkit suite 142/142 ×5 (incl. contended
+×3); the workspace suite 249 green; clippy `-D warnings` clean.
+The champion arm (11r37, the gated single-lane shape): BIT-EXACT,
+allocs=0, 8.97B msg/s sustained, tree engaged (flushes ≈ passes,
+live_len=0), elision engaged (replayed 88,623 / live 7 / fallbacks
+0) — the honest cost: the two holed phases re-record as live walks
+(the pristine's 9.72B replayed the HOLED scripts — the bug itself
+was the elision's fuel: the jump-emission "fast" path). The
+rollback arm (HFT_TREE_FOLD=0): 10.96B BIT-EXACT.
+
+The unit law `t_r36e_phase_machine_laws` now drives TILED
+recordings (the orbit fill, the arming, the length/alignment
+trips at the real pass shapes) plus three new coverage sub-cells:
+the head hole, the middle gap, the tail hole — each discarded at
+the close, the phase re-arming on its next boundary.
+
+RESIDUE (documented, unreachable in CI): at deliberately starved
+assist watermarks (HFT_ASSIST_WATERMARK ≤ 48 — the CI arms set
+8192, the default 2048), the engagement count assert can trip
+(crossed 70 < 72) — the multi-boundary chunk-skip jump crosses a
+pass boundary without stepping the phase machine (the single
+on_boundary fires at the LATE covering crossing; the intermediate
+pass's bracket is skipped, the count loses a step per jump). A
+close-side multi-boundary collector (firing every crossed pass
+record in ring order) was implemented and REVERTED: it perturbs
+the replay emission gate's exhausted-script defer cycle — a
+three-way livelock (the pace spin holds the submit, the fold
+waits on the worker's records, the worker's emission waits on the
+next window's record) that the pristine dynamics avoid only by
+the elision never falling that far behind. The count face's fix
+(the per-crossing multi-fire at the LIVE WALK's own crossings,
+not the emission gate) is the R38 queue's first item.
+
 ## §8 R37c — the research queue (the removed research cells)
 
 The R37b push's fleet verdict (run 39080408718): the fix's three laws

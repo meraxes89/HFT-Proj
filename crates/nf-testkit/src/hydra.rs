@@ -477,7 +477,52 @@ impl ResLog {
     fn on_boundary(&mut self, rb: u64) {
         if self.recording {
             let lo = self.phase_lo[self.phase] as usize;
-            self.phase_n[self.phase] = (self.segs.len() - lo) as u32;
+            let n = self.segs.len() - lo;
+            // R37c: THE COVERAGE LAW — a phase script is replayable only
+            // if it TILES the pass it recorded: the first segment's rel
+            // is 0, the segments are contiguous (rel_{i+1} == rel_i +
+            // k_i), and the tiling ends exactly at the pass length
+            // (rb − cur_rb). A recording that resumed PAST its pass's
+            // boundary (the walk re-entering after an inline episode —
+            // the mid-window assist claims + the straddle continuation
+            // skipped the marked chunks wholesale, carrying the eval
+            // cursor across the boundary without a crossing) opens its
+            // bracket with the head spans [cur_rb, walk_resume) provided
+            // by the INLINE ring — those spans never enter the script,
+            // so the script's first rel > 0. Mid-pass claims hole the
+            // middle the same way; a tail assist holes the end. The
+            // replay of a holed script jumps the emission (the fold's
+            // k-exceeds assert: "composite record k=64 exceeds
+            // fold_rem=16") — the 13-shard CI family's 1-lane face and
+            // the R37c queue's first wall. The discard_phase hole guard
+            // at the WALK's chunk-skip catches the skips while the
+            // bracket it targets is open — but the boundary-straddling
+            // episode fires the skips BEFORE the crossing (the previous
+            // pass's bracket), and the new pass's bracket opens clean
+            // at the resume, born with the hole: ONLY this close-side
+            // law sees it. A holed script is discarded (phase_n = 0 —
+            // the next orbit's same-phase pass re-records; the steady
+            // self-serve regime records hole-free).
+            let tiles = n > 0 && {
+                let want = rb.saturating_sub(self.cur_rb);
+                let first = &self.segs[lo];
+                let mut end = 0u64;
+                if first.rel == 0 {
+                    for s in &self.segs[lo..lo + n] {
+                        if s.rel as u64 != end {
+                            break;
+                        }
+                        end += s.k as u64;
+                    }
+                }
+                end == want
+            };
+            if tiles {
+                self.phase_n[self.phase] = n as u32;
+            } else {
+                self.segs.truncate(lo);
+                self.phase_n[self.phase] = 0;
+            }
             self.recording = false;
         }
         // The length law: the boundary deltas must be constant.
@@ -9202,13 +9247,23 @@ mod tests {
     #[test]
     fn t_r36e_phase_machine_laws() {
         const T: u64 = 7_903; // the mini tape's span count (T mod 64 = 47)
+        // The tiled recording: segments of CHUNK (the chunk-grid break
+        // discipline) with the pass-tail partial, covering [rb, rb+T).
+        let tile = |log: &mut ResLog, rb: u64| {
+            let mut first = rb;
+            while first < rb + T {
+                let k = (rb + T - first).min(CHUNK) as u32;
+                log.push_seg(first, k, 0x1111);
+                first += k as u64;
+            }
+        };
+        let n_tile = ((T + CHUNK - 1) / CHUNK) as u32;
         let mut log = ResLog::new(true, false, 1);
         // Pass 1: the base-0 boundary opens the phase-0 recording.
         log.on_boundary(0);
         assert!(log.recording, "the first boundary must open the recording");
-        log.push_seg(0, 64, 0x1111);
-        log.push_seg(64, 64, 0x2222);
-        // Pass 2: the phase-0 log SEALS (2 segments) + the length is
+        tile(&mut log, 0);
+        // Pass 2: the phase-0 log SEALS (the tiling) + the length is
         // learned + the phase-47 recording opens immediately (the
         // machine always leaves the walk in the recording state for a
         // fresh phase).
@@ -9216,8 +9271,8 @@ mod tests {
         assert!(log.recording, "the fresh phase re-opens the recording");
         assert_eq!(log.pass_len, T, "the length law learns the pass length");
         assert_eq!(log.phase, (T % 64) as usize);
-        assert_eq!(log.phase_n[0], 2, "the phase-0 log holds 2 segments");
-        log.push_seg(0, 32, 0x3333);
+        assert_eq!(log.phase_n[0], n_tile, "the phase-0 log holds the tiling");
+        tile(&mut log, T);
         // The orbit: drive boundaries 3..=64 (each a fresh phase — the
         // mini's orbit is the full 64) — no arming until a repeat.
         for k in 2..64u64 {
@@ -9228,14 +9283,14 @@ mod tests {
                 k + 1
             );
             assert!(log.recording, "each fresh phase records (pass {})", k + 1);
-            log.push_seg(0, 48, 0x4444);
+            tile(&mut log, k * T);
         }
         // Pass 65: the phase 0 repeats at a length-aligned offset (64*T)
-        // — ARMED. The script is the pass-1 recording (2 segments).
+        // — ARMED. The script is the pass-1 recording (the tiling).
         log.on_boundary(64 * T);
         assert!(log.replaying, "the phase-0 repeat must arm the replay");
         assert_eq!(log.rp_next, 0);
-        assert_eq!(log.rp_end, 2);
+        assert_eq!(log.rp_end, n_tile);
         assert_eq!(log.replayed_passes, 1);
         // THE LENGTH LAW'S TRIP: the next boundary advances a DIFFERENT
         // delta — the whole log resets and the phase re-records.
@@ -9247,23 +9302,72 @@ mod tests {
             "the reset truncated the whole store (the fresh bracket is empty)"
         );
         assert_eq!(log.pass_len, 0, "the length is unlearned after the reset");
+        // R37c: THE COVERAGE LAW — a HEAD-HOLED recording (the walk
+        // resuming past the boundary: the inline episode's chunk skips
+        // carry the eval cursor across without a crossing, the head
+        // spans come from the inline ring and never enter the script)
+        // is discarded at the close; the phase re-records at its next
+        // boundary.
+        {
+            let mut lh = ResLog::new(true, false, 1);
+            lh.on_boundary(0);
+            lh.push_seg(3_744, 64, 0xEEEE);
+            lh.push_seg(3_744 + 64, 64, 0xEFEF);
+            lh.on_boundary(T);
+            assert_eq!(lh.phase_n[0], 0, "the head-holed script is discarded");
+            lh.on_boundary(64 * T);
+            assert!(
+                lh.recording,
+                "the head-holed phase re-records on its next boundary"
+            );
+        }
+        // R37c: the MIDDLE GAP (a mid-pass inline interlude) — same law.
+        {
+            let mut lg = ResLog::new(true, false, 1);
+            lg.on_boundary(0);
+            lg.push_seg(0, 64, 0x1234);
+            lg.push_seg(128, 64, 0x5678); // the gap [64, 128)
+            lg.on_boundary(T);
+            assert_eq!(lg.phase_n[0], 0, "the gapped script is discarded");
+        }
+        // R37c: the TAIL HOLE (a tail assist cuts the recording short) —
+        // the tiling must end exactly at the pass length.
+        {
+            let mut lt = ResLog::new(true, false, 1);
+            lt.on_boundary(0);
+            let mut first = 0u64;
+            while first < T - 64 {
+                lt.push_seg(first, 64, 0x9ABC);
+                first += 64;
+            }
+            lt.on_boundary(T);
+            assert_eq!(lt.phase_n[0], 0, "the tail-holed script is discarded");
+        }
         // A grid-aligned length regime (T2 = 8,192 = 64*128: the orbit is
         // exactly 1 — every boundary repeats the phase) — the arming law
         // and the alignment trip on a fresh machine.
         const T2: u64 = 8_192;
         let mut log2 = ResLog::new(true, false, 1);
         log2.on_boundary(0);
-        log2.push_seg(0, 64, 0xAAAA);
+        for first in (0..T2).step_by(CHUNK as usize) {
+            log2.push_seg(first, CHUNK as u32, 0xAAAA);
+        }
         log2.on_boundary(T2);
         assert_eq!(log2.pass_len, T2);
         assert_eq!(log2.phase, 0, "T2 mod 64 == 0: the same phase");
-        log2.push_seg(0, 64, 0xBBBB);
+        for first in (T2..2 * T2).step_by(CHUNK as usize) {
+            log2.push_seg(first, CHUNK as u32, 0xBBBB);
+        }
         log2.on_boundary(2 * T2);
         assert!(
             log2.replaying,
             "the grid-aligned length arms on the first repeat"
         );
-        assert_eq!(log2.rp_end, 1, "the phase-0 script is the one segment");
+        assert_eq!(
+            log2.rp_end,
+            (T2 / CHUNK) as u32,
+            "the phase-0 script is the full tiling"
+        );
         // THE ALIGNMENT LAW'S TRIP: a rotated offset (the phase matches,
         // the offset is not a multiple of the length) resets.
         log2.on_boundary(2 * T2 + T2 / 2);

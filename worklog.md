@@ -74,3 +74,21 @@ Work Log:
 
 Stage Summary:
 - The R37b mission: the ORIGINAL 13-shard geometry closed (the three laws — the mid-SS claim guard, the fallback grid law, the replay shutdown escape; the two-lane A/B 5/5 BIT-EXACT locally). The fleet: the gated arms green; the residual family (the pre-existing 1-lane flake at ~3-4% on the current pool + the two-lane residuals) is the R37c queue with the full census + artifacts. PR #22's head: c04d872 + this doc commit. The next session: the segment-discipline fix (the 16-span hole class), then the two-lane re-unlock, then Gate 12's η and the corridor.
+
+---
+Task ID: 10
+Agent: Super Z (main agent — Run 900 / R37d, the 4-shard class)
+Task: Close the 1-lane starvation flake (run 39086154969: shards 12/22/33/77 + 100, t_r36e_replay_parity_and_engagement, "composite record k=64 exceeds fold_rem=16 at span 58240") — the R37c queue's first wall — and drive PR #22 to 121/121 green.
+
+Work Log:
+- REPRODUCED: 6 CPU hogs + the r36e cell solo = 8/25 failures (the k-exceeds class; fold_rem 16/32; the record always chunk-aligned k=64 — the current chunk's tail missing). The WM sweep: ≤48 deterministic (the engagement face).
+- INSTRUMENTED: a lock-free event ring (ftrace: CLAIM/SEAL/IFOLD/WSKIP/SPLIT/OPEN/STRAD/BOUND/OPREC/PSEG/DISC/REMIT) + a DIAG assert + per-loop heartbeats + the pace-spin extension + the record-ring dump at the emission's exhausted defer. Reproduced with the trace → the FULL mechanism.
+- ROOT CAUSE: the inline-episode chunk-skips carry the walk's eval cursor ACROSS a pass boundary without a crossing; the new pass's recording bracket opens at the resume with the head spans [boundary, resume) inline-provided — THE PHASE SCRIPT IS BORN WITH A HEAD HOLE (first rel = the skip gap: 16 in the CI geometry, 3,744 locally). The arming (phase key + length alignment only) replays the holed script verbatim → the emission jumps the fold → the k-exceeds assert. The walk's discard_phase hole guard misses the class (the skips hit the PREVIOUS bracket).
+- THE FIX — THE COVERAGE LAW (on_boundary's close): a script seals only when it TILES its pass (rel_0 == 0, contiguous, ending at rb − cur_rb); holed → discard (phase_n = 0, the next orbit re-records).
+- A second fix (the multi-boundary collector: every crossed pass record steps the machine in ring order) was implemented for the count face, then REVERTED: bisect-B proved it stalls the champion arm (the emission gate's exhausted-script defer + the pace spin + the fold = a three-way livelock; traced to the collector disturbing the gate's fire/adoption timing — the adoption lands without the phase step). The coverage law alone (bisect-A): no stall, all green.
+- The unit cell t_r36e_phase_machine_laws reworked: tiled recordings (the orbit/arming/trips at the real shapes) + three new coverage sub-cells (head hole, middle gap, tail hole — discarded; the phase re-arms at its next boundary).
+- VERIFICATION: r36e 0/30 + 0/25 contended; WM sweep 2048..64 3× green; nf-testkit 142/142 ×5 (3 contended); workspace 249 green; clippy -D warnings clean; the champion arm (11r37): BIT-EXACT, allocs=0, 8.97B sustained, tree+elision engaged (replayed 88,623/live 7/fb 0); the rollback arm 10.96B BIT-EXACT. All TEMP diagnostics stripped (grep-clean).
+- docs/49 §8-pre written (the full mechanism, the fix, the verification, the residue + the R38 queue item). 
+
+Stage Summary:
+- The residual family's 1-lane face (the 4-shard CI class) is CLOSED at the root: holed scripts can never arm. The honest elision cost: ~8% on the contended dev slice (the 2 holed phases walk live; the pristine's "9.72B" was the jump-emission bug itself). The count face (WM ≤ 48, unreachable in CI — the arms run 2048/8192) documented with the R38 plan (the live-walk-only multi-fire). Next: the fleet's 121-shard verdict on PR #22's new head → merge → the corridor (Gate 12 η, L3 RowOp/order_scan, L4 the wide windows).
