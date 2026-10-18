@@ -256,3 +256,33 @@ lane counts 1/2/3/4 — the own-chunk-END coincidence pinned), and
 classic windows' per-chunk publishes, the mark preceding the
 exposure — the walk's inline-skip + the hole guard under real claim
 pressure, assists > 0).
+
+## §8 R37c — the research queue (the deferred cells)
+
+The R37b push's fleet verdict (run 39080408718): the fix's three laws
+are sound locally (the two-worker arm 5/5 BIT-EXACT), but the two new
+END-TO-END cells — intentionally more aggressive than the bench's
+steady shapes (the full-tape 136-pass two-lane parity; the
+claim-stress ramp) — exposed a RESIDUAL emission-discipline class the
+CI timing window catches and the local 2-core slice cannot:
+
+* `t_r37_two_lane_replay_parity` (now `#[ignore]`):
+  `composite record k=64 exceeds fold_rem=16 at span 102720` — a
+  mid-chunk 16-span hole / a foreign-chunk record in the wrong lane's
+  ring: a segment-boundary discipline break (a publish-split resume
+  or a phase-script arming under the full-tape ending).
+* `t_r37_two_lane_classic_claims_parity` (now `#[ignore]`):
+  `hydra composite fold-order violation: got span 447936, expected
+  443840 (lane 1)` — a 4,096-span (64-chunk) lane-record jump: the
+  claim/emission interleaving under the dense-claim regime (the
+  stale-inline-entry clog class — an inline ring entry whose chunk
+  already folded via the lane record blocks the ring).
+
+Both are RESEARCH INSTRUMENTS for the next run (R37c): un-ignore when
+the walk/replay boundary discipline and the claim/emission
+interleaving close them. The deterministic unit law
+(`t_r37_fallback_grid_law`) and the three R37b laws ship; the bench
+arms carry the 13-shard verification. The 1-lane starvation flake
+(`composite record k=64 exceeds fold_rem` on the r36e cell, ~1/3 under
+parallel load, ~0 on the CI test phase) is the same family — the
+class is real, pre-existing, and the next run's first wall.
