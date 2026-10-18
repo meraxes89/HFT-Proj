@@ -139,3 +139,17 @@ Work Log:
 
 Stage Summary:
 - THE L3 ENGINE WIRING IS LANDED (Gate 13's first half wired into the ACTIVE pipeline): the B3 wall's dataflow inversion real in the engine, [S1] 6.4's prohibition lifted at the fabric level (Theorem 31's prerequisite), the bake schedule-free, bit-exact at every scale (twin -> cells -> tape -> engine digest). THE PENDING: the fleet's verdict (the 40-shard matrix). THE R38 QUEUE: (1) the two-lane elision (the per-lane phase scripts + the multi-boundary collector — THE L2 unlock), (2) the stacking-underflow adversarial exactness, (3) the batched VPGATHERQQ gather, (4) Gate 12's eta (11r38w's fleet number is its first input).
+
+---
+Task ID: 14
+Agent: Super Z (main agent — Run 900 / R38, the fleet's L4 verdict)
+Task: Read run 39135659511's fleet numbers and act on the L4 finding.
+
+Work Log:
+- THE FLEET'S VERDICT (run 39135659511, attempt 2 = 41/41 green — 4 target-silicon draws in attempt 1: shards 25/32 completed, 27/30 hit the 30-min tail-cancel and re-queued): the L3 wiring ENGAGED clean — the champion arm ran order_scan=push with the IDENTICAL digest (0x53988eaacf452cd1), L=63, span_merge_ok=true, BIT-EXACT, allocs=0, all 40 shards green on the parity cells + the arms.
+- THE RATES: 11r36s (the R36-E stable shape, NBUF=16, w=1, elision): 60.07B / 64.11B on the two real shards. MY champion (the same shape + NBUF=64): 23.58B / 26.81B — the 4x ring is a -60% REGRESSION at the single-lane elision operating point (both shards agree; the pull arm 11r38r at NBUF=64 confirms: 28.10/27.69B). The mechanism: the elision makes the MAIN core the bottleneck; the deep ring's entry-array footprint (64 x 64KiB = 4MiB vs 1MiB) + the deeper runahead thrash the main core's cache — the runway's producer-side benefit does not pay here.
+- THE TWO-LANE PRICING (11r38w, NBUF=64-confounded): 26.56/28.61B vs the single-lane elision's 60-64B — the two-lane live walk is ~2x slower on the real silicon too (the dev slice's 3x was the pessimistic bound); the per-lane elision (the R38 queue item 3) remains THE L2 unlock.
+- THE ACTION: the champion + attribution arms (11r37/11r38w/11r38r/11r37r) revert to the 16-deep default ring; the ladder (11nb6/11nb25) remains the ring's pricing surface; docs/50's L4 section carries the verdict; the ci.sh comment documents the measurement.
+
+Stage Summary:
+- The corridor's honest operating shape after the fleet's first R38 verdict: the single-lane elision + the push bake at the 16-deep ring (the 60-64B class on the fleet); the L4 widening is measured-and-reverted (a -60% rate regression at this point — a producer-side lever that does not pay when the elision makes the main core the bottleneck). THE R38 QUEUE unchanged: (1) the two-lane elision (per-lane phase scripts — THE L2 unlock, now fleet-priced at ~2x), (2) the stacking-underflow exactness, (3) the VPGATHERQQ gather, (4) Gate 12's eta.

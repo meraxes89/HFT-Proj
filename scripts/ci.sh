@@ -998,17 +998,24 @@ grep "test result: ok" /tmp/test_r38.txt | head -1
 # (the three R37b fixes) stay merged — HFT_SUSTAINED_WORKERS=2 runs
 # them on the hardened hosts (the local A/B ran the two-lane shape
 # 5/5 BIT-EXACT).
-# R38 (the 200B corridor): the champion arm carries L3 + L4 — the
-# bake runs the Theorem-29 push scan (HFT_ORDER_SCAN's default — the
-# B3 wall's dataflow inversion, the dual-lane resolution's soundness
-# lift) and the RX ring widens 4x (HFT_NBUF=64 — the deep-ring runway
-# absorbing consumer-side scheduler noise; 11nb6 prices the depth).
-# The worker shape stays the PROVEN single-lane elision (the R37c
-# ship's gate): the dev-slice measurement priced the two-lane LIVE
-# walk at 3.2B vs the elision's 9.9B (the eval dominates — the
-# two-lane ELISION, the per-lane phase scripts, is the R38 queue's
-# item 3; 11r38w prices the lane shape on the fleet's real silicon).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
+# R38 (the 200B corridor): the champion arm carries L3 — the bake
+# runs the Theorem-29 push scan (HFT_ORDER_SCAN's default — the B3
+# wall's dataflow inversion, the dual-lane resolution's soundness
+# lift). THE L4 VERDICT (the fleet's own measurement, run 39135659511
+# on the target silicon): the 4x ring (HFT_NBUF=64) is a -60%
+# REGRESSION at the single-lane elision operating point — 23.6-26.8B
+# vs 60.1-64.1B for the identical 16-deep shape (11r36s) on the same
+# shards — the deep ring's entry-array footprint (64 x 64KiB = 4MiB
+# vs 1MiB) and the deeper runahead thrash the main core's cache when
+# the elision makes the MAIN the bottleneck. The champion reverts to
+# the 16-deep default; the ladder (11nb6/11nb25) remains the ring's
+# pricing surface. The worker shape stays the PROVEN single-lane
+# elision (the R37c ship's gate): the dev-slice measurement priced
+# the two-lane LIVE walk at 3.2B vs the elision's 9.9B (the eval
+# dominates — the two-lane ELISION, the per-lane phase scripts, is
+# the R38 queue's item 3; 11r38w prices the lane shape on the
+# fleet's real silicon).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37.txt
 grep -q "allocs=0" /tmp/bench_r37.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37.txt
@@ -1033,7 +1040,7 @@ grep "FOLDTREE_DIAGNOSTIC" /tmp/bench_r37.txt | head -1
 # recording overhead); the same-draw delta 11r37 - 11r38w prices the
 # lane shape + the elision's contribution. The two-lane ELISION (the
 # per-lane phase scripts) is the R38 queue's item 3.
-HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38w.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38w.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38w.txt
 grep -q "allocs=0" /tmp/bench_r38w.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r38w.txt
@@ -1048,7 +1055,7 @@ grep "RESREPLAY_DIAGNOSTIC sustained" /tmp/bench_r38w.txt | head -1
 # same-draw delta 11r37 - 11r38r prices the push scan's bake-time
 # contribution (sig_bake_ms; the tables are pinned identical by the
 # parity cells — the rate stays the same-draw verdict's).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=0 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38r.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=0 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38r.txt
 grep -q "allocs=0" /tmp/bench_r38r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r38r.txt
@@ -1062,7 +1069,7 @@ grep "SIGFABRIC_DIAGNOSTIC sustained" /tmp/bench_r38r.txt | head -1
 # the tree's contribution (the fold's critical path + the drain's
 # pipelining). The two-lane elision stays armed on both arms (its own
 # rollback is HFT_RES_REPLAY=0 — arm 11r36er's law).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37r.txt
 grep -q "allocs=0" /tmp/bench_r37r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37r.txt

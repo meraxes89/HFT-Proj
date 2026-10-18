@@ -115,11 +115,19 @@ an over-cancelling E/C/X, which the loop re-anchors).
 
 ## §3 The corridor's operating shape (the L2/L4 verdicts)
 
-**L4 — the 4× ring (armed).** The champion arms run `HFT_NBUF=64`
-(the R33-C ladder's 4× point — the deep-ring runway absorbing
-consumer-side scheduler noise; `11nb6` prices the depth, `11r36s`
-holds the 16-ring reference). The ring is protocol-transparent (the
-F-4 law, `t_r33_nbuf_ladder_parity`) — the bit-parity gate holds.
+**L4 — the 4× ring (measured, REVERTED).** The fleet's verdict (run
+39135659511, the target silicon, both real shards): `HFT_NBUF=64` is
+a **−60% regression at the single-lane elision operating point** —
+23.6–26.8B vs 60.1–64.1B for the identical 16-deep shape (11r36s) on
+the same shards. The deep ring's entry-array footprint (64 × 64KiB =
+4MiB vs 1MiB at 16) and the deeper runahead thrash the main core's
+cache exactly when the elision makes the MAIN core the bottleneck —
+the runway's benefit (absorbing consumer-side scheduler noise) is a
+producer-side argument that does not pay at this operating point.
+The champion reverts to the 16-deep default; the ladder (`11nb6` /
+`11nb25`) remains the ring's pricing surface. The bit-parity law
+held at every depth (the F-4 law) — the regression is pure rate, not
+correctness.
 
 **L2 — the two-lane measurement (the honest verdict).** The R37b
 laws + the R37c coverage law hold; the ship's gate can lift. But the
@@ -145,9 +153,10 @@ if not, the per-lane elision is the unlock.
 ## §4 The arms
 
 * **11r37 (the champion)**: `HFT_RXDESC=1 HFT_RES_REPLAY=1
-  HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_NBUF=64` — the
-  single-lane elision + the push bake + the 4× ring. Greps:
-  `order_scan=push`, `L=63`, `workers=1`, the tree + elision laws.
+  HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1` — the single-lane
+  elision + the push bake (the 16-deep ring: the fleet's L4 verdict).
+  Greps: `order_scan=push`, `L=63`, `workers=1`, the tree + elision
+  laws.
 * **11r38w (NEW — the L2 pricing)**: `HFT_RES_REPLAY=0
   HFT_SUSTAINED_WORKERS=2` — the two-lane live-walk attribution on
   the fleet's silicon. Greps: `workers=2`, `elision=false`, the
