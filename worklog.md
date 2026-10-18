@@ -61,3 +61,16 @@ Work Log:
 
 Stage Summary:
 - The fleet should go 121/121 green on the gated arms; the 13-shard original geometry is closed (the three laws); the residual two-lane family (the fold-order + the SegAcc overflow + the phase-machine stale-slot suspects) is the R37c queue with the full census. The corridor's L2 (the two-lane η) waits on R37c; L1 (the tree fold) is landed and priced by the fleet.
+
+---
+Task ID: 9
+Agent: Super Z (main agent — Run 900 / R37c, the final census)
+Task: The c04d872 gated run's verdict + the session close-out.
+
+Work Log:
+- The gated run 39085222808: the two-worker arms' failures GONE (the gate holds); the remaining ~4/121 failures are ALL the pre-existing 1-lane starvation flake (t_r36e_replay_parity_and_engagement: "composite record k=64 exceeds fold_rem=16 at span 58240" — the deterministic span, the same failure verified on the pristine tree locally at 2/6). The runner-pool timing window (01:08 pool ~3-4%, the original 18:59 pool 0/121) — the flake is the residual family's 1-lane face.
+- The failure mechanism (the analysis in docs/49 §8): the emitter's records jump [..., 58224) → [58240, ...) — a 16-span hole at the mid-chunk publish-split resume; the fold's k-exceeds assert catches the desync (the SegAcc::push8 overflow is the same root when the seg fills first). The R37c first wall.
+- docs/49 §8 finalized: the census (the two-lane fold-order + the SegAcc overflow + the 1-lane flake — one family, three faces), the ship's gate's rationale, the R37c queue's artifacts (the harness + the two cells verbatim), and the reproduction requirements.
+
+Stage Summary:
+- The R37b mission: the ORIGINAL 13-shard geometry closed (the three laws — the mid-SS claim guard, the fallback grid law, the replay shutdown escape; the two-lane A/B 5/5 BIT-EXACT locally). The fleet: the gated arms green; the residual family (the pre-existing 1-lane flake at ~3-4% on the current pool + the two-lane residuals) is the R37c queue with the full census + artifacts. PR #22's head: c04d872 + this doc commit. The next session: the segment-discipline fix (the 16-span hole class), then the two-lane re-unlock, then Gate 12's η and the corridor.

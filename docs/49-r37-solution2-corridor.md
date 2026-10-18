@@ -308,10 +308,19 @@ into `crates/nf-testkit/src/hydra.rs` (after `r36e_drive` and after
 class is closed. The deterministic unit law
 (`t_r37_fallback_grid_law`) and the three R37b laws SHIP; the bench
 arms carry the 13-shard verification. The 1-lane starvation flake
-(`composite record k=64 exceeds fold_rem` on the r36e cell, ~1/3
-under parallel load on the 2-core dev slice, ~0 on the CI test
-phase) is the same family — pre-existing, verified against the
-pristine tree, and the next run's first wall.
+(`composite record k=64 exceeds fold_rem=16 at span 58240` on the
+r36e cell — the DETERMINISTIC span on both the dev slice and the
+fleet) is the same family's 1-lane face: pre-existing (verified
+against the pristine tree at 2/6 on the dev slice, the identical
+span), exposed at ~3-4% on the 01:08 runner pool (0/121 on the
+original 18:59 pool — the load/timing window). THE R37c FIRST WALL:
+the walk/replay segment discipline — a 16-span hole at the
+mid-chunk publish-split resume (the emitter's records jump
+[...58224) → [58240...), and the fold's k-exceeds assert catches
+it; the same root surfaces as the SegAcc::push8 overflow when the
+seg fills first. The fix needs the CI-class timing reproduction +
+instrumentation (the next session's first task, with this run's
+census as the map).
 
 ### §8.1 The R37c harness (restore verbatim)
 
