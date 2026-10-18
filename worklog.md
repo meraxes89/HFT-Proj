@@ -184,3 +184,17 @@ Work Log:
 
 Stage Summary:
 - The two-lane elision's first fleet verdict: 39/40 with one 1-lane residual (the multi-fire's rare interleaving face at the plain R6 gate) — closed by the scope gate (the 1-lane crossing semantics restored verbatim; the collector armed only where the per-lane discipline needs it). The champion arm's 2-lane rate verdict: the next run's 11r37 number vs 11r36s (the 1-lane 64.3B confirmed on this run's silicon) and 11r38w — gate 12's eta three-point instrument.
+
+---
+Task ID: 17
+Agent: Super Z (main agent — Run 900 / R38, THE FLEET'S VERDICT on the two-lane elision)
+Task: The 40-shard verdict on the scope-gated two-lane elision (920d860) — the mission's three items' fleet confirmation.
+
+Work Log:
+- THE VERDICT (run 39168431150, commit 920d860): **41/41 GREEN — the full 40-shard matrix** (the Fleet Silicon Census run green too). The scope gate closed the shard-31 flake: no failures, no cancels.
+- THE CHAMPION 11r37 (THE TWO-LANE ELLISION, HFT_SUSTAINED_WORKERS=2 + HFT_RES_REPLAY=1): **rate=60,296,587,725 (60.3B msg/s)** on the real-silicon draw — BIT-EXACT, allocs=0, elision=true, replayed 1,191,948 / live 18 / fallbacks 0 (99.998% of both lanes' boundary crossings are replays — the per-lane phase scripts armed on BOTH physical cores), the sheaf degree law checked at 564,102 boundaries, the identical engine digest with order_scan=push, tree=true live_len=0, workers=2. The cross-draw range: 52.5–60.3B (the shard-12 draw: 53.58B champion / 56.37B one-lane / 1.5B two-lane live walk — the elision's 2-lane contribution is 35x over the live walk on the same silicon).
+- THE HONEST READING (gate 12's first cut): the two-lane elision runs at the champion class (52–60B vs the one-lane's 56–64B — the same main-core bound): the unlock is REAL (the elision arms on both lanes, bit-exact, the collector engaged, the fold's interleaved merge at full speed) but the RATE does not double — the main core's submission + drain is the binding constraint (the second worker's records interleave but the main's per-span work is unchanged). The mission's 180–220B window needs the MAIN-SIDE parallelization next (the submission/scan path off the main core — the next program's L-layer; the SMT co-lanes of solution2.md §5.3 are the designed surface).
+- The arms all green: 11r38w (the 2-lane live walk), 11r38r (the order-scan rollback at 2 lanes), 11r37r (the tree rollback at 2 lanes), 11r36s (the 1-lane reference at 58.9B on this draw) — gate 12's three-point instrument (11r37 / 11r38w / 11r36s) is now fully populated for the next session's eta analysis.
+
+Stage Summary:
+- THE TWO-LANE ELISION IS FLEET-CONFIRMED: 41/41 green, the champion at 60.3B BIT-EXACT with the elision engaged on both lanes (99.998% replay) and the Theorem-25 sheaf surface verified at scale (564k boundaries). The R38 queue's item 1 is CLOSED on the fleet. The corridor's honest state: the two-lane elision holds the champion class; the next lever for 200B is the main-core submission path (the workers are no longer the bottleneck — the elision proved it).
