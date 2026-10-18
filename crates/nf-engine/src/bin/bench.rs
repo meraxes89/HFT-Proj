@@ -1047,19 +1047,19 @@ fn run_hydra_sustained_5s(
             let n_workers = fabric.workers as u64;
             // THE ENGAGEMENT LAWS (the exit-0 discipline — the bench
             // asserts what the CI greps): on an armed run every loop
-            // pass replays (the per-worker boundary count == the pass
-            // count + the two gen re-anchors; the recording orbit and
-            // the fallbacks are the only live passes), the fallbacks
-            // stay at the assist's noise floor, and the fusion absorbs
-            // the emitter's per-32-span flush granularity.
-            // R38: the engagement law scopes to the SINGLE-LANE shape —
-            // at 2+ lanes the R37c coverage law discards the per-lane
-            // partial scripts by construction (a lane's round-robin
-            // chunk sub-grid is not a pass tiling), so the elision
-            // stays disarmed and the workers run the verbatim live
-            // walk; the per-lane phase scripts (the two-lane elision)
-            // are the R38 queue's item 3.
-            if res_replay_on && n_workers == 1 {
+            // pass replays on EVERY LANE (the per-worker boundary count
+            // == the pass count + the gen re-anchors; the recording
+            // orbit and the fallbacks are the only live passes), the
+            // fallbacks stay at the assist's noise floor, and the
+            // fusion absorbs the emitter's per-32-span flush
+            // granularity.
+            // R38/L2: the engagement law now covers the TWO-LANE shape —
+            // the per-lane phase scripts (the coverage law's sub-grid
+            // tiling) arm the elision on BOTH lanes: each lane's
+            // machine steps at every boundary (the multi-boundary
+            // collector's bracket discipline), so the counts scale by
+            // the worker count verbatim.
+            if res_replay_on && n_workers >= 1 {
                 let crossed = replayed + live;
                 assert!(
                     crossed >= n_workers * d_passes,
@@ -1077,6 +1077,17 @@ fn run_hydra_sustained_5s(
                     "R36-E engagement: zero replayed passes on an armed run"
                 );
             }
+            // R38/L2: the multi-boundary collector's sheaf telemetry —
+            // the boundary degree checks that matched vs missed (the
+            // jump episodes + the fresh-sink head; the steady regime
+            // dominates).
+            let (sheaf_checked, sheaf_missed) = sink.sheaf_stats();
+            eprintln!(
+                "SHEAFDIAGNOSTIC sustained: checked={} missed={} (R38/L2: Theorem 25's \
+                 asynchronous sheaf merge — the lanes' published epoch composites, the \
+                 boundary degree law; never waited on, never spun)",
+                sheaf_checked, sheaf_missed
+            );
             println!(
                 "PR1_R36_EVAL_ELISION_VERDICT rate={} elision={} replayed_passes={} live_passes={} fallbacks={} res_records={} fused_calls={} (R36-E: the worker eval elision — the res-record replay over the phase-segment logs + the main-side call fusion; the per-pass worker cost collapses from the span walk to the record emission; the guards: the frozen-master regime, the length law, the phase alignment, the inline guard, the per-pass tuple assert — docs/48)",
                 sustained_rate,

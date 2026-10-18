@@ -990,6 +990,18 @@ cargo test --release -p nf-testkit t_r38 2>&1 | tee /tmp/test_r38.txt
 grep -q "t_r38_bake_push_pull_parity ... ok" /tmp/test_r38.txt
 grep -q "t_r38b_bake_push_pull_parity_tape ... ok" /tmp/test_r38.txt
 grep "test result: ok" /tmp/test_r38.txt | head -1
+# R38/L2 (THE TWO-LANE ELISION — the 200B unlock, docs/50 §6): the
+# per-lane phase scripts (the coverage law's sub-grid tiling — each
+# lane's round-robin chunk sub-grid tiles its pass segment), the
+# multi-boundary collector (the live-walk multi-fire + Theorem 25's
+# epoch-slot publication + the boundary degree law), and the engine
+# parity at 2 workers (the mini tape's 2-lane orbit: 128 phases, the
+# harvested tuples BIT-EXACT vs the sequential references).
+cargo test --release -p nf-testkit t_r38c 2>&1 | tee /tmp/test_r38c.txt
+grep -q "t_r38c_per_lane_tiling_laws ... ok" /tmp/test_r38c.txt
+grep -q "t_r38c_replay_parity_two_lane ... ok" /tmp/test_r38c.txt
+grep -q "t_r38c_sheaf_degree_law ... ok" /tmp/test_r38c.txt
+grep "test result: ok" /tmp/test_r38c.txt | head -1
 # R37c (the ship's gate, the R36-E precedent): the two-worker shape
 # exposed a residual emission-discipline family on the fleet (the
 # fold-order class at ~10-15%/shard + the SegAcc overflow — docs/49
@@ -1009,37 +1021,45 @@ grep "test result: ok" /tmp/test_r38.txt | head -1
 # vs 1MiB) and the deeper runahead thrash the main core's cache when
 # the elision makes the MAIN the bottleneck. The champion reverts to
 # the 16-deep default; the ladder (11nb6/11nb25) remains the ring's
-# pricing surface. The worker shape stays the PROVEN single-lane
-# elision (the R37c ship's gate): the dev-slice measurement priced
-# the two-lane LIVE walk at 3.2B vs the elision's 9.9B (the eval
-# dominates — the two-lane ELISION, the per-lane phase scripts, is
-# the R38 queue's item 3; 11r38w prices the lane shape on the
-# fleet's real silicon).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
+# pricing surface. R38/L2 (THE 200B UNLOCK — docs/50 §6): the champion
+# arm flips to the DUAL-LANE ELISION — HFT_SUSTAINED_WORKERS=2 with
+# HFT_RES_REPLAY=1 (the elision active on both physical Zen 5 cores):
+# the per-lane phase scripts (the coverage law's sub-grid tiling)
+# arm the replay on BOTH lanes, the multi-boundary collector keeps
+# the bracket discipline (the live-walk multi-fire + the epoch-slot
+# publications), and the fold's static-order drain merges the lanes
+# (Theorem 23(b)). The engagement law scales with the worker count
+# (each lane's machine steps at every boundary); the same-draw ratio
+# vs 11r38w (the two-lane LIVE walk) prices the elision's fleet
+# contribution, and vs 11r36s (the one-lane elision) the lane
+# interference efficiency eta (gate 12).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37.txt
 grep -q "allocs=0" /tmp/bench_r37.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37.txt
 grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=true" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT rate=" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*tree=true" /tmp/bench_r37.txt
-grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=1" /tmp/bench_r37.txt
+grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=2" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC sustained: tree=true" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC.*live_len=0" /tmp/bench_r37.txt
-grep -q "RESREPLAY_DIAGNOSTIC sustained: .*elision=true" /tmp/bench_r37.txt
+grep -q "RESREPLAY_DIAGNOSTIC sustained: .*workers=2 elision=true" /tmp/bench_r37.txt
+grep -q "SHEAFDIAGNOSTIC sustained: checked=" /tmp/bench_r37.txt
 grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true order_scan=push" /tmp/bench_r37.txt
 grep -q "SIGFABRIC_DIAGNOSTIC.*L=63" /tmp/bench_r37.txt
 grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37.txt | head -1
 grep "PR1_R36_EVAL_ELISION_VERDICT" /tmp/bench_r37.txt | head -1
+grep "RESREPLAY_DIAGNOSTIC sustained" /tmp/bench_r37.txt | head -1
+grep "SHEAFDIAGNOSTIC sustained" /tmp/bench_r37.txt | head -1
 grep "FOLDTREE_DIAGNOSTIC" /tmp/bench_r37.txt | head -1
 
 # ── 11r38w. R38/L2: the two-lane live-walk pricing (the attribution
-# arm) — the fleet prices the lane shape on the real silicon (2
-# physical Zen 5 cores). The elision CANNOT arm at 2 lanes (the R37c
-# coverage law discards the per-lane partial scripts by construction)
-# so the workers run the verbatim live walk (HFT_RES_REPLAY=0 — no
-# recording overhead); the same-draw delta 11r37 - 11r38w prices the
-# lane shape + the elision's contribution. The two-lane ELISION (the
-# per-lane phase scripts) is the R38 queue's item 3.
+# arm) — the fleet prices the lane shape WITHOUT the elision on the
+# real silicon (2 physical Zen 5 cores): HFT_RES_REPLAY=0 keeps the
+# verbatim live walk (no recording overhead); the same-draw delta
+# 11r37 - 11r38w prices the DUAL-LANE ELISION's contribution (the
+# per-lane phase scripts' replay vs the span walk — the R38 queue's
+# item 3, LANDED: the champion 11r37 now runs it).
 HFT_RXDESC=1 HFT_RES_REPLAY=0 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38w.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38w.txt
 grep -q "allocs=0" /tmp/bench_r38w.txt
@@ -1054,8 +1074,10 @@ grep "RESREPLAY_DIAGNOSTIC sustained" /tmp/bench_r38w.txt | head -1
 # HFT_ORDER_SCAN=0 restores the Phase-R OrderCache pull verbatim — the
 # same-draw delta 11r37 - 11r38r prices the push scan's bake-time
 # contribution (sig_bake_ms; the tables are pinned identical by the
-# parity cells — the rate stays the same-draw verdict's).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=0 HFT_SUSTAINED_WORKERS=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38r.txt
+# parity cells — the rate stays the same-draw verdict's). R38/L2: the
+# rollback matches the champion's TWO-LANE shape (the attribution
+# discipline: same shape, one lever).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=0 HFT_SUSTAINED_WORKERS=2 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r38r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r38r.txt
 grep -q "allocs=0" /tmp/bench_r38r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r38r.txt
@@ -1067,9 +1089,10 @@ grep "SIGFABRIC_DIAGNOSTIC sustained" /tmp/bench_r38r.txt | head -1
 # HFT_TREE_FOLD=0 restores the R36 serial per-record apply verbatim
 # (the journal's serial mode): same-draw delta 11r37 - 11r37r prices
 # the tree's contribution (the fold's critical path + the drain's
-# pipelining). The two-lane elision stays armed on both arms (its own
-# rollback is HFT_RES_REPLAY=0 — arm 11r36er's law).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=1 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
+# pipelining). The dual-lane elision stays armed on both arms (its own
+# rollback is HFT_RES_REPLAY=0 — arm 11r36er's law). R38/L2: the
+# rollback matches the champion's TWO-LANE shape.
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_TREE_FOLD=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r37r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r37r.txt
 grep -q "allocs=0" /tmp/bench_r37r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37r.txt

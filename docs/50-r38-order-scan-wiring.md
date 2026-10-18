@@ -181,3 +181,119 @@ if not, the per-lane elision is the unlock.
 3. The batched VPGATHERQQ entry gather (Theorem 30(ii)).
 4. Gate 12's η measurement (the lane interference efficiency —
    11r38w's fleet number is its first input).
+
+## §6 R38/L2 — THE TWO-LANE ELISION (the L2 unlock, LANDED)
+
+**The mission** (the 200B corridor's remaining lever): extend the
+proven ~60–64B single-core elision across both physical Zen 5 lanes —
+the champion arm flips to `HFT_SUSTAINED_WORKERS=2` with
+`HFT_RES_REPLAY=1` (the elision active on both cores). Three laws
+land:
+
+**1. THE PER-LANE PHASE SCRIPTS** (the coverage law's sub-grid
+tiling). The R37c coverage law sealed a script only when it tiled the
+FULL pass — a lane's round-robin chunk sub-grid is not a full-pass
+tiling, so every per-lane script was discarded and the elision could
+never arm at 2+ lanes (the construction blocker, §3's L2 verdict).
+The generalized law: a script seals when it tiles **the lane's own
+positions** within the pass — the HEAD at the sub-grid entry
+(`lane_span_entry(rb)` — 0 when the boundary lands mid-own-chunk, the
+foreign head-gap otherwise), the BODY gaps in
+{0, (n_lanes−1)·CHUNK} (the mid-chunk publish split, the foreign gap
+between own chunks), and the TAIL at the sub-grid exit
+(`lane_span_exit(rb_next)` — the boundary itself when it lands
+mid-own-chunk, the last own chunk's end otherwise). At n_lanes == 1
+the law degenerates VERBATIM to the R37c operands (E = rb, X = rb,
+the gap set {0} — the one-lane scripts seal identically; the
+no-drift law, pinned by the unchanged 154-cell suite). The hole
+classes the law rejects are unchanged: the head hole (the inline
+episode's late resume), the skipped own chunk (the inline assist —
+the gap n_lanes·CHUNK is not in the allowed set), the tail assist.
+`RESLOG_PHASES` widens 128 → 512 (the phase modulus n_lanes·CHUNK
+would index out of bounds at 3+ lanes; 512 covers eight).
+
+**2. THE MULTI-BOUNDARY COLLECTOR** (the asynchronous sheaf merge,
+Theorem 25 + Theorem 26(b)):
+* **The multi-fire** — the live walk's crossings fire the boundary
+  step for EVERY crossed pass boundary in ring order (the resolve may
+  adopt several records in one jump — the chunk-skip episodes; the
+  single-fire lost a bracket step per jumped pass, the R37c count
+  face). The multi-fire fires ONLY at the live walk's crossings,
+  NEVER at the replay emission gate (the docs/49 §8-pre livelock
+  analysis's fix direction — the reverted close-side collector's
+  failure was the emission gate's exhausted-script defer cycle).
+* **The epoch-slot publication** — each worker publishes its pass
+  composite `X_ℓ^(e) = (K, B)` (the segment-monoid compose of its
+  EMITTED segments — the recording's push_segs, the replay's noted
+  emissions, the fallback's live remainder; a running accumulator
+  tracks all three) into per-lane epoch slots: the data first
+  (Relaxed), the tag LAST (Release) — one store triple per pass, off
+  the ingestion path, exactly Theorem 25's protocol. No lane ever
+  reads the other's slot except the collector, once per boundary; no
+  lane ever waits on the other's publication.
+* **The boundary degree law** — the main's collector (at each
+  completed boundary) reads both lanes' slots and checks
+  `K_first + K_second == the fold's lane-drained span count` (the
+  composite records' k sum — the fold's INDEPENDENT account of the
+  lanes' emission). The publication is never waited on: a miss (the
+  slots stale or torn across epochs — the fresh-sink head, the jump
+  episodes) is counted, never spun (Theorem 26(b)'s bounded
+  staleness; the SHEAFDIAGNOSTIC line's checked/missed). The local
+  champion: checked=39,898 / missed=1,103 (97.3%).
+* **The m-way law (the algebra's honest boundary)** — on the
+  round-robin grid, the pass's composite is the INTERLEAVED
+  tape-order product (Theorem 25's "2m under m-way interleaving"):
+  the fold's static-order drain IS the merge (Theorem 23(b)), exact
+  by construction. The 2-factor closed form `S ⨂ X_first ⨂
+  X_second` is the BLOCK-SPLIT instantiation (exact there — and
+  accidentally exact at the all-64-degree interior, where 13·64 ≡ 0
+  mod 64 collapses the compose to XOR — but NOT at the boundary
+  partials); the t_r38c cell pins both the inequality (the strict
+  a,b,a,b alternation with the real degree mix) and the block-split
+  equality, so the engine's merge choice is documented law, not
+  accident.
+
+**3. THE DEFER PAUSE** (the emission gate's stall discipline — the
+dev-slice finding). The pre-R38 defer cycle (the exhausted-script
+defer + the mid-script frontier break) re-entered the batch top with
+NO pause: on a SHARED core the MHz spin starves the OTHER lane's
+worker, the fold's order coupling then throttles the main's
+publication, and the record the spinner waits for lands late — the
+amplified thrash measured as the two-lane elision's local 8×
+collapse (321M vs the live walk's 2.62B on a 2-vCPU slice). The fix:
+the stalled cycle escalates `polite_spin_deep` (a dedicated
+defer-backoff counter, reset on progress) — on a dedicated core the
+first ~20 laps are pure PAUSE bursts (the wake latency is one lap,
+far under the pass-open cadence — the fleet shape unchanged); after
+~100µs of true idleness it yields, and the sibling gets its slice.
+The local dual-lane elision: **321M → 4.15B msg/s** (12.9×, the same
+2-vCPU slice; the fleet's dedicated-core shape prices the real
+number).
+
+**The verification chain**: `t_r38c_per_lane_tiling_laws` (the unit
+law — the sub-grid tiling, the head/tail partials, the three hole
+faces, the orbit arming, the n=1 degeneration);
+`t_r38c_replay_parity_two_lane` (the engine cell — the champion shape
+at 2 workers on the mini tape: the 2-lane orbit is 128 (the grid
+period doubles; 7,903 mod 128 = 125, gcd = 1), the harvested tuples
+BIT-EXACT against the sequential references, the engagement counts
+doubled, the fallbacks at the steady zero);
+`t_r38c_sheaf_degree_law` (the algebra — the degree law, the lane
+composites' semantics, the m-way inequality + the block-split
+equality). The full nf-testkit suite: 154/154 (151 + the three
+cells). Clippy `-D warnings` clean. The local champion arm
+(11r37's env): BIT-EXACT, allocs=0, `workers=2 elision=true`,
+replayed 82,080 / live 32 / fallbacks 0 (99.96% of the boundary
+crossings on both lanes are replays), the sheaf degree law at 97.3%
+of boundaries, the identical engine digest and L=63, `live_len=0`.
+
+**The champion arm (11r37) flips**: `HFT_SUSTAINED_WORKERS=2` with
+`HFT_RES_REPLAY=1` — the dual-lane elision, the push bake, the
+16-deep ring. The rollbacks (11r38r, 11r37r) match the two-lane
+shape (the attribution discipline: same shape, one lever); 11r38w
+keeps `HFT_RES_REPLAY=0` (the two-lane LIVE walk — the elision's
+fleet attribution); 11r36s stays the one-lane historical reference
+(gate 12's η denominator). The R38 queue's item 1 is CLOSED; the
+queue: (2) the stacking-underflow exactness, (3) the VPGATHERQQ
+gather, (4) gate 12's η — now with 11r37/11r38w/11r36s as its
+three-point instrument.
