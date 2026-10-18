@@ -222,6 +222,16 @@ Theorem 25 + Theorem 26(b)):
   NEVER at the replay emission gate (the docs/49 §8-pre livelock
   analysis's fix direction — the reverted close-side collector's
   failure was the emission gate's exhausted-script defer cycle).
+  THE SCOPE GATE (the fleet's first verdict on cadb9f6, run
+  39165939083 shard 31): the collector fires ONLY on the multi-lane
+  shape (`n_lanes > 1`, where the per-lane bracket discipline needs
+  every crossed pass stepped); the ONE-lane live walk keeps the
+  pre-R38 crossing semantics VERBATIM — the plain R6/R7 gate's
+  1-worker sustained arm tripped the fold-order assert on a rare
+  publication interleaving with the multi-fire armed (the R37c
+  ship's-gate discipline: the count-face benefit is unreachable at
+  the CI watermarks in the 1-lane shape, so the fleet-proven shape
+  wins the scope).
 * **The epoch-slot publication** — each worker publishes its pass
   composite `X_ℓ^(e) = (K, B)` (the segment-monoid compose of its
   EMITTED segments — the recording's push_segs, the replay's noted

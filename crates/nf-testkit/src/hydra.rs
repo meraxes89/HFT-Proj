@@ -2985,7 +2985,21 @@ fn lane_worker_rxdesc_diet(
                         res_slots,
                         rhead,
                         &mut nres,
-                        true, // R38/L2: the LIVE WALK's crossing — the multi-boundary collector fires
+                        // R38/L2: THE SCOPE GATE — the multi-boundary
+                        // collector fires ONLY on the multi-lane shape
+                        // (n_lanes >= 2, where the per-lane bracket
+                        // discipline needs every crossed pass stepped).
+                        // The ONE-lane live walk keeps the pre-R38
+                        // crossing semantics VERBATIM (the fleet-proven
+                        // 41/41 shape — the run-39165939083 verdict:
+                        // the plain R6/R7 gate's 1-worker sustained arm
+                        // tripped the fold-order assert on a rare
+                        // publication interleaving with the multi-fire
+                        // armed; the R37c ship's-gate discipline applies
+                        // — the collector's count-face benefit is
+                        // unreachable at the CI watermarks in the 1-lane
+                        // shape, so the proven shape wins the scope).
+                        n_lanes > 1,
                     );
                     next_wb = new_wb;
                     idx = (gid - rec_base) as usize;
