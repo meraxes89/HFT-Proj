@@ -23,6 +23,7 @@ pub mod orderscan;
 pub mod sigfabric;
 pub mod sigpush;
 pub mod polyhash;
+pub mod randomstream;
 pub mod spanfold;
 pub mod reference;
 pub mod sched;

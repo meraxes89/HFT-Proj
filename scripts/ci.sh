@@ -1214,6 +1214,30 @@ grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40x.txt
 grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40x.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r40x.txt | tail -1
 
+# ── 11rs. PHASE 2: THE PRODUCTION LIVE RANDOM STREAM (the mission's ────
+# --random-stream directive). A seedable splitmix64 ITCH 5.0 synthesizer
+# (nf_testkit::randomstream) generates an unseen, non-repeating tape
+# (order lifecycle, price walks, weighted A/E/C/X/D/U), and the FULL
+# pipeline runs it with EVERY content-bound elision disarmed
+# (SIG_FABRIC=0, RES_REPLAY=0, PASS_REPLAY=0, RXDESC=0, CALL_FUSION=0 —
+# the bin's own defaults): the workers live-walk every span reading and
+# CRC-verifying every payload byte, the main core live-scans every
+# batch. THE ORACLE: the sequential SpanConformanceSink reference vs
+# the hydra fabric — BIT-EXACT on ARBITRARY data — and every pass's
+# harvested tuple must reproduce it. THE TELEMETRY: the sustained live
+# rate + the per-group latency tail (P50/P99/P99.99 — the engine's
+# real-time processing quantum) + best-effort perf_event_open cache
+# miss counters (perf=unavailable on sandboxed runners — zeroed
+# gracefully). The seed is pinned for reproducibility; HFT_RANDOM_SEED
+# sweeps it.
+cargo run --release -p nf-engine --bin bench_random_stream 2>&1 | tee /tmp/bench_rs.txt
+grep -q "RANDOM_STREAM_PARITY.*-> BIT-EXACT" /tmp/bench_rs.txt
+grep -q "allocs=0" /tmp/bench_rs.txt
+grep -q "PR1_RANDOM_STREAM_VERDICT rate=" /tmp/bench_rs.txt
+grep -q "PR1_RANDOM_STREAM_VERDICT.*elisions=none" /tmp/bench_rs.txt
+grep "PR1_RANDOM_STREAM_VERDICT" /tmp/bench_rs.txt | head -1
+grep "RANDOM_STREAM_TAIL" /tmp/bench_rs.txt | head -1
+
 # ── 11r36r. R36-B: the re-anchor rollback (the attribution arm) ──────
 # HFT_REANCHOR=0 restores the full per-pass sequencer construction
 # (the 64 KiB arena zero + copy — the PR #20 boundary shape): the
