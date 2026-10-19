@@ -1381,6 +1381,25 @@ pub struct WorkerStats {
     /// R36-E: passes walked live (the recording orbit, the fallbacks,
     /// the rollback/audit shapes).
     pub res_live: AtomicU64,
+    /// R39a: LAYER-1 guard fires — the segment capacity law's defensive
+    /// mid-chunk flushes (the SegAcc held 64 spans at a push boundary;
+    /// the flush is a LEGAL extra segment split — the composition law
+    /// is exact for every k — so the counter is telemetry, never a
+    /// failure). Steady state: 0. Non-zero on a run = the residual
+    /// cursor-discipline family (docs/49 §8) fired and was CONTAINED.
+    pub seg_guards: AtomicU64,
+    /// R39a: LAYER-2 guard fires — the chunk-cursor containment resyncs
+    /// (the eval cursor left [chunk_lo, chunk_lo+CHUNK] between walk
+    /// entries; the cursors re-derived positionally via `fallback_grid`).
+    /// Steady state: 0 (the legal boundary case eval == chunk_lo+CHUNK
+    /// is handled by the normal path, not the resync).
+    pub cursor_resyncs: AtomicU64,
+    /// R39a: LAYER-3 guard fires — the record-window snaps (the adopted
+    /// record's base sits AHEAD of the eval cursor: the record stream
+    /// jumped over a mid-chunk publish-split hole — an inline-claimed
+    /// remainder — and the skipped spans are NOT this lane's to
+    /// evaluate; the cursor snaps to the record's base). Steady state: 0.
+    pub record_snaps: AtomicU64,
     /// This worker's pinned cpu (usize::MAX when unpinned).
     pub cpu: AtomicU64,
 }
@@ -1404,6 +1423,9 @@ impl WorkerStats {
             res_recs: AtomicU64::new(0),
             res_fb: AtomicU64::new(0),
             res_live: AtomicU64::new(0),
+            seg_guards: AtomicU64::new(0),
+            cursor_resyncs: AtomicU64::new(0),
+            record_snaps: AtomicU64::new(0),
             cpu: AtomicU64::new(u64::MAX),
         }
     }
@@ -2075,6 +2097,15 @@ fn lane_worker_rxdesc(
                 // R25a: composite mode buffers the term (per-span mode
                 // emits the R23 shape verbatim — the rollback).
                 if composite {
+                    // R39a LAYER 1 (the scalar face, the pre-diet twin):
+                    // the capacity law — a full buffer flushes FIRST (the
+                    // legal extra split; the composition law is exact for
+                    // every k). This worker has no ResLog (the pre-R36-E
+                    // shape), so the flush emits without the capture.
+                    if seg.len == 64 {
+                        let _ = seg.flush(res_slots, rhead, &mut nres);
+                        stats.seg_guards.fetch_add(1, Ordering::Relaxed);
+                    }
                     seg.push(gid, value);
                 } else {
                     res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
@@ -3025,6 +3056,53 @@ fn lane_worker_rxdesc_diet(
                     continue 'batch;
                 }
             }
+            // R39a: THE WALK-ENTRY GUARD LAWS (the Shard-28 SegAcc
+            // family's closure — docs/49 §8's census: "the chunk cursors
+            // desyncing behind gid, the chunk-end flush missing, the seg
+            // growing unbounded", exposed by the two-lane shape's
+            // record-adoption interleavings at ~2.5%/shard on the fleet).
+            // Three position-derived, self-correcting invariants checked
+            // at the single choke point every walk entry passes through.
+            // Steady state: all three are no-ops (two register compares
+            // on locals); a fire is CONTAINMENT, never a behavior change
+            // on a healthy stream — each guard restores the invariant
+            // the walk's own discipline already assumes.
+            //
+            // LAYER 3 — THE RECORD-WINDOW SNAP: the adopted record's base
+            // sits AHEAD of the eval cursor (the emission gate's
+            // exhausted-script crossings adopt at `pending = next_wb`,
+            // which the multi-lane gap can hold BEYOND the cursor; the
+            // walk's `idx = eval - rec_base` would then WRAP to a huge
+            // usize and read the arrays out of bounds — the 16-span
+            // mid-chunk publish-split hole of the R37c census is this
+            // face's geometry). The skipped spans belong to NO record
+            // this lane can evaluate (an inline-claimed remainder or a
+            // foreign window): the only sound position is the record's
+            // own base.
+            if eval < rec_base {
+                stats
+                    .record_snaps
+                    .fetch_add(rec_base - eval, Ordering::Relaxed);
+                eval = rec_base;
+            }
+            // LAYER 2 — THE CURSOR CONTAINMENT RESYNC: the eval cursor
+            // must sit inside [chunk_lo, chunk_lo + CHUNK] (the closed
+            // end is the LEGAL fully-consumed boundary the chunk-end
+            // flush below owns). The replay emission can advance eval by
+            // whole passes while chunk_lo stays put; a desynced-behind
+            // chunk_lo silently DISABLES the chunk-end flush (gid never
+            // equals chunk_lo + CHUNK again) and the segment accumulator
+            // grows past its 64-span law — the SegAcc::push8 overflow
+            // verbatim. The resync is `fallback_grid`'s position law
+            // (drift-impossible by construction): the lane's own chunk
+            // at-or-above the cursor, the cursor clamped up to it.
+            if eval < chunk_lo || eval > chunk_lo + CHUNK {
+                let (lo, ws) = fallback_grid(eval, lane_idx, n_lanes);
+                chunk_id = ws / CHUNK;
+                chunk_lo = lo;
+                eval = ws;
+                stats.cursor_resyncs.fetch_add(1, Ordering::Relaxed);
+            }
             let chunk_hi = (chunk_lo + CHUNK).min(ready);
             let mut gid = eval;
             let mut idx = (eval - rec_base) as usize;
@@ -3125,6 +3203,27 @@ fn lane_worker_rxdesc_diet(
                         // spans per 64 B of sidecar traffic.
                         let v8 = rx.get_values8(arr_slot, idx);
                         if composite {
+                            // R39a LAYER 1 — THE SEGMENT CAPACITY LAW: the
+                            // group may never push past the 64-span law
+                            // (the SegAcc overflow's panic face, Shard 28:
+                            // `index out of bounds: the len is 0 but the
+                            // index is 0` — a full buffer at push8). The
+                            // pre-push flush is a LEGAL extra segment
+                            // boundary: the composition law is exact for
+                            // every k (the R25a split law), so the fold's
+                            // result is bit-identical — the guard converts
+                            // the latent overflow into an extra record and
+                            // a telemetry counter, never a wrong answer.
+                            if seg.len + 8 > 64 {
+                                if let Some((first, k, b)) =
+                                    seg.flush(res_slots, rhead, &mut nres)
+                                {
+                                    reslog.push_seg(first, k, b);
+                                }
+                                stats
+                                    .seg_guards
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             seg.push8(gid, &v8);
                         } else {
                             for k in 0usize..8 {
@@ -3258,6 +3357,19 @@ fn lane_worker_rxdesc_diet(
                 // at the flush points) — per-span mode emits the R23
                 // shape verbatim (the HFT_COMPOSITE_FOLD=0 rollback).
                 if composite {
+                    // R39a LAYER 1 (the scalar face): the same capacity
+                    // law as the group path — a full buffer flushes FIRST
+                    // (a legal extra segment split; the composition law
+                    // is exact for every k, so the fold's result is
+                    // bit-identical — see the group path's comment).
+                    if seg.len == 64 {
+                        if let Some((first, k, b)) =
+                            seg.flush(res_slots, rhead, &mut nres)
+                        {
+                            reslog.push_seg(first, k, b);
+                        }
+                        stats.seg_guards.fetch_add(1, Ordering::Relaxed);
+                    }
                     seg.push(gid, value);
                 } else {
                     res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
@@ -3621,7 +3733,7 @@ impl HydraFabric {
             };
             let placement = &self.worker_cpus;
             eprintln!(
-                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1} res_replays={} res_recs={} res_fb={} res_live={}",
+                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1} res_replays={} res_recs={} res_fb={} res_live={} seg_guards={} cursor_resyncs={} record_snaps={}",
                 ws.batches.load(Ordering::Relaxed),
                 ws.spans.load(Ordering::Relaxed),
                 ws.eval_ns.load(Ordering::Relaxed) as f64 / 1e6,
@@ -3636,6 +3748,9 @@ impl HydraFabric {
                 ws.res_recs.load(Ordering::Relaxed),
                 ws.res_fb.load(Ordering::Relaxed),
                 ws.res_live.load(Ordering::Relaxed),
+                ws.seg_guards.load(Ordering::Relaxed),
+                ws.cursor_resyncs.load(Ordering::Relaxed),
+                ws.record_snaps.load(Ordering::Relaxed),
             );
         }
         // R35-B: the 𝒜₅.₀ fabric's engagement line (always printed —
@@ -10176,6 +10291,146 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// R39a: THE SEGMENT CAPACITY LAW'S COMPOSITION EXACTNESS — the
+    /// Shard-28 SegAcc::push8 overflow's guard (the len-0-index-0 panic
+    /// face) works by flushing the in-flight segment BEFORE a push that
+    /// would cross the 64-span law. The flush is legal IFF an extra
+    /// segment boundary is composition-exact: the split chain's
+    /// concatenated application must equal the unsplit application for
+    /// every split point. This cell pins that law directly on SegAcc
+    /// through the public flush surface (the walk's own emission path).
+    #[test]
+    fn t_r39a_segacc_capacity_composition_law() {
+        // Deterministic value stream (the spans' raw values).
+        let vals: Vec<u64> = (0..131u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        // The consumer's application of a composite record (k, B) —
+        // the REAL surface (`sink::fold_compose_apply`), not a local
+        // re-implementation: the split chain must compose against the
+        // consumer the walk actually feeds.
+        use crate::sink::{fold_compose_apply as apply, fold_compose_b, fold_term};
+        let mut slots = [Res {
+            span_id: 0,
+            aux: 0,
+            value: 0,
+        }; RES_CAP];
+        // THE UNSPLIT REFERENCE: the whole stream as ONE 131-span
+        // composite. A 131-span segment is structurally beyond SegAcc's
+        // 64-slot buffer (the 64-span law) — so the reference is the
+        // ALGEBRA's own closed form, `fold_compose_b` over the full
+        // premultiplied term stream (the same compose `flush` runs, on
+        // an unbounded slice): the composition law the guard relies on
+        // is exact for EVERY k, not just k ≤ 64, and this is the k=131
+        // witness.
+        let terms: Vec<u64> = vals.iter().map(|&v| fold_term(v)).collect();
+        let k_w: u32 = 131;
+        let b_w = fold_compose_b(&terms);
+        // THE GUARD'S SPLIT CHAIN: the walk's capacity law — a full
+        // buffer flushes FIRST (the extra boundary), the push lands in
+        // the fresh segment.
+        let mut recs: Vec<(u32, u64)> = Vec::new();
+        let mut acc = SegAcc::new();
+        for (i, v) in vals.iter().enumerate() {
+            if acc.len == 64 {
+                if let Some((_, k, b)) = acc.flush(&mut slots, 0, &mut 0) {
+                    recs.push((k, b));
+                }
+            }
+            acc.push(i as u64, *v);
+            assert!(acc.len <= 64, "the raw push crossed the 64-span law");
+        }
+        if let Some((_, k, b)) = acc.flush(&mut slots, 0, &mut 0) {
+            recs.push((k, b));
+        }
+        // THE LAW: the split chain composes to the unsplit application.
+        let h_split = recs.iter().fold(0u64, |h, (k, b)| apply(h, *k, *b));
+        let h_whole = apply(0, k_w, b_w);
+        assert_eq!(h_split, h_whole, "the capacity split broke composition");
+        // The splits tile exactly, each within the 64-span law.
+        let mut seen = 0u32;
+        for (k, _) in &recs {
+            assert!(*k <= 64, "a segment exceeded the 64-span law: k={k}");
+            seen += k;
+        }
+        assert_eq!(seen, 131, "the splits must tile the stream exactly");
+        // The push8 face: a full buffer + a group push must flush first
+        // (the Shard-28 geometry: 64 buffered, the group arrives).
+        let mut acc8 = SegAcc::new();
+        for i in 0usize..8 {
+            acc8.push8((i as u64) * 8, &[vals[i * 8]; 8]);
+        }
+        assert_eq!(acc8.len, 64, "eight groups must fill the buffer exactly");
+        if acc8.len + 8 > 64 {
+            if let Some((_, k, b)) = acc8.flush(&mut slots, 0, &mut 0) {
+                recs.push((k, b));
+            }
+        }
+        acc8.push8(512, &[7u64; 8]);
+        assert_eq!(acc8.len, 8, "the guarded group push lands post-flush");
+    }
+
+    /// R39a: THE WALK-ENTRY GUARD LAWS — the containment predicate and
+    /// the record-window snap, unit-level. LAYER 2: the eval cursor must
+    /// sit in [chunk_lo, chunk_lo+CHUNK] at every walk entry (the closed
+    /// end is the chunk-end flush's legal state); a violation resyncs
+    /// positionally via fallback_grid — the resync output must (a) satisfy
+    /// the containment predicate, (b) never move backward, (c) land on
+    /// the lane's own grid. LAYER 3: eval below the adopted record's base
+    /// snaps forward to it (the mid-chunk publish-split hole's spans are
+    /// not this lane's to evaluate).
+    #[test]
+    fn t_r39a_walk_entry_guard_laws() {
+        // LAYER 2 — the containment + resync law across lane shapes.
+        for n_lanes in [1u64, 2, 3, 4] {
+            for lane_idx in 0..n_lanes {
+                let own0 = lane_idx * CHUNK;
+                // The desync faces: eval far AHEAD of a stale chunk_lo
+                // (the emission advanced by several own chunks), and a
+                // mid-chunk ahead position.
+                for eval in [
+                    own0 + 5 * n_lanes * CHUNK,
+                    own0,
+                    own0 + 3 * n_lanes * CHUNK + 17,
+                ] {
+                    let chunk_lo = own0; // the stale cursor
+                    let contained = eval >= chunk_lo && eval <= chunk_lo + CHUNK;
+                    if !contained {
+                        let (lo, ws) = fallback_grid(eval, lane_idx, n_lanes);
+                        // (a) the output is contained.
+                        assert!(
+                            ws >= lo && ws <= lo + CHUNK,
+                            "resync output not contained: eval {eval} -> lo {lo} ws {ws}"
+                        );
+                        // (b) never backward.
+                        assert!(ws >= eval, "resync moved backward: {eval} -> {ws}");
+                        // (c) the lane's own grid.
+                        assert_eq!(
+                            (lo / CHUNK) % n_lanes,
+                            lane_idx,
+                            "resync left the lane grid: lo {lo} lane {lane_idx}/{n_lanes}"
+                        );
+                    }
+                }
+                // The legal boundary state (eval == chunk_lo + CHUNK) is
+                // CONTAINED — the chunk-end flush owns it, never resync.
+                let lo = lane_idx * CHUNK;
+                let eval = lo + CHUNK;
+                assert!(eval >= lo && eval <= lo + CHUNK);
+            }
+        }
+        // LAYER 3 — the record snap: eval below the record's base snaps
+        // forward; eval at-or-above never moves (the predicate the walk
+        // applies verbatim).
+        for (eval, rec_base) in [(0u64, 0u64), (5, 5), (5, 21), (64, 128), (100, 64)] {
+            let snapped = eval.max(rec_base);
+            assert!(snapped >= rec_base, "the snap must clear the record base");
+            assert!(snapped >= eval, "the snap must never move backward");
+            assert!(
+                snapped == eval || eval < rec_base,
+                "a snap may only fire when eval < rec_base"
+            );
         }
     }
 
