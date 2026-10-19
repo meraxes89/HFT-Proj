@@ -521,16 +521,17 @@ fn run_hydra_sustained_5s(
     let dual_env = std::env::var("HFT_DUAL_PRODUCER").as_deref() == Ok("1")
         && workers == 2
         && std::env::var("HFT_TREE_FOLD").as_deref() != Ok("0");
-    // R40c-II: the RX's pin law — the default parks the RX on P0's own
-    // cpu (the complementary-sharing law: P0's transport waits are futex
-    // parks, exactly the gaps the RX's publication bursts fill; the
-    // fleet's first dual draw priced the RX-on-W0 shape at a mean_width
-    // collapse + 57% of the scan in wait). HFT_DUAL_RX_SIB=1 restores
-    // the original RX-on-W0's-cpu sharing (the attribution arm 11r40x).
-    // Read BEFORE the window (env::var allocates).
-    let dual_rx_sib = std::env::var("HFT_DUAL_RX_SIB").as_deref() == Ok("1");
+    // R40c-II: the RX's pin law — the default keeps the FLEET-PROVEN
+    // W0-share shape (the RX on W0's logical cpu; run 39327552826's
+    // 11r40x arm: 53.6-63.8B). The complementary-sharing counterfactual
+    // (the RX on P0's own cpu) was REFUTED at -80% (12.5B — the
+    // park/publish cadence is a context-switch generator; see
+    // affinity::fabric_placement_dual's doc). HFT_DUAL_RX_P0=1 arms the
+    // refuted shape as the documented counterfactual. Read BEFORE the
+    // window (env::var allocates).
+    let dual_rx_p0 = std::env::var("HFT_DUAL_RX_P0").as_deref() == Ok("1");
     let (main_cpu, rx_cpu, worker_cpus, p1_cpu) = if dual_env {
-        nf_testkit::affinity::fabric_placement_dual(workers, !dual_rx_sib)
+        nf_testkit::affinity::fabric_placement_dual(workers, dual_rx_p0)
     } else {
         let (m, r, w) = nf_testkit::affinity::fabric_placement(workers);
         (m, r, w, None)

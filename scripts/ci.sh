@@ -1193,19 +1193,16 @@ grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r40r.txt
 grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r40r.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r40r.txt | tail -1
 
-# ── 11r40x. R40c-II: the RX-pin attribution (the complementary-share's ──
-# counterfactual). HFT_DUAL_RX_SIB=1 restores the fleet's FIRST dual
-# shape — the RX sharing W0's logical cpu — whose telemetry (run
-# 39257999925) showed the degradation chain: W0's res-ring backpressure
-# yield-storm stacked the RX's publication latency, P0's group sweep
-# collapsed to mean_width 1.78, wait_ms ate 57% of the scan, and the
-# completion-pace cascade throttled the rendezvous to the mono's own
-# cadence. The same-draw delta 11r40 - 11r40x prices the
-# complementary-sharing law (the RX on P0's cpu — P0's futex parks are
-# exactly the gaps the RX's publication bursts fill; W0/W1 own their
-# logical cpus outright). BIT-EXACT and allocs=0 on BOTH arms (the pin
-# changes no byte of the protocol).
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 HFT_DUAL_RX_SIB=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40x.txt
+# ── 11r40x. R40c-II: the RX-pin counterfactual (THE FLEET'S REFUTATION, ──
+# kept armed as documentation). HFT_DUAL_RX_P0=1 pins the RX on P0's
+# own logical cpu — the complementary-sharing hypothesis run 39327552826
+# REFUTED at -80% (12.5B vs the default W0-share's 60.3B on the same
+# draws): the park/publish cadence at per-batch granularity is a
+# context-switch generator (the DIAG decomposition: wait_ms=91 but
+# work_ms=4138 — P0 preempted mid-member-loop ~350K times by the RX's
+# publication bursts). The arm stays in the matrix so the fleet keeps
+# pricing the counterfactual against the default's evolution.
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 HFT_DUAL_RX_P0=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40x.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40x.txt
 grep -q "allocs=0" /tmp/bench_r40x.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40x.txt
@@ -1213,6 +1210,25 @@ grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*attached=true" /tmp/bench_r40x.txt
 grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40x.txt
 grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40x.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r40x.txt | tail -1
+
+# ── 11r40k. R40c-III: THE DUAL AT THE PER-BATCH CADENCE (the k=1 stack ──
+# candidate). Run 39327552826's r39r arm (the mono k=1 rollback) posted
+# the run's best draws (61.7-74.6B — the grouped-consume k=8 path
+# carries a per-batch work regression on this build: 148ns/batch vs 62
+# at k=1); the dual's P0-offload (+5-9% same-draw over its mono
+# rollback) should STACK with the k=1 cadence's +15-24%. The arm runs
+# the dual at HFT_BATCH_GROUP=1 — the same-draw delta vs 11r40 (the
+# k=8 dual) prices the cadence's contribution inside the split; the
+# delta vs 11r39r (the mono k=1) prices the split's contribution at the
+# k=1 cadence. BIT-EXACT + allocs=0 as ever.
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 HFT_BATCH_GROUP=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40k.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40k.txt
+grep -q "allocs=0" /tmp/bench_r40k.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40k.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*attached=true" /tmp/bench_r40k.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40k.txt
+grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40k.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r40k.txt | tail -1
 
 # ── 11rs. PHASE 2: THE PRODUCTION LIVE RANDOM STREAM (the mission's ────
 # --random-stream directive). A seedable splitmix64 ITCH 5.0 synthesizer
