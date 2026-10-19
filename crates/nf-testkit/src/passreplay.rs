@@ -63,7 +63,7 @@ use nf_transport::pipeline::PipelinedReplayTransport;
 /// of magnitude below; per-message sinks (`wants_spans() == false`)
 /// overflow [`MAX_CALLS`] immediately and degrade to the live scan —
 /// correct by construction, the ledger is the packed/span shape's lever).
-const MAX_BATCHES: usize = 2048;
+pub(crate) const MAX_BATCHES: usize = 2048;
 const MAX_CALLS: usize = 16_384;
 const MAX_WORDS: usize = 262_144;
 const MAX_RECS: usize = 16_384;
@@ -170,6 +170,17 @@ pub struct PassReplay {
     live_batches: u64,
     replayed_passes: u64,
     re_records: u64,
+    /// R40c: THE SCRIPT-CLEAN TRACKING — the master version snapshot at
+    /// this pass's begin_pass and the verdict at its note_pass_end. A
+    /// pass is CLEAN when the version never moved (no mid-pass
+    /// truncation/re-record) — the template at the pass end represents
+    /// EXACTLY that pass. Arming on an UNCLEAN template (the poison
+    /// cell's catch: a mid-pass master bump truncates the template and
+    /// re-records the tail — 17 batches, 8432 spans vs the steady 22 /
+    /// 10992) builds P1's script on a partial pass grid: every per-pass
+    /// target drifts and P1 chases phantom boundaries forever.
+    pass_start_version: u64,
+    last_pass_clean: bool,
     /// R36-E: the call-fusion arm (`HFT_CALL_FUSION` — default ON; read
     /// once at construction, outside every measured window).
     fusion: bool,
@@ -221,6 +232,8 @@ impl PassReplay {
             live_batches: 0,
             replayed_passes: 0,
             re_records: 0,
+            pass_start_version: 0,
+            last_pass_clean: false,
             fusion: std::env::var("HFT_CALL_FUSION").as_deref() != Ok("0"),
             fused_calls: 0,
             fusion_barrier: true,
@@ -336,6 +349,8 @@ impl PassReplay {
         self.pass_batch_idx = 0;
         self.pass_live = 0;
         self.recording = None;
+        // R40c: the clean tracking's per-pass snapshot.
+        self.pass_start_version = self.version;
         // R36-E: the bracket barrier — this pass's calls may not fuse
         // into the previous pass's tail (the emission-order law 4).
         self.fusion_barrier = true;
@@ -500,6 +515,76 @@ impl PassReplay {
         if self.pass_batch_idx > 0 && self.pass_live == 0 {
             self.replayed_passes += 1;
         }
+        // R40c: the clean verdict — the version stable through the pass
+        // AND the template non-empty (a first-live pass fills it — also
+        // clean; a truncated-then-rerecorded pass is NOT: the version
+        // moved mid-pass, the template is the partial tail).
+        self.last_pass_clean = self.version == self.pass_start_version && !self.batches.is_empty();
+    }
+
+    /// R40c: THE PERMANENT LIVE MODE — the harness's poison hook's
+    /// companion. A mid-pass regime break (the dual's poison: a foreign
+    /// master write truncated the template mid-pass) leaves the template
+    /// as the poison pass's TAIL (the re-record starts at the failing
+    /// batch — batch 5's rx_start, not batch 0's); the NEXT pass's
+    /// replay would hit Guard 3's bounds assert (a structurally broken
+    /// template, never a graceful false). The poison flag short-circuits
+    /// try_replay forever (the live scan is the permanent path — the
+    /// production fallback's law), exactly as the capacity poison does.
+    pub fn poison_permanent(&mut self) {
+        self.poison = true;
+        self.batches.clear();
+        self.calls.clear();
+        self.words.clear();
+        self.recs.clear();
+        self.last_pass_clean = false;
+    }
+
+    /// R40c: whether the LAST COMPLETED pass ran clean (no mid-pass
+    /// master-version move) — the arm's script-integrity gate. Arming
+    /// on an unclean template binds P1's pass grid to a partial
+    /// recording (the phantom-boundary drift).
+    pub fn dual_script_clean(&self) -> bool {
+        self.last_pass_clean
+    }
+
+    /// R40: the ledger template's batch count (the arm's readiness
+    /// operand + the script build's extent).
+    pub fn dual_batch_count(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// R40: one batch's script data — `(p1_total, pass_spans)`:
+    /// `p1_total` sums the PACKED calls' message totals (P1's count
+    /// share — the suppressed dispatch surface; the `Span`/`SpanBatch`
+    /// calls re-issue UNSUPPRESSED on P0's sink, so their message
+    /// counts stay P0's), while `pass_spans` sums EVERY
+    /// span-advancing call's spans (`Packed.n` + one per `Span` + `n`
+    /// per `SpanBatch` — the SS cursor advance runs in all three
+    /// submit paths, so the drain-target arithmetic must count them
+    /// all; the mini tape's steady pass carries one lone `Span` — the
+    /// off-by-one the t_r40_parity cell caught).
+    pub fn dual_batch_summary(&self, idx: usize) -> (u64, u32) {
+        let mut total = 0u64;
+        let mut spans = 0u32;
+        if let Some(b) = self.batches.get(idx) {
+            for c in &self.calls[b.call_lo as usize..b.call_hi as usize] {
+                match c {
+                    Call::Packed { total: t, n, .. } => {
+                        total += t;
+                        spans += *n;
+                    }
+                    Call::Span { .. } => {
+                        spans += 1;
+                    }
+                    Call::SpanBatch { n, .. } => {
+                        spans += *n;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (total, spans)
     }
 
     /// Re-issue one recorded call to the live sink.

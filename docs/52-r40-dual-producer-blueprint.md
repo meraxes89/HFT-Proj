@@ -217,3 +217,59 @@ the worker plane to the producer plane.
   99.998% regime is the windfall R40 spends, not a surface it touches).
 - No ring protocol changes: the SPSC descriptor/res rings keep their
   laws; R40 only narrows each ring to one producer-consumer SMT pair.
+
+## 7. The R40c hardening — the eight laws the parity cells caught
+
+The implementation's own cells (t_r40_parity_dual_vs_refs at 40 passes,
+t_r40_poison_fallback_parity at 24 with the arm+4 mid-pass poison) caught
+eight real bugs before any silicon saw the split. Each is pinned here
+because every one of them is a LAW the next design must inherit.
+
+1. **The lazy law is the drain's own invariant, not the mono's.** The
+   lane-0 drain may journal leaves past an unretired boundary (a lagging
+   P1 defers the completion at the arrival gate while P0 never blocks).
+   The position-keyed merge makes this sound: `partition_len` /
+   `retire_upto` cut journal_0 exactly at the boundary. A record that
+   STARTS at or past `end_span` belongs to a later pass; only a true
+   straddle (`fold_pos < end_span < fold_pos + k`) is a violation.
+2. **The clean shutdown is a sweep, not a word.** P1's exit drains its
+   remaining lane-1 territory to the submission frontier
+   (`initiate_shutdown(frontier)` — the end stored before the word),
+   publishing each pass's arrival from the script's totals, and only
+   then posts `p1_done`. A bare exit freezes the cursor mid-stream and
+   hangs P0's finish on `dual_lanes_past`. The arrival publishes ONLY
+   on a complete drain — an arrival with a short cursor is a lie that
+   composes an incomplete leaf set.
+3. **The phantom pass.** P1's ring-id grid runs one ahead of P0's
+   driven passes at the tail; the pass beyond the frontier targets
+   records that never exist. The mid-drain re-cap (observing the word
+   inside the drain loop) closes the race the top-of-loop check misses.
+4. **The arrival ring must exceed the push gate's lead bound.** The
+   gate parks P1 at ~21 passes of j1 lead; a 16-slot ring laps. 64
+   slots = 3× the bound.
+5. **The arm requires the claim-free edge.** The arm closes the assist
+   valve; an outstanding inline claim orphans (the suppressed odd
+   batches never evaluate it, the entry never seals, the lane-0 drain
+   parks on the stale mark forever). The gate: `fold_pos == next_span`
+   (which also makes the pass-grid anchor exact) and no mark at the
+   cursor chunk.
+6. **The journal must cover the deferral bound.** The lazy law
+   legitimately holds ~22 passes of live leaves; a capacity flush
+   across pending boundaries contaminates every pending snapshot.
+   FJ_CAP 8192 = 3× the bound.
+7. **The arm requires a clean template.** A mid-pass master bump
+   truncates the ledger to the pass's tail; arming on it binds P1 to a
+   partial grid (the phantom-boundary drift). The poison hook also
+   takes the ledger's permanent live mode — the truncated template is
+   structurally unreplayable.
+8. **The count is script-direct.** The poison pass's P1 contribution
+   is exactly the suppressed odd batches [0, pb) per the SCRIPT (the
+   frozen schedule), independent of P1's racing progress; the armed
+   pre-poison window gets the script's full odd total; pre-arm and
+   post-poison passes get zero. The old `count_1 −
+   odd_totals_before(pb)` inverted the overlap in both directions.
+
+**The staging**: the champion arm stays the proven single-producer
+record shape on this push; 11r40 (the armed split) and 11r40r (the
+rollback) price the rate on the fleet's silicon. The champion flips on
+the next push with both arms' numbers on the table.

@@ -508,11 +508,36 @@ fn run_hydra_sustained_5s(
             workers = n.max(1);
         }
     }
-    let (main_cpu, rx_cpu, worker_cpus) = nf_testkit::affinity::fabric_placement(workers);
+    // R40: THE DUAL-PRODUCER SPLIT (docs/52 — Champion-4T). The env
+    // gate is read BEFORE the window (the discipline); the placement
+    // inverts the ownership — P0 and P1 take the two physical cores'
+    // representatives, the workers their SMT siblings, the RX shares
+    // W0's cpu (the coherence dividend: every ring handoff becomes
+    // same-physical-core). HFT_DUAL_PRODUCER=0 (the default) keeps the
+    // proven distinct placement and never spawns P1 — the mono loop
+    // verbatim. The split also REQUIRES the tree journal (the merged
+    // two-lane flush is the only sound compose; HFT_TREE_FOLD=0 is the
+    // serial rollback — its call-order compose cannot take the merge).
+    let dual_env = std::env::var("HFT_DUAL_PRODUCER").as_deref() == Ok("1")
+        && workers == 2
+        && std::env::var("HFT_TREE_FOLD").as_deref() != Ok("0");
+    let (main_cpu, rx_cpu, worker_cpus, p1_cpu) = if dual_env {
+        nf_testkit::affinity::fabric_placement_dual(workers)
+    } else {
+        let (m, r, w) = nf_testkit::affinity::fabric_placement(workers);
+        (m, r, w, None)
+    };
+    // The dual arms only where the topology gave P1 a core.
+    let dual_env = dual_env && p1_cpu.is_some();
     if let Some(c) = main_cpu {
         let _ = nf_testkit::affinity::pin_current_to(c);
     }
     let fabric = nf_testkit::hydra::HydraFabric::spawn_pinned(workers, &worker_cpus);
+    // R40: P1 borrows the fabric for the run's life — the sustained
+    // arm is a one-shot per process (the verdicts print, main
+    // returns, the exit reaps the threads), so the box LEAKS and the
+    // fabric's own post-verdict Drop-join is subsumed by the exit.
+    let fabric: &'static nf_testkit::hydra::HydraFabric = Box::leak(fabric);
     let mut total_msgs = 0u64;
     let mut session_counter = 1000u64;
     // R23c: the affine-arm attach — same law as the burst arm (the
@@ -552,7 +577,7 @@ fn run_hydra_sustained_5s(
         transport.set_rxdesc(st);
     }
     let mut seq = Sequencer::new();
-    let mut sink = nf_testkit::hydra::HydraSpanSink::new(&fabric);
+    let mut sink = nf_testkit::hydra::HydraSpanSink::new(fabric);
 
     // R12: the vectorized watermark ladder (startup detection — outside
     // every measurement window; HFT_VEC_LADDER=0 is the rollback).
@@ -564,6 +589,25 @@ fn run_hydra_sustained_5s(
     // only under the frozen-master regime (rxbuild + session elision).
     // HFT_PASS_REPLAY=0 is the rollback (the live scan verbatim).
     let mut pass_replay = nf_testkit::passreplay::PassReplay::new();
+
+    // R40: THE DUAL-PRODUCER GATE + P1. The gate is built OUTSIDE the
+    // window (the allocs=0 law); P1 idles on the armed word (its own
+    // core — the pre-arm spin is PAUSE-hinted and bounded by the SS
+    // regime's ~4-pass proof) until the harness arms at a pass top.
+    // The engine, the arrival protocol, and the poison law live in
+    // nf_testkit::dual (docs/52's structural split; the cells:
+    // t_r40_*).
+    let gate: Option<std::sync::Arc<nf_testkit::dual::DualGate>> = if dual_env {
+        Some(nf_testkit::dual::DualGate::new())
+    } else {
+        None
+    };
+    let mut dual_armed = false;
+    if let Some(g) = &gate {
+        let gg = std::sync::Arc::clone(g);
+        let cpu = p1_cpu;
+        std::thread::spawn(move || nf_testkit::dual::lane1_run(&gg, fabric, cpu));
+    }
 
     // Untimed reference pass pins the per-pass tuple (identical bytes every
     // pass; only the session id changes, which cannot affect the tuple).
@@ -583,7 +627,7 @@ fn run_hydra_sustained_5s(
     let ref_tuple = {
         transport.reset_pass(1, initial_sess);
         *seq = Sequencer::new_unboxed();
-        let mut ref_sink = nf_testkit::hydra::HydraSpanSink::new(&fabric);
+        let mut ref_sink = nf_testkit::hydra::HydraSpanSink::new(fabric);
         ref_sink.begin_pass();
         while transport.next_batch() {
             seq.ingest_entries_ladder(transport.entries(), transport.now_ns(), &mut ref_sink, ladder);
@@ -718,6 +762,27 @@ fn run_hydra_sustained_5s(
         session_counter += 1;
         pass += 1;
 
+        // R40: THE ARM — the SS regime's proof (≥3 self-serve windows,
+        // the toroidal steady epoch) + a complete ledger template arm
+        // the split at the pass top. The ORDER LAW: P1's cursors are
+        // computed from the MONO fold position BEFORE `dual_arm`
+        // reprojects the sink's own cursor onto lane 0.
+        if !dual_armed {
+            if let Some(g) = &gate {
+                if sink.dual_arm_ready_ss(3) && pass_replay.dual_batch_count() > 0 {
+                    let n = pass_replay.dual_batch_count();
+                    let f1_init = sink.dual_fold_pos_1_init();
+                    let rt1 = sink.dual_res_tail_1_init(fabric);
+                    let pbase = sink.dual_pass_base_at_arm();
+                    g.fill_script(n, |i| pass_replay.dual_batch_summary(i));
+                    sink.dual_arm(std::sync::Arc::clone(g));
+                    let first = sink.dual_first_pass();
+                    g.arm(first, f1_init, rt1, pbase);
+                    dual_armed = true;
+                }
+            }
+        }
+
         let t_r = tsc_now();
         transport.reset_pass(pass, sess);
         let t_r1 = tsc_now();
@@ -756,6 +821,9 @@ fn run_hydra_sustained_5s(
         // verbatim, the order law is unchanged — only the batch-boundary
         // ceremony amortizes). group_k == 1 degenerates to the verbatim
         // per-batch cadence (the attribution arm's rollback).
+        // R40: the pass's batch counter (the dispatch parity's key —
+        // the LEDGER's batch sequence, not the group's local index).
+        let mut batch_in_pass = 0usize;
         loop {
             let t_w = tsc_now();
             let n = transport.next_group(group_k);
@@ -766,6 +834,16 @@ fn run_hydra_sustained_5s(
             let t_b = tsc_now();
             for j in 0..n {
                 transport.select_group_batch(j);
+                // R40: THE DISPATCH SPLIT — the odd batches' packed calls
+                // re-issue with the count/last-seq/G-INV SUPPRESSED (P1
+                // owns them from the script); the SS cursor arithmetic
+                // still runs (P0's next_span tracks the global frontier).
+                // The sink's own armed flag is the authority (it may
+                // have disarmed itself at begin_pass's non-SS poison —
+                // the local mirror lags that path).
+                if sink.dual_is_armed() {
+                    sink.set_p1_suppress(batch_in_pass & 1 == 1);
+                }
                 // R32: try the verdict replay first — a TRUE return means
                 // the frozen-master regime proved this batch is
                 // byte-identical to the recorded one and the recorded
@@ -774,6 +852,23 @@ fn run_hydra_sustained_5s(
                 // elided). FALSE = record/live-scan the batch through
                 // the tee.
                 if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
+                    // R40: THE POISON — the regime broke (a live re-scan):
+                    // publish the break point, disarm into the zombie
+                    // lane-split, and let the mono re-record proceed (the
+                    // script-direct count at the completion prices the
+                    // suppressed odd batches [0, pb) exactly).
+                    if sink.dual_is_armed() {
+                        if let Some(g) = &gate {
+                            g.set_poison(sink.dual_current_pass(), batch_in_pass as u64);
+                        }
+                        sink.dual_disarm_poison();
+                        // R40c: the ledger's permanent live mode — the
+                        // truncated template is structurally partial; a
+                        // later pass's replay would hit Guard 3's bounds
+                        // assert (fail-loud on a broken template).
+                        pass_replay.poison_permanent();
+                        dual_armed = false;
+                    }
                     pass_replay.begin_record(&transport, &seq);
                     {
                         let mut rec_sink = pass_replay.recorder(&mut sink);
@@ -786,6 +881,7 @@ fn run_hydra_sustained_5s(
                     }
                     pass_replay.seal_batch(&seq);
                 }
+                batch_in_pass += 1;
             }
             let t_i = tsc_now();
             sink.drain_ready();
@@ -814,6 +910,15 @@ fn run_hydra_sustained_5s(
     }
     // The single blocking drain of the whole run — INSIDE the window (the
     // last pass's verification is part of the measured work).
+    // R40c: the clean shutdown — the frontier FIRST (P1's exit SWEEP
+    // drains its remaining lane-1 territory to this end, publishing
+    // each pass's arrival from the script's totals, then posts
+    // p1_done — the finish's dual branch waits for exactly that; a
+    // bare shutdown word would freeze P1's cursor mid-stream and hang
+    // the finish on a lagging P1).
+    if let Some(g) = &gate {
+        g.initiate_shutdown(sink.submission_frontier());
+    }
     sink.finish();
     let n = sink.harvest_completed(&mut harvested);
     for rec in &harvested[..n] {
@@ -995,6 +1100,30 @@ fn run_hydra_sustained_5s(
         group_k,
         group_k > 1
     );
+    // R40: THE DUAL-PRODUCER SPLIT's verdict line — the structural
+    // split's pricing row (the engagement law: armed=true with
+    // armed_from > 0 and merges ≈ the dual passes; p1_batches ≈ half
+    // the ledger's batch count per dual pass; poison=false in the
+    // steady regime — any break falls to the zombie lane-split, the
+    // fail-safe that never silently corrupts). HFT_DUAL_PRODUCER=0 is
+    // the rollback (the mono loop verbatim, the proven placement).
+    if let Some(g) = &gate {
+        let (attached, _live, _passes, merges) = sink.dual_stats();
+        let poison = g.poison_at().is_some();
+        println!(
+            "PR1_R40_DUAL_PRODUCER_VERDICT rate={} attached={} armed_from={} merges={} p1_batches={} p1_records={} arrivals={} arrival_defers={} p1_parks={} poison={} (R40: the dual-producer split — P0's lane-0 drain + the suppressed odd-batch dispatch, P1's dedicated-core lane-1 engine, the position-keyed boundary merge of Theorem 23(b)'s static order; HFT_DUAL_PRODUCER=0 restores the mono loop verbatim)",
+            sustained_rate,
+            attached,
+            g.armed_from(),
+            merges,
+            g.p1_batches.load(std::sync::atomic::Ordering::Relaxed),
+            g.j1.records.load(std::sync::atomic::Ordering::Relaxed),
+            g.arrival_count(),
+            g.arrival_defers.load(std::sync::atomic::Ordering::Relaxed),
+            g.p1_parks.load(std::sync::atomic::Ordering::Relaxed),
+            poison
+        );
+    }
     // R33: the producer-side elision's verdict line — the publication-
     // schedule replay + the parked-flag wake-skip's pricing row. The
     // engagement law: sched_replays ~= publications - the recording

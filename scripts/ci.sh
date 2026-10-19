@@ -1140,6 +1140,59 @@ grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=false" /tmp/bench_r39r.txt
 grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r39r.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r39r.txt | tail -1
 
+# ── 11r40. R40c: THE DUAL-PRODUCER DISPATCH (Champion-4T, the armed ──
+# split). HFT_DUAL_PRODUCER=1 arms the second producer: P1's
+# dedicated-core lane-1 engine (the suppressed odd-batch dispatch's
+# script accounting + the drain into the shared leaf journal j1), P0's
+# lane-0 drain, and the position-keyed boundary merge (Theorem 23(b)'s
+# static order — the m-way law). THE R40c LAWS this fleet draw prices:
+# (1) THE ARM — the claim-free edge (fold_pos == next_span, no inline
+# mark at the cursor — the arm closes the assist valve; an outstanding
+# claim orphans and parks the lane-0 drain forever) + the script-clean
+# gate (never arm on a truncated template — the phantom-grid drift);
+# (2) THE SHUTDOWN SWEEP — P1 drains its remaining territory to the
+# frontier before p1_done (the finish's dual_lanes_past wait
+# terminates; a bare shutdown word froze the cursor and hung the
+# finish); (3) THE RATE — the single-thread submission ceiling's
+# breach: the same-draw delta vs 11r40r (the mono loop at the
+# identical shape) prices the split's contribution toward the 200B
+# corridor. The engagement law: armed_from > 0, p1_records > 0,
+# merges > 0, poison=false (any break falls to the zombie lane-split,
+# the fail-safe), BIT-EXACT, allocs=0.
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40.txt
+grep -q "allocs=0" /tmp/bench_r40.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40.txt
+grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=true" /tmp/bench_r40.txt
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r40.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT rate=" /tmp/bench_r40.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*attached=true" /tmp/bench_r40.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*armed_from=[1-9]" /tmp/bench_r40.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*merges=[1-9]" /tmp/bench_r40.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*p1_records=[1-9]" /tmp/bench_r40.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40.txt
+grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40.txt | head -1
+grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r40.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r40.txt | tail -1
+
+# ── 11r40r. R40c: the dual-producer rollback (the attribution arm) ──
+# HFT_DUAL_PRODUCER=0 (the default) restores the mono submission loop
+# verbatim — the proven distinct placement, no P1 spawn, no gate: the
+# R39 sweep champion's shape at the identical draws. The same-draw
+# delta 11r40 - 11r40r prices the split's RATE contribution (the
+# main-core submission path's offload minus the merge overhead); the
+# champion arm (11r37) stays the PROVEN single-producer record shape
+# until this run's 11r40 verdict proves the split green on the fleet's
+# silicon — then the champion flips (the next push's move, armed with
+# both arms' numbers).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40r.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40r.txt
+grep -q "allocs=0" /tmp/bench_r40r.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40r.txt
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r40r.txt
+grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r40r.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r40r.txt | tail -1
+
 # ── 11r36r. R36-B: the re-anchor rollback (the attribution arm) ──────
 # HFT_REANCHOR=0 restores the full per-pass sequencer construction
 # (the 64 KiB arena zero + copy — the PR #20 boundary shape): the

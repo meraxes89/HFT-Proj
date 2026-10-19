@@ -13,6 +13,7 @@ pub fn res_dbg_gate() -> bool {
 pub mod affinity;
 pub mod batch_parity;
 pub mod crcfold;
+pub mod dual;
 pub mod fakeserver;
 pub mod golden;
 pub mod hydra;

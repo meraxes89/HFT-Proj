@@ -836,6 +836,64 @@ fn fabric_placement_siblings(workers: usize) -> (Option<usize>, Option<usize>, V
     }
 }
 
+/// R40: THE CHAMPION-4T PLACEMENT — the dual-producer topology
+/// (docs/52 §1, the user's directive):
+///
+/// ```text
+/// physical core 0:  cpu0 = P0 (the sink's owner)   cpu1 = W0 + RX
+/// physical core 1:  cpu2 = P1 (the lane-1 engine)  cpu3 = W1
+/// ```
+///
+/// The coherence dividend: P0's ring traffic (the transport's
+/// filled[] from the RX, lane-0's res_head from W0) becomes
+/// SAME-PHYSICAL-CORE (SMT siblings share L1) — the drain's
+/// Acquire loads and the submission waits cheapen; the same holds
+/// for P1/W1 on core 1. The workers (~4% duty) and the RX (~28%)
+/// co-locate on cpu1 at ~32% combined demand — the R25b
+/// counterfactual already proved worker-sibling sharing is the
+/// cheap theft (the scalars_stacked failure was MAIN+RX stacked,
+/// never worker+RX).
+///
+/// Returns `(main, rx, worker_cpus, p1)`; `p1 = None` on hosts
+/// without the 2-core SMT shape (the dual never arms there — the
+/// callers gate on it).
+pub fn fabric_placement_dual(
+    workers: usize,
+) -> (Option<usize>, Option<usize>, Vec<usize>, Option<usize>) {
+    let order = cpu_order(); // distinct-physical representatives first
+    if order.is_empty() || workers != 2 {
+        let (m, r, w) = fabric_placement_distinct(workers);
+        return (m, r, w, None);
+    }
+    // The two producers: the first two distinct physical cores.
+    let p0 = order[0];
+    let p1 = order.get(1).copied();
+    if p1.is_none() {
+        let (m, r, w) = fabric_placement_distinct(workers);
+        return (m, r, w, None);
+    }
+    let p1 = p1.unwrap();
+    // The workers: each producer's SMT sibling (the lane ring's
+    // coherence pair), preferring the sibling; the RX shares W0's
+    // cpu (the ~32% combined demand fits one logical core).
+    let sib0 = read_sibling_group(p0)
+        .unwrap_or_else(|| vec![p0])
+        .into_iter()
+        .find(|c| *c != p0);
+    let sib1 = read_sibling_group(p1)
+        .unwrap_or_else(|| vec![p1])
+        .into_iter()
+        .find(|c| *c != p1);
+    match (sib0, sib1) {
+        (Some(w0), Some(w1)) => (Some(p0), Some(w0), vec![w0, w1], Some(p1)),
+        _ => {
+            let (m, r, w) = fabric_placement_distinct(workers);
+            (m, r, w, None)
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod fabric_placement_tests {
     use super::*;
