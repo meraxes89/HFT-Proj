@@ -1002,6 +1002,18 @@ grep -q "t_r38c_per_lane_tiling_laws ... ok" /tmp/test_r38c.txt
 grep -q "t_r38c_replay_parity_two_lane ... ok" /tmp/test_r38c.txt
 grep -q "t_r38c_sheaf_degree_law ... ok" /tmp/test_r38c.txt
 grep "test result: ok" /tmp/test_r38c.txt | head -1
+# R39 (THE PRODUCER PIVOT — Option A, the coarse-grained submission
+# sweep): the grouped-consume parity cell — the grouped sweep vs the
+# per-batch cadence on the armed frozen-master shape (the identity
+# stream, the EOS alignment, the mixed-mode discipline, the mid-pass
+# abandon's FIFO drain) — and the exact lane modulus's oracle (the
+# Granlund-Montgomery magic vs the DIV across the fleet's lane counts).
+cargo test --release -p nf-transport t_r39 2>&1 | tee /tmp/test_r39.txt
+grep -q "t_r39_group_sweep_parity_vs_batch ... ok" /tmp/test_r39.txt
+grep "test result: ok" /tmp/test_r39.txt | head -1
+cargo test --release -p nf-testkit t_r39 2>&1 | tee /tmp/test_r39b.txt
+grep -q "t_r39_lane_mod_exactness ... ok" /tmp/test_r39b.txt
+grep "test result: ok" /tmp/test_r39b.txt | head -1
 # R37c (the ship's gate, the R36-E precedent): the two-worker shape
 # exposed a residual emission-discipline family on the fleet (the
 # fold-order class at ~10-15%/shard + the SegAcc overflow — docs/49
@@ -1047,11 +1059,22 @@ grep -q "RESREPLAY_DIAGNOSTIC sustained: .*workers=2 elision=true" /tmp/bench_r3
 grep -q "SHEAFDIAGNOSTIC sustained: checked=" /tmp/bench_r37.txt
 grep -q "SIGFABRIC_DIAGNOSTIC sustained: baked=true order_scan=push" /tmp/bench_r37.txt
 grep -q "SIGFABRIC_DIAGNOSTIC.*L=63" /tmp/bench_r37.txt
+# R39: THE GROUPED CONSUME's engagement law (the producer pivot, Option A
+# — the main-core submission sweep's coarse granularity): armed=true (the
+# default k=8), mean_width > 1 (the sweep actually widened — the R38L2
+# baseline at the per-batch cadence was groups == batches), and the
+# hard floor unchanged (BIT-EXACT, allocs=0 above). The same-draw delta
+# vs 11r39r (the k=1 rollback) prices the sweep's contribution.
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT rate=" /tmp/bench_r37.txt
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r37.txt
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*mean_width=[2-9]\." /tmp/bench_r37.txt
 grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37.txt | head -1
 grep "PR1_R36_EVAL_ELISION_VERDICT" /tmp/bench_r37.txt | head -1
+grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r37.txt | head -1
 grep "RESREPLAY_DIAGNOSTIC sustained" /tmp/bench_r37.txt | head -1
 grep "SHEAFDIAGNOSTIC sustained" /tmp/bench_r37.txt | head -1
 grep "FOLDTREE_DIAGNOSTIC" /tmp/bench_r37.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r37.txt | tail -1
 
 # ── 11r38w. R38/L2: the two-lane live-walk pricing (the attribution
 # arm) — the fleet prices the lane shape WITHOUT the elision on the
@@ -1099,6 +1122,23 @@ grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37r.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*tree=false" /tmp/bench_r37r.txt
 grep -q "FOLDTREE_DIAGNOSTIC sustained: tree=false" /tmp/bench_r37r.txt
 grep "PR1_R37_TREE_FOLD_VERDICT" /tmp/bench_r37r.txt | head -1
+
+# ── 11r39r. R39: the grouped-consume rollback (the attribution arm) ──
+# HFT_BATCH_GROUP=1 restores the verbatim per-batch cadence (next_batch's
+# wait/free/wake/drain per batch — the R38L2 champion's shape): the
+# same-draw delta 11r37 - 11r39r prices the coarse-grained sweep's
+# contribution to the main-core budget (wait_ms + the per-batch fixed
+# submit costs + the per-batch drain setup + the tsc instrumentation).
+# The dual-lane elision + the push bake + the tree fold stay armed (the
+# attribution discipline: same shape, one lever).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_BATCH_GROUP=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r39r.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r39r.txt
+grep -q "allocs=0" /tmp/bench_r39r.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r39r.txt
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT rate=" /tmp/bench_r39r.txt
+grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=false" /tmp/bench_r39r.txt
+grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r39r.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r39r.txt | tail -1
 
 # ── 11r36r. R36-B: the re-anchor rollback (the attribution arm) ──────
 # HFT_REANCHOR=0 restores the full per-pass sequencer construction

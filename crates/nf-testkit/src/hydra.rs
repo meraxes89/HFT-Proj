@@ -111,6 +111,76 @@ use std::thread::JoinHandle;
 /// further than R6's CHUNK=16, collapsing per-span atomic-fence traffic.
 const CHUNK: u64 = 64;
 
+/// R39: THE EXACT LANE MODULUS — the fold grid's runtime `% n_lanes`
+/// (paid at every drain loop top — the lane re-derivation's division is
+/// a DIV instruction because the divisor is runtime: ~99.5M divides on
+/// the champion's 5s window at ~172 chunk switches per pass) becomes the
+/// precomputed division: one AND when the lane count is a power of two
+/// (the champion's 2 lanes — the modulo vanishes), else the
+/// Granlund–Montgomery exact invariant multiplication (m = floor(2^N/d)
+/// + 1 with N = 32 + floor(log2 d); q = (u·m) >> N — exact for every
+/// dividend u < 2^32, G–M Theorem 4.2; the fold grid u = fold_pos/CHUNK
+/// is < 2^32 with six orders of margin at the 200B target — 1T msgs ≈
+/// 21.7B spans ≈ 2^28.3 grid positions). The remainder is
+/// `u − q·n` (one widening multiply + subtract), ~4 cycles vs the DIV's
+/// 7–15 on the Zen 5 core.
+#[derive(Clone, Copy)]
+struct LaneMod {
+    /// The modulus (0/1 = the degenerate single-lane shapes).
+    n: u64,
+    /// true when n is a power of two (the AND path).
+    pow2: bool,
+    /// The G–M magic (valid when n is not a power of two).
+    magic: u128,
+    /// The magic's total shift N = 32 + floor(log2 n).
+    magic_sh: u32,
+}
+
+impl LaneMod {
+    fn new(n: u64) -> Self {
+        if n > 1 && n.is_power_of_two() {
+            Self {
+                n,
+                pow2: true,
+                magic: 0,
+                magic_sh: 0,
+            }
+        } else if n > 1 {
+            let l = 63 - n.leading_zeros(); // floor(log2 n)
+            let nbits = 32 + l;
+            let magic = ((1u128 << nbits) / n as u128) + 1;
+            Self {
+                n,
+                pow2: false,
+                magic,
+                magic_sh: nbits,
+            }
+        } else {
+            Self {
+                n,
+                pow2: false,
+                magic: 0,
+                magic_sh: 0,
+            }
+        }
+    }
+
+    /// `u % n` — exact for every `u < 2^32` (the G–M domain; asserted in
+    /// debug). The degenerate shapes (0/1 lanes) map everything to 0.
+    #[inline(always)]
+    fn rem(&self, u: u64) -> u64 {
+        if self.n <= 1 {
+            return 0;
+        }
+        if self.pow2 {
+            return u & (self.n - 1);
+        }
+        debug_assert!(u < (1u64 << 32), "LaneMod dividend {u} exceeds the G-M domain");
+        let q = ((u as u128) * self.magic >> self.magic_sh) as u64;
+        u - q * self.n
+    }
+}
+
 /// Result-ring capacity (power of two, multiple of CHUNK).
 const RES_CAP: usize = 4096;
 /// Descriptor-ring capacity (power of two, multiple of CHUNK, strictly <
@@ -4004,6 +4074,10 @@ pub struct HydraSpanSink<'a> {
     /// ~40-80c/span of pure main-thread fat. Incremental advance + wrap
     /// replaces the division with an add and a compare.
     n_lanes: usize,
+    /// R39: the fold grid's exact lane modulus (the drain loop top's
+    /// derived-grid re-derivation `% n_lanes` — the runtime DIV becomes
+    /// the AND/magic path; see LaneMod).
+    lane_mod: LaneMod,
     /// Lane of the chunk containing `next_span` (submit side).
     submit_lane: usize,
     /// Spans remaining in the submit-side chunk.
@@ -4078,6 +4152,18 @@ pub struct HydraSpanSink<'a> {
     /// The fabric's rxdesc state (None = the legacy ring path — the
     /// per-run constant from the fabric).
     rx: Option<Arc<RxdescState>>,
+    /// R39: THE CACHED BORROW — the same state as a `&'a` reference (the
+    /// fabric's own Arc, dereferenced once at construction). The hot
+    /// submit paths (`submit_span_rx` / `submit_span_batch_rx` /
+    /// `submit_packed_batch_rx`) previously paid an `Arc::clone` + drop
+    /// PER CALL — two locked RMWs on the shared refcount line, ~25-40
+    /// cycles each on the elision champion's every-batch cadence — for a
+    /// pointer the sink already owns. The borrow's lifetime is the
+    /// FABRIC's (`'a`), not any `&self`/`&mut self` method borrow, so it
+    /// coexists freely with the mutable self calls the commit paths
+    /// make (a copy of a shared reference; no aliasing — all the state's
+    /// methods are `&self` with interior/atomic mutability).
+    rx_ref: Option<&'a RxdescState>,
     /// This sink's generation (workers re-anchor spans to 0 on change).
     rx_gen: u64,
     /// A submission window is open (its pass record is published).
@@ -4252,6 +4338,9 @@ impl<'a> HydraSpanSink<'a> {
         // (construction time — outside every window; a fresh generation
         // re-anchors the workers' span grid to 0).
         let rx = fabric.and_then(|f| f.rxdesc.clone());
+        // R39: the cached borrow — the fabric's own Arc, dereferenced
+        // once (the lifetime rides 'a; the hot paths stop cloning).
+        let rx_ref: Option<&'a RxdescState> = fabric.and_then(|f| f.rxdesc.as_deref());
         let rx_gen = rx.as_ref().map_or(0, |st| st.next_gen());
         let rx_affine = rx.as_ref().is_some_and(|st| st.affine_armed());
         let sink = Self {
@@ -4278,6 +4367,7 @@ impl<'a> HydraSpanSink<'a> {
             pending_lane: 0,
             pending_head: 0,
             n_lanes: fabric.map(|f| f.lanes.len()).unwrap_or(0),
+            lane_mod: LaneMod::new(fabric.map(|f| f.lanes.len()).unwrap_or(0) as u64),
             // Chunk 0 → lane 0; advance on chunk completion (after-use).
             submit_lane: 0,
             submit_rem: CHUNK,
@@ -4314,6 +4404,7 @@ impl<'a> HydraSpanSink<'a> {
             sheaf_checked: 0,
             sheaf_missed: 0,
             rx,
+            rx_ref,
             rx_gen,
             rx_win_open: false,
             rx_win_slot: 0,
@@ -4602,6 +4693,24 @@ impl<'a> HydraSpanSink<'a> {
         self.rx_win_ss = false;
         self.rx_win_pre = 0;
         self.complete_boundaries();
+    }
+
+    /// R39: the oldest pending pass's completion frontier — the composite
+    /// drain's boundary-hoist operand. `u64::MAX` when no completion can
+    /// fire at the current position (no pending pass, the head record is
+    /// already done, or the end is unstamped) — the hoisted compare then
+    /// never fires and the full `complete_boundaries()` runs at the
+    /// loop-top / break / park sites exactly as before (the pop-and-
+    /// advance shapes it owns stay there).
+    #[inline]
+    fn pending_boundary_end(&self) -> u64 {
+        if self.pass_tail != self.pass_head {
+            let rec = &self.passes[self.pass_tail];
+            if !rec.done && rec.end_span != u64::MAX {
+                return rec.end_span;
+            }
+        }
+        u64::MAX
     }
 
     /// Snapshot + reset at every pass boundary the fold has crossed.
@@ -5171,10 +5280,11 @@ impl<'a> HydraSpanSink<'a> {
     /// leave the submitting core entirely.
     #[inline]
     fn submit_span_rx(&mut self, body: &[u8]) {
-        let st = self
-            .rx
-            .clone()
-            .expect("submit_span_rx without rxdesc state");
+        // R39: the cached borrow — the per-span `Arc::clone` + drop (two
+        // locked RMWs on the shared refcount line) leaves the submit path.
+        let Some(st) = self.rx_ref else {
+            unreachable!("submit_span_rx without rxdesc state")
+        };
         // (The blob base was captured by submit_span's preamble — the
         // single write-once point, shared with the RX's capture.)
         // Lazy window open (the burst shape has no begin_pass; begin_pass
@@ -5366,7 +5476,9 @@ impl<'a> HydraSpanSink<'a> {
         if recs.is_empty() {
             return;
         }
-        let Some(st) = self.rx.clone() else {
+        // R39: the cached borrow — the per-batch `Arc::clone` + drop
+        // leaves the submit path (the same law as submit_span_rx's).
+        let Some(st) = self.rx_ref else {
             unreachable!("submit_span_batch_rx without rxdesc state")
         };
         // The blob base — submit_span's preamble, verbatim (write-once
@@ -5739,7 +5851,11 @@ impl<'a> HydraSpanSink<'a> {
         if words.is_empty() {
             return;
         }
-        let Some(st) = self.rx.clone() else {
+        // R39: the cached borrow — the per-packed-call `Arc::clone` + drop
+        // (two locked RMWs on the shared refcount line, paid by every
+        // fused Packed call of the elision champion's cadence) leaves the
+        // submission path; the lifetime rides the fabric's 'a.
+        let Some(st) = self.rx_ref else {
             unreachable!("submit_packed_batch_rx without rxdesc state");
         };
         // The blob base — the packed batch's first body pointer (write-once
@@ -6222,7 +6338,11 @@ impl<'a> HydraSpanSink<'a> {
             // (the 512-span drift class). Deriving from the position
             // makes the class structurally impossible; one shift + one
             // mod at the consumer's loop edge.
-            self.fold_lane = ((self.fold_pos / CHUNK) % self.n_lanes as u64) as usize;
+            // R39: the derived grid's lane re-derivation — the runtime DIV
+            // (`% n_lanes`) becomes the exact AND/magic modulus (LaneMod);
+            // the derivation LAW is unchanged (drift-immune re-derive at
+            // every loop top).
+            self.fold_lane = self.lane_mod.rem(self.fold_pos / CHUNK) as usize;
             self.fold_rem = CHUNK - (self.fold_pos % CHUNK);
             // H6: `fold_lane` tracks the chunk containing `fold_pos` — no
             // division in the hot path (advance after chunk completion).
@@ -6251,6 +6371,21 @@ impl<'a> HydraSpanSink<'a> {
                 // store below. Per-slot masking handles the ring wrap.
                 let slots = lane.res_slots_read();
                 let mut consumed: u64 = 0;
+                // R39: THE BOUNDARY HOIST — the oldest pending pass's
+                // completion frontier, read ONCE per record-loop entry
+                // (the per-record `complete_boundaries()` call was
+                // ~12-18 cycles of loads + branch for a condition that
+                // fires once per ~178 records on the champion's shape —
+                // 103M calls for 578,887 true boundaries). The local
+                // compare below replaces the call; the `>=` + the refresh
+                // after each true firing keep consecutive boundaries (the
+                // parked-then-resumed multi-cross shapes) exact, and the
+                // loop-top / break / park calls still run the full
+                // function (the hoist only skips calls that CANNOT fire:
+                // records never straddle a pending boundary — the
+                // worker's break discipline, pinned by the debug assert
+                // below).
+                let mut next_end = self.pending_boundary_end();
                 while tail + consumed < head {
                     let r = &slots[((tail + consumed) & RES_MASK) as usize];
                     let k = r.aux as u64;
@@ -6357,8 +6492,15 @@ impl<'a> HydraSpanSink<'a> {
                         // of them) wait their grid turn — the ORDER LAW.
                         break;
                     }
-                    // A record ending exactly at a boundary snapshots now.
-                    self.complete_boundaries();
+                    // A record ending exactly at a boundary snapshots now
+                    // (R39: the hoisted local compare replaces the
+                    // per-record call; the refresh re-reads the next
+                    // pending frontier so the following records of a
+                    // multi-cross resume stay exact).
+                    if self.fold_pos >= next_end {
+                        self.complete_boundaries();
+                        next_end = self.pending_boundary_end();
+                    }
                 }
                 lane.res_tail.store(tail + consumed, Ordering::Release);
                 self.complete_boundaries();
@@ -10256,3 +10398,33 @@ mod tests {
     }
 
 }
+
+    /// R39: the exact lane modulus's oracle — `LaneMod::rem(u)` must equal
+    /// `u % n` for every fleet lane count (the powers of two AND-path, the
+    /// odd/prime magic path) over the G–M domain's whole relevant range
+    /// (the dense low grid + the 2^32 boundary's neighborhood).
+    #[test]
+    fn t_r39_lane_mod_exactness() {
+        let lanes: [u64; 9] = [2, 3, 4, 5, 7, 8, 9, 16, 32];
+        for &n in &lanes {
+            let m = LaneMod::new(n);
+            for u in 0u64..200_000 {
+                assert_eq!(m.rem(u), u % n, "n={n} u={u}");
+            }
+            // The domain's upper neighborhood (grid positions at the
+            // 200B target's scale and the 2^32 boundary).
+            for &u in &[
+                1u64 << 28,
+                (1 << 28) + 12_345,
+                (1 << 31) - 1,
+                (1 << 32) - 1,
+                (1 << 32) - 2,
+                (1 << 31) + 987_654,
+            ] {
+                assert_eq!(m.rem(u), u % n, "n={n} u={u} (boundary)");
+            }
+        }
+        // The degenerate shapes: 0/1 lanes map everything to 0.
+        assert_eq!(LaneMod::new(0).rem(12345), 0);
+        assert_eq!(LaneMod::new(1).rem(12345), 0);
+    }

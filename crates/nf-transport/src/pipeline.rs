@@ -119,6 +119,13 @@ const ENTRY_CAP: usize = 1024;
 /// 2048-publication change it shipped with; restored to the measured shape).
 const BUF_PARK_NS: u64 = 50_000;
 
+/// R39: the grouped consume's hard group-size bound (the deferred-free
+/// FIFO's array length). The env word's requested k is clamped into
+/// [1, MAX_GROUP]; 8 is the champion default (the user's 4x-8x widening
+/// directive — 22 batches/pass at the mini tape's shape sweep in
+/// 8+8+6).
+const MAX_GROUP: usize = 32;
+
 // R8: construction-time shared handles (mailbox + triple store) — the hot
 // path dereferences plain references; the Arcs exist only to cross the
 // thread spawn boundary. Tier-F allow mirrors render.rs's construction
@@ -2230,6 +2237,23 @@ pub struct PipelinedReplayTransport {
     /// (the abandoned pass's in-flight tail MUST be freed, or the RX
     /// stalls NBUF buffers in and the advance never completes).
     at_eos: bool,
+    /// R39: THE DEFERRED-FREE FIFO — the grouped consume's cluster of
+    /// consumed-but-not-yet-freed DATA turns (all but the group's last,
+    /// which rides `cur` exactly as the per-batch path's one-batch
+    /// deferral does). Bounded by [`MAX_GROUP`]; EOS marker turns NEVER
+    /// enter it (their own consumption frees them immediately — the
+    /// auto-advance trigger's timing law). Drained by [`Self::free_pending`]
+    /// at the next group's/batch's entry and at every reset, so the
+    /// buffer-return discipline stays exactly the legacy shape, just
+    /// amortized over the group.
+    pending_data: [u64; MAX_GROUP],
+    /// R39: the FIFO's live length (the turns are strictly increasing).
+    pending_len: usize,
+    /// R39: the current group's first turn — `select_group_batch(j)`
+    /// points the guards' `cur` at `group_lo + j`.
+    group_lo: u64,
+    /// R39: the current group's batch count (0 outside a group).
+    group_n: usize,
 }
 
 impl PipelinedReplayTransport {
@@ -2512,6 +2536,10 @@ impl PipelinedReplayTransport {
             cur: None,
             resets: 0,
             at_eos: false,
+            pending_data: [0; MAX_GROUP],
+            pending_len: 0,
+            group_lo: 0,
+            group_n: 0,
         }
     }
 
@@ -2543,9 +2571,10 @@ impl PipelinedReplayTransport {
             "armed (auto-advance) transport: use reset_pass(pass, session) — \
              the session alone cannot identify the program pass"
         );
-        if let Some(t) = self.cur.take() {
-            self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
-        }
+        // R39: the deferred-free cluster drains here too (the FIFO is
+        // empty on the pure per-batch path; a mixed/grouped caller
+        // cannot leak a turn across the reset).
+        self.free_pending();
         self.resets += 1;
         let n = self.resets;
         // SAFETY: consumer-exclusive cell; the RX thread reads it only
@@ -2617,9 +2646,13 @@ impl PipelinedReplayTransport {
             self.mb.auto_fn.is_some(),
             "reset_pass on an unarmed transport: use reset(session)"
         );
-        if let Some(t) = self.cur.take() {
-            self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
-        }
+        // R39: the deferred-free cluster drains at the boundary (the
+        // clean-end shape arrives empty — the EOS-fetching call drained
+        // everything through the marker; the mid-pass abandon shape
+        // drains here so the abandoned pass's in-flight tail can unstick
+        // the RX, the same release the legacy cur-free provided, plus
+        // the group's earlier members).
+        self.free_pending();
         self.resets += 1;
         // R16b: a clean end-of-pass and a mid-pass abandon need OPPOSITE
         // unstick policies, and `last_eos` alone cannot tell them apart —
@@ -2737,16 +2770,153 @@ impl PipelinedReplayTransport {
     /// harness's poll()==0 equivalent). The entry slice + clock stay valid
     /// until the next call.
     pub fn next_batch(&mut self) -> bool {
-        // R33-B: the free path's producer wake — the freed fetch_add is a
-        // locked RMW, so the Acquire load of `prod_parked` below cannot
-        // miss a producer that swapped-true before its own re-check (the
-        // both-RMW cycle proof, docs/44 §2): either the load sees the flag
-        // (wake) or the producer's freed re-check sees THIS free (no park).
-        // A plain load on the un-parked common case costs ~5ns; the wake
-        // syscall fires only when the RX actually parked (the post-R33-A
-        // equilibrium: the ring runs full and the producer parks between
-        // refills — without this, its 50µs timed self-wake would stall the
-        // consumer up to 45µs per park).
+        // R39: the deferred-free cluster rides the same entry (the FIFO
+        // is empty on the pure per-batch path — zero behavior change;
+        // mixed next_batch/next_group callers cannot leak a deferred
+        // turn).
+        self.free_pending();
+        self.wait_filled_turn();
+        let t = self.turn;
+        self.turn += 1;
+        // SAFETY: consumer owns the pubs record for this turn (the
+        // filled[] Acquire in wait_filled_turn ordered its Release
+        // store).
+        let len = unsafe { (*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get()).len };
+        if len == 0 {
+            // EOS: the empty publication occupies a turn — free it to keep
+            // the use counts symmetric for the next pass. The free is also
+            // the AUTO-ADVANCE trigger: the RX is (at most) a timed-park
+            // quantum away from noticing it — bump the wake word so the
+            // next pass's bake starts NOW (one syscall per pass).
+            self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
+            self.mb.wake.fetch_add(1, Ordering::Release);
+            futex_wake(&self.mb.wake);
+            // R16b: the consumer now sits exactly at the pass boundary —
+            // reset_pass's clean-end discriminator (see at_eos).
+            self.at_eos = true;
+            return false;
+        }
+        // A data batch — any pass-boundary position is stale (the flag
+        // always reflects the LAST next_batch call, so a stray consume
+        // after a false can never poison the next reset_pass).
+        self.at_eos = false;
+        self.cur = Some(t);
+        true
+    }
+
+    /// R39: THE GROUPED CONSUME — the main-core submission sweep's coarse
+    /// granularity (the producer-pivot program's Option A). Waits ONCE
+    /// for the group's first batch (the verbatim spin/park protocol), then
+    /// PEEKS the already-published consecutive turns into the group: each
+    /// peeked member costs one `filled[]` Acquire load and one `pubs.len`
+    /// read — no freed fetch_add, no parked-flag check, no wait — and the
+    /// group is replayed as one unit (the harness's ledger guards + sink
+    /// submit per member, ONE drain at the group's end). The turn's
+    /// buffer return rides [`Self::free_pending`]'s cluster (amortized
+    /// exactly like the per-batch path's deferral — see the FIFO's law).
+    ///
+    /// CONTRACT (identical to `next_batch`): returns the number of DATA
+    /// batches in the group (0 == EOS — the pass is complete, the caller
+    /// breaks to the pass boundary); `select_group_batch(j)` must be
+    /// called before each member's guard reads (`batch_bounds`,
+    /// `entries`, `now_ns`); the members' buffers stay owned until the
+    /// NEXT group's `free_pending`.
+    ///
+    /// SOUNDNESS: the sweep stops at the first not-yet-published turn (a
+    /// stale `filled[]` value can never equal a FUTURE turn — turns are
+    /// unique per slot use) and at the pass's EOS marker WITHOUT
+    /// consuming it (the next call's wait finds it already published and
+    /// runs the EOS path verbatim — the marker's free+wake keeps its
+    /// exact timing, the auto-advance trigger's law). k is clamped to
+    /// [1, MAX_GROUP]; k == 1 degenerates to `next_batch`'s shape plus
+    /// the guards' explicit select.
+    pub fn next_group(&mut self, k: usize) -> usize {
+        let k = k.clamp(1, MAX_GROUP);
+        self.free_pending();
+        self.wait_filled_turn();
+        let t = self.turn;
+        // SAFETY: same ordering law as next_batch's len read.
+        let len0 = unsafe { (*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get()).len };
+        if len0 == 0 {
+            // The EOS marker — next_batch's path verbatim (the free + the
+            // wake + the at_eos discriminator; the marker's buffer return
+            // is the auto-advance trigger and must NOT be deferred).
+            self.turn += 1;
+            self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
+            self.mb.wake.fetch_add(1, Ordering::Release);
+            futex_wake(&self.mb.wake);
+            self.at_eos = true;
+            self.group_n = 0;
+            return 0;
+        }
+        // THE SWEEP: extend the group over the already-published
+        // consecutive data turns. A peek that finds `filled != turn + j`
+        // stops the sweep (the member is not published yet — the group
+        // takes what is ready; the next group's wait catches up). A peek
+        // that finds a published EOS marker stops WITHOUT consuming it
+        // (the next call's zero-length path handles it verbatim).
+        let mut n = 1usize;
+        while n < k {
+            let tj = t + n as u64;
+            let i = (tj & self.mb.nbuf_mask) as usize;
+            if self.mb.filled[i].load(Ordering::Acquire) != tj {
+                break;
+            }
+            // SAFETY: the filled[] Acquire above ordered this record's
+            // Release store — the len read observes the publication.
+            let lj = unsafe { (*self.mb.pubs[i].get()).len };
+            if lj == 0 {
+                break; // the EOS marker — leave it for the verbatim path
+            }
+            n += 1;
+        }
+        self.turn = t + n as u64;
+        // The deferred-free cluster: all but the last member ride the
+        // FIFO; the last rides `cur` (exactly the per-batch path's
+        // one-batch deferral, extended — the next group's free_pending
+        // drains both).
+        for j in 0..(n - 1) {
+            self.pending_data[j] = t + j as u64;
+        }
+        self.pending_len = n - 1;
+        self.group_lo = t;
+        self.group_n = n;
+        self.cur = Some(t + (n - 1) as u64);
+        self.at_eos = false;
+        n
+    }
+
+    /// R39: point the guards' batch cursor at the current group's `j`-th
+    /// member (the ledger's `batch_bounds` identity assert, the live
+    /// scan's `entries`/`now_ns`). The member's buffer stays owned until
+    /// the next group's `free_pending`.
+    #[inline]
+    pub fn select_group_batch(&mut self, j: usize) {
+        debug_assert!(
+            j < self.group_n,
+            "select_group_batch({j}) outside the group ({})"
+            , self.group_n
+        );
+        if j < self.group_n {
+            self.cur = Some(self.group_lo + j as u64);
+        }
+    }
+
+    /// R39: the deferred-free cluster — drain the FIFO of consumed data
+    /// turns (one freed fetch_add each) plus `cur`'s deferral, then ONE
+    /// producer-wake check. The R33-B both-RMW cycle proof holds verbatim
+    /// (the frees are Release RMWs; the flag check follows them in the
+    /// same call — either the producer's parked re-check sees this
+    /// cluster's frees, or the check sees its flag and wakes it). On the
+    /// pure per-batch path the FIFO is empty and this is EXACTLY the
+    /// legacy `cur` free + wake check; the mixed next_batch/next_group
+    /// discipline cannot leak a deferred turn.
+    fn free_pending(&mut self) {
+        for idx in 0..self.pending_len {
+            let t = self.pending_data[idx];
+            self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
+        }
+        self.pending_len = 0;
         if let Some(t) = self.cur.take() {
             self.mb.freed[(t & self.mb.nbuf_mask) as usize].fetch_add(1, Ordering::Release);
             if self.mb.prod_parked.0.load(Ordering::Acquire)
@@ -2756,6 +2926,13 @@ impl PipelinedReplayTransport {
                 futex_wake(&self.mb.wake);
             }
         }
+    }
+
+    /// R39: the wait for `filled[turn] == turn` — `next_batch`'s verbatim
+    /// spin/park block, extracted so the grouped consume shares it (the
+    /// group pays it ONCE, on its first member; the sweep's peeks take
+    /// only the fast Acquire loads).
+    fn wait_filled_turn(&mut self) {
         let i = (self.turn & self.mb.nbuf_mask) as usize;
         // Polite acquire: a bounded spin for the common fast case, then a
         // futex park. An UNCAPPED spin here starved the RX on the SMT
@@ -2812,32 +2989,6 @@ impl PipelinedReplayTransport {
                 .slow_ns
                 .fetch_add(t_park.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        let t = self.turn;
-        self.turn += 1;
-        // SAFETY: consumer owns buffer i for turn t; the record was
-        // published by the RX's Release store (ordered by the Acquire
-        // above) — the R33-C pubs array (the old in-EntryBuf trio).
-        let len = unsafe { (*self.mb.pubs[i].get()).len };
-        if len == 0 {
-            // EOS: the empty publication occupies a turn — free it to keep
-            // the use counts symmetric for the next pass. The free is also
-            // the AUTO-ADVANCE trigger: the RX is (at most) a timed-park
-            // quantum away from noticing it — bump the wake word so the
-            // next pass's bake starts NOW (one syscall per pass).
-            self.mb.freed[i].fetch_add(1, Ordering::Release);
-            self.mb.wake.fetch_add(1, Ordering::Release);
-            futex_wake(&self.mb.wake);
-            // R16b: the consumer now sits exactly at the pass boundary —
-            // reset_pass's clean-end discriminator (see at_eos).
-            self.at_eos = true;
-            return false;
-        }
-        // A data batch — any pass-boundary position is stale (the flag
-        // always reflects the LAST next_batch call, so a stray consume
-        // after a false can never poison the next reset_pass).
-        self.at_eos = false;
-        self.cur = Some(t);
-        true
     }
 
     /// The current batch's entries (valid after next_batch() returned true,
@@ -3990,6 +4141,196 @@ mod tests {
         // the replay transport's polls froze after its recording pass.
         let (_, _, master_frames) = replay.rx_build_stats();
         assert_eq!(master_frames, 60, "master frame count");
+    }
+
+    // ─── R39: the producer pivot — the coarse-grained sweep ────────────
+
+    /// R39: THE GROUPED-CONSUME parity pin — the SAME armed frozen-master
+    /// shape as the champion (rxbuild + elision + the schedule replay +
+    /// prearm, NBUF=16), one transport consumed per-batch (`next_batch`,
+    /// the verbatim cadence) and one consumed by the grouped sweep
+    /// (`next_group` + `select_group_batch`), through passes of ~8
+    /// publications each (the ring laps within every pass — the
+    /// deferred-free FIFO's discipline is exercised at depth: a leaked
+    /// turn stalls the RX's bufwait at NBUF and this test hangs). The
+    /// observable streams must be IDENTICAL: per-member (rx_start, len)
+    /// triples in order + clocks, EOS alignment, per-pass frame counts.
+    /// Then the MIXED-MODE discipline (a `next_batch` stretch inside a
+    /// grouped pass) and the MID-PASS ABANDON (reset_pass after a
+    /// partial group — the unstick + the FIFO drain at the boundary)
+    /// must complete with the same identity stream (the batched twin's
+    /// pass after the abandon is the oracle).
+    #[test]
+    fn t_r39_group_sweep_parity_vs_batch() {
+        let gt = mini_gt(30_000);
+        let sched = mini_sched(30_000);
+        let mk = || {
+            PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true, // rxbuild
+                16,   // nbuf — the champion depth
+                true, // elision — the frozen-master regime
+                true, // sched replay
+                true, // prearm — the champion's advance shape
+            )
+        };
+        let mut batched = mk();
+        let mut grouped = mk();
+        let mut groups_seen = 0u64;
+        let mut members_seen = 0u64;
+        let mut multi_member = false;
+        // The first TWO passes: the grouped sweep vs the batched stream,
+        // member-for-member (the batched twin is driven one next_batch
+        // per group member — the streams must interleave identically).
+        for p in 1..=2u64 {
+            let sess = sess_program(p);
+            batched.reset_pass(p, sess);
+            grouped.reset_pass(p, sess);
+            // Determinism: give the RX a head start so the sweep's width
+            // observes the runahead the fleet sees (the ring fills; the
+            // pre-arm gate parks the RX at the pass's marker until the
+            // consumer's first free — no deadlock, the timed park law).
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut frames = 0usize;
+            loop {
+                let n = grouped.next_group(8);
+                if n == 0 {
+                    break;
+                }
+                groups_seen += 1;
+                members_seen += n as u64;
+                multi_member |= n > 1;
+                for j in 0..n {
+                    grouped.select_group_batch(j);
+                    assert!(
+                        batched.next_batch(),
+                        "pass {p}: the grouped sweep out-ran the batched stream (member {j}/{n})"
+                    );
+                    let (a_bounds, a_clock) = (batched.batch_bounds(), batched.now_ns());
+                    let (b_bounds, b_clock) = (grouped.batch_bounds(), grouped.now_ns());
+                    assert_eq!(
+                        a_bounds, b_bounds,
+                        "pass {p}: member {j}: (rx_start, len) diverged — the identity law broke"
+                    );
+                    assert_eq!(a_clock, b_clock, "pass {p}: member {j}: clock diverged");
+                    let ae = batched.entries();
+                    let be = grouped.entries();
+                    assert_eq!(ae.len(), be.len(), "pass {p}: member {j}: length mismatch");
+                    for (a, b) in ae.iter().zip(be.iter()) {
+                        assert!(
+                            !entry_content_neq(a, b),
+                            "pass {p}: member {j}: grouped entry diverged from the batched stream"
+                        );
+                    }
+                    frames += ae.len();
+                }
+            }
+            // The batched twin must sit at the SAME EOS.
+            assert!(
+                !batched.next_batch(),
+                "pass {p}: EOS misalignment (the grouped stream ended early)"
+            );
+            assert_eq!(frames, 6000, "pass {p}: frame count");
+        }
+        // The MIXED-MODE pass: one 3-member sweep, then the per-batch
+        // cadence to the EOS (the FIFO must drain inside next_batch — no
+        // turn leaks across the mode switch; the pass's remaining data
+        // batches exercise the data-member stretch).
+        {
+            let p = 3u64;
+            let sess = sess_program(p);
+            batched.reset_pass(p, sess);
+            grouped.reset_pass(p, sess);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let n = grouped.next_group(3);
+            assert!(n > 0, "pass {p}: the mixed-mode sweep came up empty");
+            for j in 0..n {
+                grouped.select_group_batch(j);
+                assert!(batched.next_batch(), "pass {p}: mixed-mode member starvation");
+                assert_eq!(
+                    batched.batch_bounds(),
+                    grouped.batch_bounds(),
+                    "pass {p}: mixed-mode (rx_start, len) diverged"
+                );
+            }
+            groups_seen += 1;
+            loop {
+                if !grouped.next_batch() {
+                    break;
+                }
+                assert!(batched.next_batch(), "pass {p}: batched starvation in mixed mode");
+                assert_eq!(
+                    batched.batch_bounds(),
+                    grouped.batch_bounds(),
+                    "pass {p}: mixed-mode next_batch divergence"
+                );
+                members_seen += 1;
+            }
+            assert!(!batched.next_batch(), "pass {p}: mixed-mode EOS misalignment");
+        }
+        // The MID-PASS ABANDON: a 3-member group of pass 4 consumed (5
+        // data publications + the marker still in flight), then
+        // reset_pass(5) (the unstick path — the FIFO drain at the reset +
+        // the forward frees through the abandoned pass's marker; a leaked
+        // deferred turn here stalls the RX and this test hangs). The
+        // batched twin consumes pass 4 fully; pass 5's identity stream is
+        // the oracle for the post-abandon state.
+        {
+            grouped.reset_pass(4, sess_program(4));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let n = grouped.next_group(3);
+            assert!(n > 0, "pass 4: the abandon sweep came up empty");
+            for j in 0..n {
+                grouped.select_group_batch(j);
+            }
+            // The entries of the consumed members stay readable until the
+            // next group's free (the deferral contract).
+            let (b4, _) = grouped.batch_bounds();
+            assert!(b4 != 0, "pass 4: the abandoned member's bounds are unreadable");
+            grouped.reset_pass(5, sess_program(5));
+        }
+        {
+            let p = 5u64;
+            batched.reset_pass(4, sess_program(4));
+            run_pass(&mut batched);
+            batched.reset_pass(p, sess_program(p));
+            grouped.reset_pass(p, sess_program(p));
+            let mut frames = 0usize;
+            loop {
+                let n = grouped.next_group(8);
+                if n == 0 {
+                    break;
+                }
+                for j in 0..n {
+                    grouped.select_group_batch(j);
+                    assert!(batched.next_batch(), "pass {p}: post-abandon starvation");
+                    assert_eq!(
+                        batched.batch_bounds(),
+                        grouped.batch_bounds(),
+                        "pass {p}: post-abandon (rx_start, len) diverged"
+                    );
+                    frames += grouped.entries().len();
+                }
+            }
+            assert!(!batched.next_batch(), "pass {p}: post-abandon EOS misalignment");
+            assert_eq!(frames, 6000, "pass {p}: post-abandon frame count");
+        }
+        // The engagement law: the sweep ran, and at least one group
+        // carried multiple members (the RX runs a full ring ahead of the
+        // consumer by construction — its per-publication cost is a
+        // fraction of the consumer's).
+        assert!(groups_seen > 0, "the sweep never engaged (groups={groups_seen})");
+        assert!(
+            multi_member,
+            "no multi-member group observed ({groups_seen} groups / {members_seen} members) — \
+             the sweep degenerated to the per-batch cadence"
+        );
     }
 
     /// R33-C: the deep-ring ladder at the new depths — 64 and 256, both

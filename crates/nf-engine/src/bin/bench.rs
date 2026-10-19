@@ -612,6 +612,18 @@ fn run_hydra_sustained_5s(
     // the per-pass hash assert is disabled (count/msg_hash still asserted).
     // (Read BEFORE the allocation window — env::var allocates.)
     let null_diag = std::env::var("HFT_HYDRA_NULL").as_deref() == Ok("1");
+    // R39: THE GROUPED CONSUME's arm — the main-core submission sweep's
+    // coarse granularity (the producer pivot, Option A: the per-batch
+    // next_batch/wait/free/wake cycle amortizes over a group of k
+    // already-published batches; ONE wait + ONE free-cluster + ONE
+    // drain + ONE tsc-pair per group). Default 8 (the 4x-8x widening
+    // directive); 1 restores the verbatim per-batch cadence. Read BEFORE
+    // the window (env::var allocates).
+    let group_k: usize = std::env::var("HFT_BATCH_GROUP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|k| k.clamp(1, 32))
+        .unwrap_or(8);
     // R36-E: the eval-elision arm (HFT_RES_REPLAY — default ON; the
     // worker reads its own copy at spawn, this copy drives the verdict
     // line's engagement asserts). Read BEFORE the window (env::var
@@ -679,6 +691,9 @@ fn run_hydra_sustained_5s(
     let mut d_work_ns: u64 = 0;
     let mut d_fold_ns: u64 = 0;
     let mut d_batches: u64 = 0;
+    // R39: the grouped consume's group count (the sweep's engagement —
+    // groups < batches/2 when k >= 2 is armed and the supply keeps up).
+    let mut d_groups: u64 = 0;
     let mut d_passes: u64 = 0;
     // R8 phase-2: exact emitted-body bytes from the golden tape (the CRC
     // demand denominator — computed once, outside every window).
@@ -734,40 +749,50 @@ fn run_hydra_sustained_5s(
         d_boundary_wait_ns += tsc_d(t_r, t_r1);
         d_boundary_open_ns += tsc_d(t_r1, t_r2);
 
-        // Fold drain every batch: keeps the result rings shallow and the
-        // ordered fold close behind submission (the overlap's slack is the
-        // in-flight ring capacity, not fold lag).
+        // Fold drain per GROUP (R39: the coarse-grained submission sweep —
+        // one next_group wait + one free-cluster + one drain + one tsc
+        // pair per group of up to `group_k` already-published batches;
+        // the ledger guards + the sink submit still run PER MEMBER
+        // verbatim, the order law is unchanged — only the batch-boundary
+        // ceremony amortizes). group_k == 1 degenerates to the verbatim
+        // per-batch cadence (the attribution arm's rollback).
         loop {
             let t_w = tsc_now();
-            if !transport.next_batch() {
-                break;
+            let n = transport.next_group(group_k);
+            if n == 0 {
+                break; // EOS — the pass boundary
             }
             d_wait_ns += tsc_d(t_w, tsc_now());
             let t_b = tsc_now();
-            // R32: try the verdict replay first — a TRUE return means the
-            // frozen-master regime proved this batch is byte-identical to
-            // the recorded one and the recorded sink surface was re-issued
-            // (the workers still fold every message; only the redundant
-            // re-VALIDATION walk is elided). FALSE = record/live-scan the
-            // batch through the tee.
-            if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
-                pass_replay.begin_record(&transport, &seq);
-                {
-                    let mut rec_sink = pass_replay.recorder(&mut sink);
-                    seq.ingest_entries_ladder(
-                        transport.entries(),
-                        transport.now_ns(),
-                        &mut rec_sink,
-                        ladder,
-                    );
+            for j in 0..n {
+                transport.select_group_batch(j);
+                // R32: try the verdict replay first — a TRUE return means
+                // the frozen-master regime proved this batch is
+                // byte-identical to the recorded one and the recorded
+                // sink surface was re-issued (the workers still fold every
+                // message; only the redundant re-VALIDATION walk is
+                // elided). FALSE = record/live-scan the batch through
+                // the tee.
+                if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
+                    pass_replay.begin_record(&transport, &seq);
+                    {
+                        let mut rec_sink = pass_replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(
+                            transport.entries(),
+                            transport.now_ns(),
+                            &mut rec_sink,
+                            ladder,
+                        );
+                    }
+                    pass_replay.seal_batch(&seq);
                 }
-                pass_replay.seal_batch(&seq);
             }
             let t_i = tsc_now();
             sink.drain_ready();
             d_work_ns += tsc_d(t_b, t_i);
             d_fold_ns += tsc_d(t_i, tsc_now());
-            d_batches += 1;
+            d_batches += n as u64;
+            d_groups += 1;
         }
         pass_replay.note_pass_end();
         let t_s = tsc_now();
@@ -810,13 +835,15 @@ fn run_hydra_sustained_5s(
     if diag {
         let (rp_batches, rp_live, rp_passes, rp_rerecords) = pass_replay.stats();
         eprintln!(
-            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
+            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} groups={} group_k={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
             d_passes,
             d_reset_ns as f64 / 1e6,
             d_scan_ns as f64 / 1e6,
             d_end_ns as f64 / 1e6,
             d_pending_max,
             d_batches,
+            d_groups,
+            group_k,
             d_wait_ns as f64 / 1e6,
             d_work_ns as f64 / 1e6,
             d_fold_ns as f64 / 1e6,
@@ -948,6 +975,26 @@ fn run_hydra_sustained_5s(
             pass_replay.enabled()
         );
     }
+    // R39: THE GROUPED CONSUME's verdict line — the producer pivot's
+    // Option A pricing row (the main-core submission sweep's coarse
+    // granularity). The engagement law: armed = group_k > 1, groups ==
+    // the next_group call count, batches/groups == the sweep's mean
+    // width (the R38L2 baseline at the per-batch cadence: 12.7M batches
+    // == 12.7M groups, wait_ms=1248 of the 4834ms scan on the 58.6B
+    // draw — the per-batch sync ceremony this lever amortizes).
+    println!(
+        "PR1_R39_GROUP_SWEEP_VERDICT rate={} groups={} batches={} mean_width={:.2} group_k={} armed={} (R39: the coarse-grained submission sweep — ONE wait + ONE free-cluster + ONE drain per group of already-published batches; the ledger guards + the sink submit stay per-member verbatim; HFT_BATCH_GROUP=1 restores the per-batch cadence)",
+        sustained_rate,
+        d_groups,
+        d_batches,
+        if d_groups > 0 {
+            d_batches as f64 / d_groups as f64
+        } else {
+            0.0
+        },
+        group_k,
+        group_k > 1
+    );
     // R33: the producer-side elision's verdict line — the publication-
     // schedule replay + the parked-flag wake-skip's pricing row. The
     // engagement law: sched_replays ~= publications - the recording
