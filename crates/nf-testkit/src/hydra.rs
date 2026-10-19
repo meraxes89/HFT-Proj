@@ -5035,6 +5035,71 @@ impl<'a> HydraSpanSink<'a> {
         // a pass-start window (its record carries the flag; the
         // composite-fold workers split their segment at this span).
         self.pass_start_span = self.next_span;
+        // R40c: THE COMPLETION-PACE GATE — under the dual the boundary
+        // completions depend on P1's arrivals (ANOTHER thread's pace),
+        // and the fleet's first 11r40 draw proved P0's pass driving can
+        // outrun them: 64 pending passes and the ring's capacity assert
+        // fires (~100ms into the sustained window, every target-silicon
+        // shard). The mono never had this — its completions self-pace on
+        // its OWN fold. THE LAW: P0's pass-driving lead over the
+        // COMPLETION frontier is bounded (PASS_RING − the margin); at
+        // the bound, P0 parks (folding + completing — the arrivals land
+        // as P1 drains) until the harvest frees slots. THE DIAGNOSTICS:
+        // a stall line at 250ms (a healthy park is microseconds — the
+        // line fires only when P1 is genuinely stuck, and it carries the
+        // full rendezvous state), and a bounded patience of 10s (way
+        // beyond any legitimate transient) that fails LOUD with the same
+        // dump — the shard dies in minutes with the data, never a
+        // 35-minute timeout.
+        if self.dual.is_some() {
+            let mut sb = 0u32;
+            let park_start = std::time::Instant::now();
+            let mut logged = false;
+            while (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING >= PASS_RING - 8 {
+                self.fold_available();
+                crate::affinity::polite_spin(&mut sb);
+                let el = park_start.elapsed();
+                if !logged && el >= std::time::Duration::from_millis(250) {
+                    logged = true;
+                    if let Some(g) = &self.dual {
+                        let (l1_head, l1_tail) = self
+                            .fabric
+                            .map(|f| (f.lane(1).r40_res_head(), f.lane(1).r40_res_tail_load()))
+                            .unwrap_or((0, 0));
+                        eprintln!(
+                            "R40_PACE_STALL pending_passes={} armed_from={} p1_fold={} p1_done={} arrivals={} j1_len_snapshot={} j1_consumed={} next_span={} fold_pos={} lane1_res_head={} lane1_res_tail={} (R40c: the completion-pace gate bound — P0 waiting on the rendezvous; a healthy park is microseconds, this line means P1 is stuck or starved)",
+                            (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING,
+                            g.armed_from(),
+                            g.p1_fold(),
+                            g.p1_done(),
+                            g.arrival_count(),
+                            g.j1.snapshot(),
+                            g.j1.consumed(),
+                            self.next_span,
+                            self.fold_pos,
+                            l1_head,
+                            l1_tail
+                        );
+                    }
+                }
+                if el >= std::time::Duration::from_secs(10) {
+                    if let Some(g) = &self.dual {
+                        eprintln!(
+                            "R40_PACE_TIMEOUT armed_from={} p1_fold={} p1_done={} arrivals={} j1={} consumed={} (the rendezvous is dead — failing loud)",
+                            g.armed_from(),
+                            g.p1_fold(),
+                            g.p1_done(),
+                            g.arrival_count(),
+                            g.j1.snapshot(),
+                            g.j1.consumed()
+                        );
+                    }
+                    panic!(
+                        "R40c: the completion-pace gate exhausted its patience — the dual rendezvous is dead (see R40_PACE_TIMEOUT above)"
+                    );
+                }
+            }
+        }
         // Ring capacity: one slot must remain free for this record.
         assert_ne!(
             (self.pass_head + 1) % PASS_RING,

@@ -821,6 +821,8 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
             );
         }
         let mut sb2 = 0u32;
+        let drain_start = std::time::Instant::now();
+        let mut logged = false;
         while st.fold_pos < lane1_target {
             if !sweeping && gate.shutdown.load(Ordering::Acquire) {
                 sweeping = true;
@@ -837,6 +839,28 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
                 continue;
             }
             if !drain_lane1(gate, fabric, &mut st) {
+                // R40c: the stall diagnostic — a healthy drain spin is
+                // microseconds; 250ms without progress means the records
+                // are not coming (the fleet's 11r40 first draw: P1
+                // frozen at its target, the whole rendezvous dead behind
+                // it). One line per pass — the state pins WHERE the
+                // records stopped.
+                if !logged && drain_start.elapsed() >= std::time::Duration::from_millis(250) {
+                    logged = true;
+                    let lane_dbg = fabric.lane(1);
+                    eprintln!(
+                        "R40_P1_STALL pass={} target={} cursor={} res_tail={} res_head={} j1_len={} j1_consumed={} count_1={} sweeping={} (R40c: P1's pass-end drain stuck — the lane-1 records beyond the cursor are not arriving)",
+                        st.pass,
+                        lane1_target,
+                        st.fold_pos,
+                        st.res_tail,
+                        lane_dbg.r40_res_head(),
+                        st.j1_len,
+                        gate.j1.consumed(),
+                        st.count_1,
+                        sweeping
+                    );
+                }
                 crate::affinity::polite_spin(&mut sb2);
             }
         }

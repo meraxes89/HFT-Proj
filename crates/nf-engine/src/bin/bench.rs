@@ -769,7 +769,14 @@ fn run_hydra_sustained_5s(
         // reprojects the sink's own cursor onto lane 0.
         if !dual_armed {
             if let Some(g) = &gate {
-                if sink.dual_arm_ready_ss(3) && pass_replay.dual_batch_count() > 0 {
+                // R40c: the script-clean clause — never arm on a
+                // truncated/partial template (a mid-pass master bump's
+                // re-record — the phantom-grid drift; the parity cell's
+                // catch).
+                if sink.dual_arm_ready_ss(3)
+                    && pass_replay.dual_batch_count() > 0
+                    && pass_replay.dual_script_clean()
+                {
                     let n = pass_replay.dual_batch_count();
                     let f1_init = sink.dual_fold_pos_1_init();
                     let rt1 = sink.dual_res_tail_1_init(fabric);
