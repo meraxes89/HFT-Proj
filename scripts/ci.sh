@@ -1193,6 +1193,27 @@ grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r40r.txt
 grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r40r.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r40r.txt | tail -1
 
+# ── 11r40x. R40c-II: the RX-pin attribution (the complementary-share's ──
+# counterfactual). HFT_DUAL_RX_SIB=1 restores the fleet's FIRST dual
+# shape — the RX sharing W0's logical cpu — whose telemetry (run
+# 39257999925) showed the degradation chain: W0's res-ring backpressure
+# yield-storm stacked the RX's publication latency, P0's group sweep
+# collapsed to mean_width 1.78, wait_ms ate 57% of the scan, and the
+# completion-pace cascade throttled the rendezvous to the mono's own
+# cadence. The same-draw delta 11r40 - 11r40x prices the
+# complementary-sharing law (the RX on P0's cpu — P0's futex parks are
+# exactly the gaps the RX's publication bursts fill; W0/W1 own their
+# logical cpus outright). BIT-EXACT and allocs=0 on BOTH arms (the pin
+# changes no byte of the protocol).
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 HFT_DUAL_RX_SIB=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40x.txt
+grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40x.txt
+grep -q "allocs=0" /tmp/bench_r40x.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40x.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*attached=true" /tmp/bench_r40x.txt
+grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40x.txt
+grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40x.txt | head -1
+grep "DIAG sustained: passes" /tmp/bench_r40x.txt | tail -1
+
 # ── 11r36r. R36-B: the re-anchor rollback (the attribution arm) ──────
 # HFT_REANCHOR=0 restores the full per-pass sequencer construction
 # (the 64 KiB arena zero + copy — the PR #20 boundary shape): the

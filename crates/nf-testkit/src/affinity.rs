@@ -857,8 +857,27 @@ fn fabric_placement_siblings(workers: usize) -> (Option<usize>, Option<usize>, V
 /// Returns `(main, rx, worker_cpus, p1)`; `p1 = None` on hosts
 /// without the 2-core SMT shape (the dual never arms there — the
 /// callers gate on it).
+/// `rx_pin_p0`: the RX's cpu law (R40c-II). The fleet's first dual draw
+/// (run 39257999925, commit 599a0f7) priced the ORIGINAL shape — the RX
+/// sharing W0's logical cpu: W0's res-ring backpressure yield-storm
+/// (res_waits=1.3M laps, the polite_spin escalation churning cpu1's
+/// runqueue) stacked the RX's publication latency on top; P0's group
+/// sweep collapsed to mean_width 1.78, wait_ms ate 57% of the scan, and
+/// the completion-pace cascade throttled the whole rendezvous to the
+/// mono's own cadence (+3..+10% instead of the projected split).
+///
+/// THE COMPLEMENTARY-SHARING LAW: the one sharing that CANNOT degrade
+/// into contention is RX-on-P0's-cpu — P0's transport waits are genuine
+/// FUTEX PARKS (wait_filled_turn parks after 512 spins), exactly the
+/// gaps the RX's publication bursts fill; when P0 works, the RX has
+/// nothing to publish (SPSC flow control — the ring is full); when the
+/// RX publishes, P0 is parked waiting for exactly those publications.
+/// W0 and W1 each own their logical cpu outright — their backpressure
+/// yields churn nobody's runqueue. `HFT_DUAL_RX_SIB=1` (CI arm 11r40x)
+/// restores the original RX-on-W0 shape for the same-draw attribution.
 pub fn fabric_placement_dual(
     workers: usize,
+    rx_pin_p0: bool,
 ) -> (Option<usize>, Option<usize>, Vec<usize>, Option<usize>) {
     let order = cpu_order(); // distinct-physical representatives first
     if order.is_empty() || workers != 2 {
@@ -874,8 +893,9 @@ pub fn fabric_placement_dual(
     }
     let p1 = p1.unwrap();
     // The workers: each producer's SMT sibling (the lane ring's
-    // coherence pair), preferring the sibling; the RX shares W0's
-    // cpu (the ~32% combined demand fits one logical core).
+    // coherence pair), preferring the sibling; the RX rides P0's cpu
+    // (the complementary-sharing law above) — W0/W1 own their logical
+    // cpus outright.
     let sib0 = read_sibling_group(p0)
         .unwrap_or_else(|| vec![p0])
         .into_iter()
@@ -885,7 +905,10 @@ pub fn fabric_placement_dual(
         .into_iter()
         .find(|c| *c != p1);
     match (sib0, sib1) {
-        (Some(w0), Some(w1)) => (Some(p0), Some(w0), vec![w0, w1], Some(p1)),
+        (Some(w0), Some(w1)) => {
+            let rx = if rx_pin_p0 { p0 } else { w0 };
+            (Some(p0), Some(rx), vec![w0, w1], Some(p1))
+        }
         _ => {
             let (m, r, w) = fabric_placement_distinct(workers);
             (m, r, w, None)
