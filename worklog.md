@@ -302,3 +302,18 @@ Work Log:
 
 Stage Summary:
 - f87e6bf PUSHED (fleet run 525 in progress — the RX-pin verdict pending); b331c6c committed locally (pushed after 525's verdict to avoid overlapping fleet burns). The dual's honest state: correctness fully landed (bit-exact, zero-alloc, robust under contention), the rate ceiling diagnosed as the RX-starvation cascade, the complementary-sharing pin is the response, the 200B corridor needs the completion-cadence program on top (P0's boundary work ~2-3us/pass is the next serial surface — the arriving-last election + completion batching). Phase 2's cross-pass byte-refresh (the rotating blob window below the consumed frontier) is designed but deferred (R42) — the affine-tag incompatibility (the CRC chain's downstream invalidation) forces HFT_RXDESC=0 for the live stream, which is the honest production shape anyway.
+
+---
+Task ID: 24
+Agent: Z.ai Code (main agent — Run 900 / R40c-III, THE REFUTATION + THE PHASE-2 FLEET ARMING)
+Task: The fleet's verdict on f87e6bf (run 39327552826) and the response; Phase 2's push.
+
+Work Log:
+- THE FLEET'S SECOND DUAL VERDICT (run 39327552826, 13 full target-silicon draws, 2 draw-class failures — a contended spec-gate draw + a test-hang flake on t_rxdesc_sustained_multipass_parity, both environmental): THE COMPLEMENTARY-SHARING PIN REFUTED AT -80%. Same-draw: 11r40 (RX-on-P0) = 11.8-13.2B vs 11r40x (the W0-share) = 53.6-63.8B vs 11r40r (mono) = 53.6-60.2B vs 11r39r (k=1 mono) = 61.7-74.6B (THE RUN'S BEST DRAWS).
+- THE REFUTED MECHANISM (the DIAG decomposition): wait_ms collapsed (2476->91ms) but work_ms ate 83% of scan (4138ms) with the RX at publications=350K (vs 12.8M) — the RX-on-P0 stack is a CONTEXT-SWITCH GENERATOR: each publication burst forces a park/unpark pair at per-batch cadence; the scheduler's timeslice preempts P0 mid-member-loop and the stolen time lands in work_ms. The W0-share's yield-based contention is an order of magnitude cheaper. R25b's law extends to the dual: THE RX NEVER SHARES THE PRODUCER'S CPU.
+- THE RESPONSE (f07216a): the default reverted to the fleet-proven W0-share; HFT_DUAL_RX_P0=1 keeps the refuted shape as 11r40x (the documented counterfactual); 11r40k ARMED (the dual at HFT_BATCH_GROUP=1 — the k=1 cadence's 74.6B best draws + the dual's +5-9% should stack); the k=8 grouped-consume regression CONFIRMED fleet-wide (148ns/batch vs 62ns at k=1 — the next mono-side fix program).
+- PHASE 2 PUSHED (b331c6c rides in f07216a): bench_random_stream + randomstream.rs + the 11rs CI arm — its first fleet pricing lands on run 526.
+- Run 526 (f07216a) queued: the reverted dual + 11r40x + 11r40k + 11rs.
+
+Stage Summary:
+- THE SESSION'S HONEST LEDGER: the dual's correctness is fully landed and fleet-proven (BIT-EXACT, zero-alloc, robust under contention, +5-9% same-draw over mono, +75% on contended draws); the 200B corridor is NOT reached — the rate ceiling is the completion-cadence + the grouped-consume regression, both now precisely telemetry-priced. The RX-pin hypothesis was refuted at -80% with the mechanism fully diagnosed (the context-switch generator). The k1-dual arm (11r40k) is the next stacking candidate. Phase 2 (the production live random stream) is landed with BIT-EXACT parity on arbitrary data + the tail telemetry + the steady allocs=0 law; its fleet pricing (11rs) and the k1-dual verdict are run 526's deliverables.

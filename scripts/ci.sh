@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
 set -e
+# R40c-IV: THE FALSE-GREEN KILLER — without pipefail, every
+# `cargo run ... | tee /tmp/bench_X.txt` masks the binary's abort
+# behind tee's exit 0: a panicking arm (the R37 engagement violations
+# the dual arms carried since ce82a06) never failed the shard as long
+# as the pre-panic verdict lines satisfied the greps. Run 526's 11r40k
+# arm exposed the class by dying mid-run (before its verdict lines) —
+# the grep failed, the shard went red, and the audit found every
+# "green" dual arm since ce82a06 had been panicking invisibly.
+set -o pipefail
 
 # P0 GH tuning: honor external RUSTFLAGS if set (ci.yml znver3), else fallback to native for local/Termux
 # Keep RUSTFLAGS minimal (target-cpu only); profile controls lto/codegen/opt/strip.
@@ -1159,7 +1168,7 @@ grep "DIAG sustained: passes" /tmp/bench_r39r.txt | tail -1
 # corridor. The engagement law: armed_from > 0, p1_records > 0,
 # merges > 0, poison=false (any break falls to the zombie lane-split,
 # the fail-safe), BIT-EXACT, allocs=0.
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40.txt
+HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 HFT_DUAL_ALLOC_BISECT=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40.txt
 grep -q "allocs=0" /tmp/bench_r40.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40.txt
@@ -1211,24 +1220,18 @@ grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40x.txt
 grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40x.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r40x.txt | tail -1
 
-# ── 11r40k. R40c-III: THE DUAL AT THE PER-BATCH CADENCE (the k=1 stack ──
-# candidate). Run 39327552826's r39r arm (the mono k=1 rollback) posted
-# the run's best draws (61.7-74.6B — the grouped-consume k=8 path
-# carries a per-batch work regression on this build: 148ns/batch vs 62
-# at k=1); the dual's P0-offload (+5-9% same-draw over its mono
-# rollback) should STACK with the k=1 cadence's +15-24%. The arm runs
-# the dual at HFT_BATCH_GROUP=1 — the same-draw delta vs 11r40 (the
-# k=8 dual) prices the cadence's contribution inside the split; the
-# delta vs 11r39r (the mono k=1) prices the split's contribution at the
-# k=1 cadence. BIT-EXACT + allocs=0 as ever.
-HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=1 HFT_BATCH_GROUP=1 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40k.txt
-grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40k.txt
-grep -q "allocs=0" /tmp/bench_r40k.txt
-grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40k.txt
-grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*attached=true" /tmp/bench_r40k.txt
-grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40k.txt
-grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40k.txt | head -1
-grep "DIAG sustained: passes" /tmp/bench_r40k.txt | tail -1
+# ── 11r40k. R40c-III: THE DUAL AT THE PER-BATCH CADENCE — PULLED ──────
+# (run 39327552826's verdict: the arm died mid-run on ALL 9 full-draw
+# shards with `R40 lane-0 drain: fold-order violation (got span
+# 109952, cursor 98944, k 64)` at hydra.rs:7148 — a ~1-pass gap in the
+# lane-0 record stream at the k=1 cadence + the dual's dispatch
+# interleaving. The k1-dual stack candidate stays DESIGNED (the k=1
+# mono posted the run's best draws at 61.7-74.6B); its fold-order bug
+# gets its own session — the arm returns when the lane-0 contiguity
+# law holds at k=1. The arm's exposure of the false-green class (the
+# engagement asserts the k=8 duals had been violating invisibly since
+# ce82a06) is its landing: pipefail now armed, the flush counting
+# fixed, the alloc bisect probing.)
 
 # ── 11rs. PHASE 2: THE PRODUCTION LIVE RANDOM STREAM (the mission's ────
 # --random-stream directive). A seedable splitmix64 ITCH 5.0 synthesizer

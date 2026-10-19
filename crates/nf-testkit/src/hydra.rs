@@ -4167,6 +4167,13 @@ impl FoldJournal {
     /// tree apply (the dual boundary composes the MERGED staging —
     /// journal_0's leaves joined with P1's j1 leaves by position — so
     /// this journal's own prefix is retired WITHOUT composing it).
+    /// R40c-IV: the dual completion's flush accounting — the merge
+    /// composes through the tree law exactly as flush_upto does; the
+    /// engagement assert's counter must see it (see dual_complete_one).
+    fn note_flush(&mut self) {
+        self.flushes += 1;
+    }
+
     fn retire_upto(&mut self, boundary: u64) {
         if self.len == 0 {
             return;
@@ -5583,6 +5590,16 @@ impl<'a> HydraSpanSink<'a> {
         // publishes past the partition.
         self.journal.retire_upto(end_span);
         gate.j1.retire(j1p);
+        // R40c-IV: THE FLUSH ACCOUNTING — the dual completion composes
+        // the merged leaf sequence through the SAME tree law as the
+        // mono's flush_upto (tree_fold_segments + the single apply),
+        // but retire_upto never counted it: the engagement law's
+        // `flushes >= passes` read 13 flushes against 506K passes on
+        // every armed dual run since ce82a06 — a REAL law violation
+        // the CI's tee-masking turned into false greens (run 526's
+        // 11r40k arm exposed the class by dying mid-run BEFORE the
+        // verdict prints). The merge IS a flush; count it.
+        self.journal.note_flush();
         // THE SNAPSHOT + RESEED (the mono completion's body).
         let h = self.hash;
         {

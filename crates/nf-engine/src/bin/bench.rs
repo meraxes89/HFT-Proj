@@ -213,7 +213,27 @@ fn run_sustained_loop_5s(gt: &[u8], cal: &nf_engine::clock::ClockCalibration) ->
     let mut sink = SpanConformanceSink::new();
     let mut batch = FrameBatch::new();
 
+    // R40c-IV: THE ALLOC BISECT PROBE (HFT_DUAL_ALLOC_BISECT=1 — the
+    // 11r40 arm sets it): the dual arms carry exactly 2 in-window
+    // counter deltas (one transient allocation + its free — the
+    // counter sums both) that the mono arms do not; the probe prints
+    // the counter at every phase boundary so the fleet's log pinpoints
+    // the phase the pair lands in. Zero cost when disarmed.
+    let alloc_probe = std::env::var("HFT_DUAL_ALLOC_BISECT").as_deref() == Ok("1");
+    let probe = |tag: &str, base: (u64, u64)| {
+        if alloc_probe {
+            let (x, y) = GLOBAL.snapshot();
+            eprintln!(
+                "R40_ALLOC_BISECT {} delta={} (allocs {} deallocs {})",
+                tag,
+                (x - base.0) + (y - base.1),
+                x - base.0,
+                y - base.1
+            );
+        }
+    };
     let (a1, d1) = GLOBAL.snapshot();
+    let probe_base = (a1, d1);
     let start = Instant::now();
     let t_start_mono = read_monotonic_raw_ns();
 
@@ -720,7 +740,27 @@ fn run_hydra_sustained_5s(
     // loop pass is pure replay, ALLOC_DELTA == 0 restored — the steady
     // state's own law. (env::var inside prebake allocates — pre-window.)
     let prebaked = fabric.prebake_sig_fabric();
+    // R40c-IV: THE ALLOC BISECT PROBE (HFT_DUAL_ALLOC_BISECT=1 — the
+    // 11r40 arm sets it): the dual arms carry exactly 2 in-window
+    // counter deltas (one transient allocation + its free — the
+    // counter sums both) that the mono arms do not; the probe prints
+    // the counter at every phase boundary so the fleet's log pinpoints
+    // the phase the pair lands in. Zero cost when disarmed.
+    let alloc_probe = std::env::var("HFT_DUAL_ALLOC_BISECT").as_deref() == Ok("1");
+    let probe = |tag: &str, base: (u64, u64)| {
+        if alloc_probe {
+            let (x, y) = GLOBAL.snapshot();
+            eprintln!(
+                "R40_ALLOC_BISECT {} delta={} (allocs {} deallocs {})",
+                tag,
+                (x - base.0) + (y - base.1),
+                x - base.0,
+                y - base.1
+            );
+        }
+    };
     let (a1, d1) = GLOBAL.snapshot();
+    let probe_base = (a1, d1);
     let start = Instant::now();
     let t_start_mono = read_monotonic_raw_ns();
 
@@ -795,6 +835,7 @@ fn run_hydra_sustained_5s(
                     let first = sink.dual_first_pass();
                     g.arm(first, f1_init, rt1, pbase);
                     dual_armed = true;
+                    probe("post-arm", probe_base);
                 }
             }
         }
@@ -906,6 +947,18 @@ fn run_hydra_sustained_5s(
             d_batches += n as u64;
             d_groups += 1;
         }
+        if alloc_probe && (pass == 2 || pass % 100_000 == 0) {
+            if alloc_probe {
+                let (x, y) = GLOBAL.snapshot();
+                eprintln!(
+                    "R40_ALLOC_BISECT loop-pass-{} delta={} (allocs {} deallocs {})",
+                    pass,
+                    (x - probe_base.0) + (y - probe_base.1),
+                    x - probe_base.0,
+                    y - probe_base.1
+                );
+            }
+        }
         pass_replay.note_pass_end();
         let t_s = tsc_now();
         sink.end_pass(); // non-blocking: the tail folds during the next pass
@@ -932,10 +985,12 @@ fn run_hydra_sustained_5s(
     // p1_done — the finish's dual branch waits for exactly that; a
     // bare shutdown word would freeze P1's cursor mid-stream and hang
     // the finish on a lagging P1).
+    probe("pre-finish", probe_base);
     if let Some(g) = &gate {
         g.initiate_shutdown(sink.submission_frontier());
     }
     sink.finish();
+    probe("post-finish", probe_base);
     let n = sink.harvest_completed(&mut harvested);
     for rec in &harvested[..n] {
         assert_sustained_pass(*rec, ref_tuple, null_diag);
