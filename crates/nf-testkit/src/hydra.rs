@@ -4049,10 +4049,20 @@ fn assist_slots_from_env() -> usize {
 /// flush under a deferred boundary composes leaves ACROSS pending
 /// boundaries into the running hash — every pending boundary's
 /// snapshot then reads the contaminated chain (the parity cell's
-// 6th catch: ten consecutive wrong composites). 8192 covers the
-/// bound at 3×+ margin; the flush stays the unreachable safety net
-/// it was designed to be (the `overflows` telemetry prices any fire).
-const FJ_CAP: usize = 8192;
+// 6th catch: ten consecutive wrong composites).
+///
+/// R41b: 8192 → 32768 — THE WIDENED-j1 DEFERRAL BOUND. The quantum
+/// widening raised the arrival lead law from ~21 passes to
+/// (8192 − 1024)/86 ≈ 83 passes (the degenerate raw-leaf law ~36),
+/// so the live journal can legitimately hold ~84 × ~110 ≈ 9240
+/// leaves — PAST the old 8192 cap. The R41b fleet's first draw paid
+/// exactly that: six shards died on `hydra sustained pass tuple
+/// divergence` — the capacity flush fired under pending boundaries
+/// and contaminated the chain. 32768 covers the steady bound at 3.5×
+/// and the degenerate bound at 4×+; the flush stays the unreachable
+/// safety net it was designed to be (the `overflows` telemetry prices
+/// any fire). 3 × 32768 × 12 B ≈ 1.2 MB — P0-private, sequential.
+const FJ_CAP: usize = 32768;
 
 /// THE FOLD JOURNAL: the pass's fold records, journaled as
 /// `(k, B)` S-records on the ROTATION ring (the segment monoid

@@ -406,3 +406,17 @@ Work Log:
 
 Stage Summary:
 - R41b lands the quantum widening (the j1/res/arrival/record rings — the 21-pass arrival quanta → ~82-pass, the workers' drain-lead buffer ×4, the submission runway ×2), the completion-loop Arc hoist, and the merge pricing telemetry. The corridor's next structural step (R42) is pinned by the refutation: the coarse-record grid.
+
+---
+Task ID: R41-5
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41b fleet failure's root cause and fix (run 39410815409: 6/41 shards on `hydra sustained pass tuple divergence`).
+
+Work Log:
+- The failing shards: both the 11r40x counterfactual arm AND the main 11r40 arm — the divergence (cross-pass overlap) plus an R41_P1_STALL co-artifact. NOT the pre-compose (already reverted) — the ring widenings.
+- ROOT CAUSE: FJ_CAP=8192 was sized for the OLD deferral bound (the j1 push gate's ~21-pass arrival lead → ~2400 live journal_0 leaves). The widened j1 (8192 cap, 1024 headroom) raised the lead law to ~83 passes → the live journal legitimately holds ~84 × ~110 ≈ 9240 leaves — PAST the cap: the capacity flush composed leaves ACROSS pending boundaries into the running hash, and every pending boundary's snapshot read the contaminated chain (the R40c-IV class, the fleet's own catch this time).
+- THE FIX: FJ_CAP 8192→32768 (3.5× the steady bound, 4×+ the degenerate; ~1.2MB P0-private; the flush returns to the unreachable safety net).
+- VALIDATION: t_r40 8/8 + hydra 39/39 + parity hammer 10/10 + the local bench BIT-EXACT allocs=0. (The parity cell cannot reach the overflow at 40 passes — the fix is a capacity-margin law, validated by the bound arithmetic + the fleet.)
+
+Stage Summary:
+- The quantum widening is sound except its journal margin — fixed. The corridor attempt continues on the fleet.
