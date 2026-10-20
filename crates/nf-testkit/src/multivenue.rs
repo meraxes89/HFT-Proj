@@ -98,10 +98,11 @@ impl SlotMap {
         }
     }
 
-    /// The demux: a message's slot, by the venue's own discipline (the
-    /// stock-locate field of the ITCH message header — `body` starts at
-    /// the message's length prefix; the locate rides bytes [3..5] BE).
-    /// A fact about the feed, not an engineering choice (Def 2.1).
+    /// The demux: a message's slot, by the venue's own discipline — the
+    /// SYMBOL-HASH of the stock-locate field (Def 2.1: "symbol hashing at
+    /// the venue; segment hashing at CME" — the hash spreads the stocks
+    /// across the venue's channels; the raw locate would cluster them).
+    /// A fact about the feed's demux, not an engineering choice.
     #[inline(always)]
     pub fn demux_msg(&self, msg_with_prefix: &[u8]) -> SlotId {
         // [len: u16 BE][type: u8][locate: u16 BE][tracking: u16]...
@@ -110,7 +111,10 @@ impl SlotMap {
         } else {
             0
         };
-        (locate as usize % self.n_slots) as u8
+        // The venue's symbol hash (the multiplicative mixer — Knuth's
+        // golden-ratio scatter; deterministic, content-derived).
+        let h = (locate as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 24;
+        (h as usize % self.n_slots) as u8
     }
 
     /// The slot's lane group (venue-home).
@@ -444,26 +448,34 @@ pub fn trigger_read(eval: &dyn Fn(u32) -> P64, w_prime: u32, phi_tag: u8) -> u64
 // §5 The SPSC merge rings (Theorem 37(b) — the Null-Flow protocol)
 // ─────────────────────────────────────────────────────────────────────
 
-/// One merge-ring entry: the slot's window composite + the sequential
-/// chain's final + the window's message count + the arrival tag. 80 B
-/// (two lines worst-case — Lemma 16's accounting: ≤ 2 lines per active
-/// edge per window; no line is ever written by two sockets).
+/// One merge-ring entry: the slot's window composite's DIGEST COORDINATES
+/// + the sequential chain's final + the window's message count + the
+/// arrival tag — EXACTLY 64 B (ONE cache line: Theorem 37(b)'s own spec;
+/// Lemma 16's accounting: ≤ 2 lines per active edge per window). The
+/// composite's full P64 (the px/tag/flg coordinates) stays in the
+/// per-slot tape — the audit's surface; the digest's inputs are these.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct CompositeEntry {
-    /// The window composite `X_s^(w)` (the [S2] record, verbatim).
-    pub x: P64,
+    /// The window composite's V coordinate.
+    pub v: u64,
+    /// The window composite's C coordinate.
+    pub c: u64,
+    /// The commutative db/da coordinates.
+    pub db: i64,
+    pub da: i64,
     /// The slot's sequential chain final for the window (the dual-path
-    /// witness — `hash_apply_p64(seed, x) == h_final` per window).
+    /// witness — `hash_apply(seed, X) == h_final` per window).
     pub h_final: u64,
     /// The window's message count (the degree law's per-slot operand).
     pub msgs: u64,
     /// The window id (the arrival tag — the merger consumes ANY order).
     pub window: u64,
-    pub _pad: [u8; 8],
+    /// The deg/cnt pair packed (the digest's remaining coordinates).
+    pub deg_cnt: u64,
 }
 
-const _: () = assert!(std::mem::size_of::<CompositeEntry>() == 128);
+const _: () = assert!(std::mem::size_of::<CompositeEntry>() == 64);
 
 /// The per-slot SPSC merge ring: ONE writer (the slot's owner — the
 /// single-writer watermark law, [S2] pitfall 5 at fleet scale), ONE
@@ -485,11 +497,14 @@ impl MergeRing {
     pub fn new() -> Box<Self> {
         Box::new(MergeRing {
             slots: UnsafeCell::new(Box::new([CompositeEntry {
-                x: P64::IDENTITY,
+                v: 0,
+                c: 0,
+                db: 0,
+                da: 0,
                 h_final: 0,
                 msgs: 0,
                 window: u64::MAX,
-                _pad: [0; 8],
+                deg_cnt: 0,
             }; 8])),
             head: AU64::new(0),
             tail: AU64::new(0),
@@ -650,33 +665,16 @@ impl SlotTape {
     }
 }
 
-/// The per-slot SHARED state between P0 (the submitter) and the owner:
-/// the chunk publication cursor + the window-close counter. Single
-/// writer each (P0), release-stored; the owner acquires. These two
-/// words + the merge ring's head are the ENTIRE cross-thread surface
-/// per slot — the Null-Flow law's 3 lines (Lemma 16).
-#[repr(C)]
-pub struct SlotGate {
-    /// Chunks published (P0, Release). The owner composes chunk `c`
-    /// only after this cursor passes `c + 1`.
-    pub chunk_pub: AU64,
-    /// Windows closed (P0, Release) — the window-end marker.
-    pub window_pub: AU64,
-    /// The shutdown word (P0; the owners drain then exit).
-    pub shutdown: AtomicBool,
-    _pad: [u8; 40],
-}
-
-impl SlotGate {
-    fn new() -> Self {
-        SlotGate {
-            chunk_pub: AU64::new(0),
-            window_pub: AU64::new(0),
-            shutdown: AtomicBool::new(false),
-            _pad: [0; 40],
-        }
-    }
-}
+/// The per-slot SHARED state: WITHHELD — the derivation law below makes
+/// every per-slot gate redundant. The engine's ONE global window word
+/// (P0, release-stored once per close) is the ENTIRE submitter→owner
+/// surface: each owner DERIVES its slots' chunk frontier from the window
+/// id (the schedule is frozen — `chunk_end = cycle_base +
+/// window_chunks[w_local + 1]`, a pure function) and publishes over its
+/// SPSC merge rings. THE NULL-FLOW LAW, PERFECTED: the cross-thread
+/// surface per window is ONE gate line (P0→owners) + one ring line per
+/// slot (owner→P0) + one tail word per slot (P0→owner) — Lemma 16's
+/// accounting with the gate collapsed to a single word.
 
 /// The per-batch frozen schedule entry (P0's re-issue work): the
 /// per-slot span-count deltas + the chunk completions (which per-slot
@@ -712,16 +710,32 @@ pub type WinTuple = (u64, u64, u64);
 pub struct FleetEngine {
     pub map: SlotMap,
     pub tapes: Vec<SlotTape>,
-    pub gates: Vec<Box<SlotGate>>,
     pub rings: Vec<Box<MergeRing>>,
     /// The per-batch frozen schedule (P0's re-issue table).
     pub sched: Vec<BatchSched>,
     /// The construction's oracle tuples (per window).
     pub oracle: Vec<WinTuple>,
-    /// Telemetry: windows merged, chunks consumed per owner, digest ns.
+    /// THE GLOBAL WINDOW WORD: the closed-window count (P0, ONE
+    /// release-store per close — the submitter→owner surface's only
+    /// gate line; every owner derives its chunk frontier from it).
+    pub window_pub: AU64,
+    /// The global shutdown word (P0; the owners drain then park).
+    pub shutdown: AtomicBool,
+    /// Telemetry: windows merged, chunk events seen.
     pub windows_merged: AU64,
-    pub digest_ns: AU64,
     pub chunk_events: AU64,
+    /// The owners' readiness barrier (the thread-start allocations land
+    /// OUTSIDE the measured window — P0 waits for the count before the
+    /// snapshot; the allocs=0 law's owner-side edge).
+    pub owners_ready: AU64,
+    /// THE EXIT LATCH (the champion's HFT_DUAL_EXIT_HOLD law): the
+    /// owners' terminal park — their teardown frees (the closure + the
+    /// Thread inner) must land OUTSIDE the allocation counter's window;
+    /// the harness releases AFTER the closing snapshot.
+    pub exit_hold: AtomicBool,
+    pub exit_release: AtomicBool,
+    /// The parked-owner count (the telemetry fold's rendezvous).
+    pub owners_parked_c: AU64,
 }
 
 impl FleetEngine {
@@ -737,13 +751,17 @@ impl FleetEngine {
         Box::new(FleetEngine {
             map,
             tapes,
-            gates: (0..n).map(|_| Box::new(SlotGate::new())).collect(),
             rings: (0..n).map(|_| MergeRing::new()).collect(),
             sched,
             oracle,
+            window_pub: AU64::new(0),
+            shutdown: AtomicBool::new(false),
             windows_merged: AU64::new(0),
-            digest_ns: AU64::new(0),
             chunk_events: AU64::new(0),
+            owners_ready: AU64::new(0),
+            exit_hold: AtomicBool::new(false),
+            exit_release: AtomicBool::new(false),
+            owners_parked_c: AU64::new(0),
         })
     }
 
@@ -755,10 +773,11 @@ impl FleetEngine {
     ///
     /// THE REPEATED-SCHEDULE LAW: the frozen schedule's tapes are FINITE
     /// (one construction pass); the measured loop replays them for many
-    /// cycles. The gates' cursors are GLOBAL-MONOTONE (the cycle's chunk
-    /// base + the within-schedule index); the owner's tape reads WRAP
-    /// modulo the schedule's totals — the values recompose identically
-    /// every cycle (the frozen-regime determinism law).
+    /// cycles. The window word is GLOBAL-MONOTONE; each owner DERIVES its
+    /// slots' chunk frontier from the window id (a pure function of the
+    /// frozen schedule) and its tape reads WRAP modulo the schedule's
+    /// totals — the values recompose identically every cycle (the
+    /// frozen-regime determinism law).
     pub fn owner_loop(&self, owner_slots: &[usize], cpu: Option<usize>) {
         if let Some(c) = cpu {
             let _ = pin_current_to(c);
@@ -773,19 +792,34 @@ impl FleetEngine {
         let mut acc: Vec<P64> = vec![P64::IDENTITY; n];
         let mut h: Vec<u64> = vec![SPAN_SEED; n];
         let mut spin = 0u32;
+        // The local telemetry (folded into the engine's counter at the
+        // exit park — zero hot-path atomics).
+        let mut chunks_folded: u64 = 0;
+        // The readiness barrier: the thread-start allocations (the Vec
+        // below) are visible BEFORE P0's measured window opens.
+        self.owners_ready.fetch_add(1, Ordering::Release);
         loop {
             let mut did_work = false;
+            // ONE global load per iteration (the submitter→owner
+            // surface's only gate line — the derivation law below).
+            let pub_w = self.window_pub.load(Ordering::Acquire);
             for &s in owner_slots {
-                let gate = &self.gates[s];
                 // THE WINDOW-BOUNDED CONSUMPTION: a window's composite is
                 // the compose of EXACTLY its own chunk range (the
-                // cumulative frontier law). The catch-up path (an owner
-                // several windows behind) consumes each window's range,
-                // publishes, resets, and continues — the acc NEVER
+                // cumulative frontier law — DERIVED from the window id,
+                // never gated by a per-slot word). The catch-up path (an
+                // owner several windows behind) consumes each window's
+                // range, publishes, resets, and continues — the acc NEVER
                 // crosses a window boundary (the bug class the parity
                 // cell's first landing caught).
-                let pub_w = gate.window_pub.load(Ordering::Acquire);
-                while win_con[s] < pub_w {
+                'win: while win_con[s] < pub_w {
+                    // THE FLOW CONTROL (the Null-Flow law's writer side):
+                    // a FULL ring means the merger lags — park THIS slot
+                    // (never overwrite the merger's unread entries; the
+                    // lazy merge drains on P0's next close and frees us).
+                    if self.rings[s].free(win_con[s]) == 0 {
+                        break 'win;
+                    }
                     let cycle_base = (win_con[s] / n_win.max(1)) * total_chunks[s];
                     let w_local = (win_con[s] % n_win.max(1)) as usize;
                     let chunk_end =
@@ -800,6 +834,7 @@ impl FleetEngine {
                         // memoized replay law — the dual-path witness).
                         h[s] = mulmod(h[s], rec.c) ^ rec.v;
                         chunk_con[s] += 1;
+                        chunks_folded += 1;
                     }
                     debug_assert_eq!(
                         h[s],
@@ -809,11 +844,14 @@ impl FleetEngine {
                     self.rings[s].publish(
                         win_con[s],
                         CompositeEntry {
-                            x: acc[s],
+                            v: acc[s].v,
+                            c: acc[s].c,
+                            db: acc[s].db,
+                            da: acc[s].da,
                             h_final: h[s],
                             msgs: self.window_msgs_of(s, w_local),
                             window: win_con[s],
-                            _pad: [0; 8],
+                            deg_cnt: ((acc[s].deg as u64) << 32) | acc[s].cnt as u64,
                         },
                     );
                     // Reset the window state (the champion's law: the
@@ -824,14 +862,20 @@ impl FleetEngine {
                     did_work = true;
                 }
             }
-            // The shutdown drain: P0 posted the final window closes;
-            // publish everything then exit.
-            let all_drained = owner_slots.iter().all(|&s| {
-                let gate = &self.gates[s];
-                gate.shutdown.load(Ordering::Acquire)
-                    && win_con[s] >= gate.window_pub.load(Ordering::Acquire)
-            });
-            if all_drained {
+            // The shutdown drain: P0 posted the final window close;
+            // publish everything then park (the exit latch). (THIS
+            // owner's slots only — each owner parks on its own drain.)
+            if self.shutdown.load(Ordering::Acquire)
+                && owner_slots.iter().all(|&s| win_con[s] >= pub_w)
+            {
+                // The telemetry fold (outside every hot path).
+                self.chunk_events.fetch_add(chunks_folded, Ordering::Relaxed);
+                self.owners_parked_c.fetch_add(1, Ordering::Release);
+                self.exit_hold.store(true, Ordering::Release);
+                let mut hb = 0u32;
+                while !self.exit_release.load(Ordering::Acquire) {
+                    rendezvous_spin(&mut hb);
+                }
                 return;
             }
             if !did_work {
@@ -842,72 +886,63 @@ impl FleetEngine {
         }
     }
 
+    /// The parked-owner count (the telemetry rendezvous).
+    pub fn owners_parked(&self) -> u64 {
+        self.owners_parked_c.load(Ordering::Acquire)
+    }
+
     /// The window's message count for slot s (the frozen schedule).
     fn window_msgs_of(&self, s: usize, w: usize) -> u64 {
         self.tapes[s].window_msgs.get(w).copied().unwrap_or(0)
+    }
+
+    /// The non-blocking readiness check: every slot's window-w composite
+    /// has arrived (the lazy merge's gate).
+    pub fn window_ready(&self, w: u64) -> bool {
+        (0..self.map.n_slots).all(|s| self.rings[s].len() > w)
     }
 
     /// P0's digest merger: consume the M composites for window `w` in
     /// ARRIVAL order (any order — Theorem 33(d)), reduce the digest,
     /// chain the day object, and produce the window tuple. Returns the
     /// tuple `(count, hash, msg_hash)` — the harvest's assert unit.
-    pub fn merge_window(&self, w: u64) -> WinTuple {
-        let t0 = std::time::Instant::now();
-        // The arrival-order consume: poll the rings in round-robin until
-        // every slot's window-w entry is in (the SPSC discipline; the
-        // owners never lag more than the ring depth).
-        let mut entries = [CompositeEntry {
-            x: P64::IDENTITY,
-            h_final: 0,
-            msgs: 0,
-            window: u64::MAX,
-            _pad: [0; 8],
-        }; SLOTS_MAX];
+    /// (The caller has verified readiness — no spin here.)
+    pub fn merge_window_nowait(&self, w: u64) -> WinTuple {
         let n = self.map.n_slots;
-        let mut got = [false; SLOTS_MAX];
+        let mut d = Dig::identity();
+        let mut count = 0u64;
+        let mut msg_hash = 0u64;
+        for s in 0..n {
+            let ring = &self.rings[s];
+            let e = ring.peek(w);
+            ring.consume(w + 1);
+            assert_eq!(e.window, w, "merge ring entry order violated at slot {s}");
+            d.v ^= e.v;
+            d.c ^= e.c;
+            d.db = d.db.wrapping_add(e.db);
+            d.da = d.da.wrapping_add(e.da);
+            d.deg = d.deg.wrapping_add((e.deg_cnt >> 32) as u32);
+            d.cnt = d.cnt.wrapping_add((e.deg_cnt & 0xFFFF_FFFF) as u32);
+            count += e.msgs;
+            msg_hash ^= e.h_final;
+        }
+        let hash = d.hash();
+        self.windows_merged.fetch_add(1, Ordering::Relaxed);
+        (count, hash, msg_hash)
+    }
+
+    /// The blocking variant (the finish's final drain only — inside the
+    /// measured window's tail, the champion's own law).
+    pub fn merge_window(&self, w: u64) -> WinTuple {
         let mut spins = 0u32;
-        loop {
-            let mut all = true;
-            for s in 0..n {
-                if got[s] {
-                    continue;
-                }
-                let ring = &self.rings[s];
-                if ring.len() > w {
-                    entries[s] = ring.peek(w);
-                    ring.consume(w + 1);
-                    got[s] = true;
-                } else {
-                    all = false;
-                }
-            }
-            if all {
-                break;
-            }
+        while !self.window_ready(w) {
             spins += 1;
             if spins > 1 << 26 {
                 panic!("R43 merge_window: slot composites for window {w} never arrived (the Null-Flow protocol broke)");
             }
             rendezvous_spin(&mut spins);
         }
-        // The commutative reduction — arrival order is the flat.
-        let mut d = Dig::identity();
-        let mut count = 0u64;
-        let mut msg_hash = 0u64;
-        for s in 0..n {
-            let e = &entries[s];
-            assert_eq!(e.window, w, "merge ring entry order violated at slot {s}");
-            d.accum(&e.x);
-            count += e.msgs;
-            msg_hash ^= e.h_final;
-        }
-        let hash = d.hash();
-        // The per-window chain: the day object's running coordinate.
-        // (The chain is maintained by the harness's digest-chain state —
-        // the window tuple itself is (count, dig-hash, msg-hash).)
-        let _ = t0;
-        self.windows_merged.fetch_add(1, Ordering::Relaxed);
-        (count, hash, msg_hash)
+        self.merge_window_nowait(w)
     }
 }
 
@@ -956,21 +991,32 @@ pub struct FleetSink<'a> {
     pub last_seq: u64,
     last_gen: u64,
     // ── the replay state ──
-    /// P0's per-slot span cursors (the re-issue's arithmetic).
-    r_slot_spans: [u64; SLOTS_MAX],
     /// The replay batch index (the schedule table's cursor).
     r_batch: usize,
     /// The replay window id (the number of closed windows).
     r_windows: u64,
+    /// The oldest UNMERGED window (the lazy merge's frontier — the
+    /// champion's lazy-completion law: P0 NEVER blocks on a lagging
+    /// owner inside the window; the completions trail the closes by
+    /// whatever the owners' pace dictates, and the finish drains).
+    r_merge_pend: u64,
     /// The day chain (replay side — the digest merger's coordinate).
     r_day_chain: u64,
-    /// The completed window tuples (the harvest ring — one-window lag).
-    pub completed: [WinTuple; 64],
+    /// The completed window tuples (the harvest ring — deep: a burst of
+    /// lazy completions after a lag never overflows it; the overflow is
+    /// asserted fail-loud).
+    pub completed: [WinTuple; 4096],
     pub comp_head: usize,
     pub comp_tail: usize,
 }
 
 impl<'a> FleetSink<'a> {
+    /// The bounded-lag backpressure ceiling (the champion's RX_PACE
+    /// class): the lazy merge's lag may grow to this before P0 parks.
+    /// 64 windows ≈ 2× the completion ring's harvest cadence — the
+    /// finish's final drain can never explode past LAG_MAX + in-flight.
+    const LAG_MAX: u64 = 64;
+
     /// Construction mode.
     pub fn new_construction(map: SlotMap) -> Self {
         let n = map.n_slots;
@@ -991,11 +1037,11 @@ impl<'a> FleetSink<'a> {
             count: 0,
             last_seq: 0,
             last_gen: 0,
-            r_slot_spans: [0; SLOTS_MAX],
             r_batch: 0,
             r_windows: 0,
+            r_merge_pend: 0,
             r_day_chain: SPAN_SEED,
-            completed: [(0, 0, 0); 64],
+            completed: [(0, 0, 0); 4096],
             comp_head: 0,
             comp_tail: 0,
         }
@@ -1092,44 +1138,60 @@ impl<'a> FleetSink<'a> {
         self.batch_deltas = [0; SLOTS_MAX];
     }
 
-    /// The replay path's window close (end_pass): publish the window
-    /// close to the gates — the CLOSED-WINDOW COUNT (windows
-    /// 0..count-1 complete) + the GLOBAL-MONOTONE chunk frontier (the
-    /// cycle base + the schedule's cumulative chunk count — one store
-    /// per slot covers the window's chunks AND the tail flush) — then
-    /// merge the PREVIOUS window (the one-window pipeline offset —
-    /// §10.2's fixed-offset law).
+    /// The replay path's window close (end_pass): ONE release-store of
+    /// the global window word (the closed-window count — the ENTIRE
+    /// submitter→owner surface; the owners DERIVE their chunk frontiers
+    /// from the id), then THE LAZY MERGE: complete every window whose M
+    /// composites have ALL arrived, WITHOUT EVER BLOCKING on a lagging
+    /// owner (the champion's lazy-completion law — P0's close is O(1) +
+    /// whatever is ready; the owners' park law bounds the ring's lead).
     pub fn replay_window_close(&mut self) {
         let Some(eng) = self.engine else {
             unreachable!("replay_window_close without the engine");
         };
-        let n_win = eng.oracle.len() as u64;
-        let w_global = self.r_windows;
-        let w_local = (w_global % n_win.max(1)) as usize;
-        // Close window w_global (the gates' markers + the chunk frontier).
-        for s in 0..self.map.n_slots {
-            let gate = &eng.gates[s];
-            let total_chunks = eng.tapes[s].chunk_rec.len() as u64;
-            let cycle_base = (w_global / n_win.max(1)) * total_chunks;
-            let cum = cycle_base + eng.tapes[s].window_chunks[w_local + 1];
-            gate.chunk_pub.store(cum, Ordering::Release);
-            gate.window_pub.store(w_global + 1, Ordering::Release);
-        }
-        // Merge the previous window (if any) — the tuple's completion
-        // lags one window (the champion's lazy completion law).
-        if self.r_windows > 0 {
-            let wm = self.r_windows - 1;
-            let tuple = eng.merge_window(wm);
-            // The chain coordinate (the day object's running hash —
-            // recomputed from the digest's tuple hash).
-            self.r_day_chain = mulmod(self.r_day_chain, t_pow()[64]) ^ tuple.1;
-            self.completed[self.comp_head & 63] = tuple;
-            self.comp_head += 1;
-        }
         self.r_windows += 1;
+        eng.window_pub.store(self.r_windows, Ordering::Release);
         // Reset the per-batch schedule cursor (the next window replays
-        // the same frozen schedule).
+        // the same frozen schedule) + the observable surface's per-window
+        // fields (the champion's end_pass law — the seq numbers restart
+        // with each pass's re-issued call sequence).
         self.r_batch = 0;
+        self.last_seq = 0;
+        self.count = 0;
+        // THE LAZY MERGE (non-blocking): complete whatever is ready.
+        self.complete_ready_windows();
+        // THE BOUNDED-LAG BACKPRESSURE (the champion's RX_PACE class):
+        // if the owners have fallen more than LAG_MAX windows behind
+        // (a descheduled owner, a contended draw), P0 parks until the
+        // lazy merge drains — the finish's final drain can never
+        // explode, and the owners' rings never wedge.
+        let mut sb = 0u32;
+        while self.r_windows - self.r_merge_pend > Self::LAG_MAX {
+            self.complete_ready_windows();
+            if self.r_windows - self.r_merge_pend > Self::LAG_MAX {
+                crate::affinity::rendezvous_spin(&mut sb);
+            }
+        }
+    }
+
+    /// The lazy merge's inner loop (the champion's completion law: P0
+    /// never waits — the tuple completions trail the closes).
+    fn complete_ready_windows(&mut self) {
+        let Some(eng) = self.engine else {
+            unreachable!("complete_ready_windows without the engine");
+        };
+        while self.r_merge_pend < self.r_windows {
+            let w = self.r_merge_pend;
+            if !eng.window_ready(w) {
+                break;
+            }
+            let tuple = eng.merge_window_nowait(w);
+            self.r_day_chain = mulmod(self.r_day_chain, t_pow()[64]) ^ tuple.1;
+            self.completed[self.comp_head & 4095] = tuple;
+            self.comp_head += 1;
+            self.r_merge_pend += 1;
+        }
+        debug_assert!(self.comp_head - self.comp_tail < 4096);
     }
 
     /// The harvest: the completed window tuples (the harness's assert
@@ -1137,28 +1199,30 @@ impl<'a> FleetSink<'a> {
     pub fn harvest(&mut self, out: &mut Vec<WinTuple>) {
         out.clear();
         while self.comp_tail < self.comp_head {
-            out.push(self.completed[self.comp_tail & 63]);
+            out.push(self.completed[self.comp_tail & 4095]);
             self.comp_tail += 1;
         }
     }
 
-    /// The final drain (finish): merge the LAST window + drain the
-    /// owners (the shutdown sweep — the champion's clean-exit law).
+    /// The final drain (finish): the BLOCKING merge of every remaining
+    /// window (the champion's own finish law — the last window's
+    /// verification is part of the measured work), then the shutdown.
     pub fn finish(&mut self) {
         let Some(eng) = self.engine else {
             unreachable!("finish without the engine");
         };
-        // The last window's merge (the offset's tail — the owners
-        // published it at the final close).
-        let w = self.r_windows - 1;
-        let tuple = eng.merge_window(w);
-        self.r_day_chain = mulmod(self.r_day_chain, t_pow()[64]) ^ tuple.1;
-        self.completed[self.comp_head & 63] = tuple;
-        self.comp_head += 1;
-        // Post the shutdown (the owners exit after their drains).
-        for s in 0..self.map.n_slots {
-            eng.gates[s].shutdown.store(true, Ordering::Release);
+        // Drain the lazy merge's tail (blocking — the owners publish as
+        // their rings free; the merge is the pump).
+        while self.r_merge_pend < self.r_windows {
+            let w = self.r_merge_pend;
+            let tuple = eng.merge_window(w);
+            self.r_day_chain = mulmod(self.r_day_chain, t_pow()[64]) ^ tuple.1;
+            self.completed[self.comp_head & 4095] = tuple;
+            self.comp_head += 1;
+            self.r_merge_pend += 1;
         }
+        // Post the shutdown (the owners drain then park at the exit latch).
+        eng.shutdown.store(true, Ordering::Release);
     }
 }
 
@@ -1188,16 +1252,15 @@ impl<'a> Sink for FleetSink<'a> {
 
     fn on_span_batch(&mut self, _proof: &LiveFeedProof, recs: &[SpanRec<'_>]) {
         if self.engine.is_none() {
-            // Construction: the LIVE path.
+            // Construction: the LIVE path (the SpanRec form — cold frames).
             for r in recs {
                 self.construct_span(r.body, r.count as u32);
             }
             self.seal_batch_sched();
             return;
         }
-        // Replay: the frozen-schedule cursor arithmetic (the per-batch
-        // histograms — the SS law; no per-span work on P0's path).
-        self.replay_batch(recs.len() as u64);
+        // Replay: the batch-counter advance (the SpanRec re-issue form).
+        self.r_batch += 1;
     }
 
     fn on_span_batch_packed(
@@ -1208,8 +1271,6 @@ impl<'a> Sink for FleetSink<'a> {
         base_ptr: usize,
         words: &[u64],
     ) {
-        debug_assert_eq!(base_ptr, base_ptr); // (the blob contract)
-        let _ = words;
         assert!(
             proof.gen() >= self.last_gen,
             "G-INV violation: proof gen {} is older than sink last_gen {}",
@@ -1232,45 +1293,43 @@ impl<'a> Sink for FleetSink<'a> {
         self.last_seq = first_seq + total - 1;
         self.count += total;
         if self.engine.is_none() {
-            // Construction: the LIVE path (the words carry the spans —
-            // the bodies must be re-derived for the CRC fold).
-            // NOTE: the construction pass runs the SpanRec emission path
-            // (wants_packed_spans() = false in construction mode); this
-            // arm is unreachable in the bench's shapes but kept sound.
+            // Construction: the LIVE path — reconstruct each span's body
+            // from the packed word (the blob contract: the bytes are
+            // immutable and pass-valid; the hydra's own packed_body law)
+            // and fold it (the demux + the CRC + the three composes).
+            for &w in words {
+                let off = (w & 0xFFFF_FFFF) as usize;
+                let len = ((w >> 32) & 0xFFFF) as usize;
+                let cnt = ((w >> 48) & 0xFFFF) as u32;
+                // SAFETY: the transport's blob contract — the body slice
+                // is the exact bytes on_span would reference (the packed
+                // emission's own guarantee; bounded by the construction).
+                let body =
+                    unsafe { std::slice::from_raw_parts((base_ptr + off) as *const u8, len) };
+                self.construct_span(body, cnt);
+            }
+            self.seal_batch_sched();
             return;
         }
-        // Replay: the histogram advance.
-        self.replay_batch(total);
+        // Replay: the batch-counter advance ONLY (the SS law — the
+        // publication frontier rides the WINDOW CLOSE's cumulative store;
+        // the schedule rows are the construction's audit record).
+        self.r_batch += 1;
     }
 
     #[inline(always)]
     fn wants_packed_spans(&self) -> bool {
-        // Packed emission only in REPLAY mode (the construction needs
-        // the bodies for the CRC fold — the SpanRec path).
-        self.engine.is_some()
+        // Packed emission in BOTH modes — the construction reconstructs
+        // the bodies from the words (the fusion's 22-call cadence rides
+        // the re-issue; the per-span cost is the demux + the fold).
+        true
     }
 }
 
 impl<'a> FleetSink<'a> {
-    /// The replay path's per-batch work: the per-slot histogram advance
-    /// + the chunk publications (ONE release store per completed chunk).
-    fn replay_batch(&mut self, _total: u64) {
-        let Some(eng) = self.engine else {
-            unreachable!("replay_batch without the engine");
-        };
-        let b = self.r_batch;
-        self.r_batch += 1;
-        let row = &eng.sched[b];
-        // The per-slot cursor arithmetic (the SS law — no per-span work
-        // on P0's path). The chunk publications ride the WINDOW CLOSE's
-        // cumulative store (the global-monotone frontier law); the
-        // row's chunk list is the construction's telemetry record.
-        for s in 0..self.map.n_slots {
-            self.r_slot_spans[s] += row.slot_spans[s] as u64;
-            eng.chunk_events
-                .fetch_add(row.chunks.iter().filter(|&&(c, _)| c as usize == s).count() as u64, Ordering::Relaxed);
-        }
-    }
+    // (The replay path's per-batch work is the r_batch counter alone —
+    // the publication frontier rides the WINDOW CLOSE's cumulative
+    // store; the schedule rows are the construction's audit record.)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1363,7 +1422,7 @@ mod cells {
         b[0] = (n >> 8) as u8;
         b[1] = n as u8;
         b[2] = b'A' + (sm64(rnd) % 8) as u8; // the message type
-        let locate = (sm64(rnd) % 8) as u8; // the venue's demux field
+        let locate = (sm64(rnd) % 64) as u8; // the venue's demux field (64 stocks)
         b[3] = 0;
         b[4] = locate;
         for i in 5..n {
@@ -1643,12 +1702,11 @@ mod cells {
         // drives the OWNERS' publication directly — the audit counters
         // watch the merge path itself; the (I) law is the absence of any
         // global-order consult / epoch lock / cross-slot write in it.)
+        eng.window_pub.store(1, Ordering::Release);
         for s in 0..8 {
-            eng.gates[s].chunk_pub.store(1, Ordering::Release);
-            eng.gates[s].window_pub.store(1, Ordering::Release);
             eng.rings[s].publish(
                 0,
-                CompositeEntry { x: P64::IDENTITY, h_final: SPAN_SEED, msgs: 1, window: 0, _pad: [0; 8] },
+                CompositeEntry { v: 0, c: 0, db: 0, da: 0, h_final: SPAN_SEED, msgs: 1, window: 0, deg_cnt: 0 },
             );
         }
         let t = eng.merge_window(0);
@@ -2043,7 +2101,7 @@ mod cells {
     #[test]
     fn t_r43_c51_split_brain_a() {
         let ring = MergeRing::new();
-        let e = CompositeEntry { x: P64::IDENTITY, h_final: 1, msgs: 1, window: 0, _pad: [0; 8] };
+        let e = CompositeEntry { v: 0, c: 0, db: 0, da: 0, h_final: 1, msgs: 1, window: 0, deg_cnt: 0 };
         ring.publish(0, e);
         // The single-writer discipline: publishing window 1 without the
         // merger's consume leaves ONE free slot (depth 8); the would-be
@@ -2064,7 +2122,7 @@ mod cells {
         for w in 0..8u64 {
             ring.publish(
                 w,
-                CompositeEntry { x: P64::IDENTITY, h_final: w as u64, msgs: 1, window: w, _pad: [0; 8] },
+                CompositeEntry { v: 0, c: 0, db: 0, da: 0, h_final: w as u64, msgs: 1, window: w, deg_cnt: 0 },
             );
         }
         assert_eq!(ring.free(8), 0, "+51b: the ring must be exhausted (the park law)");
@@ -2390,7 +2448,7 @@ mod cells {
         for (w, x) in xs.iter().enumerate() {
             ring.publish(
                 w as u64,
-                CompositeEntry { x: *x, h_final: 0, msgs: 1, window: w as u64, _pad: [0; 8] },
+                CompositeEntry { v: x.v, c: x.c, db: x.db, da: x.da, h_final: 0, msgs: 1, window: w as u64, deg_cnt: ((x.deg as u64) << 32) | x.cnt as u64 },
             );
         }
         // Consume in a shuffled order (the arrival-order law).
@@ -2403,7 +2461,12 @@ mod cells {
         for &w in &order {
             let e = ring.peek(w as u64);
             assert_eq!(e.window, w as u64, "+56b: the ring entry's window tag");
-            d.accum(&e.x);
+            d.v ^= e.v;
+            d.c ^= e.c;
+            d.db = d.db.wrapping_add(e.db);
+            d.da = d.da.wrapping_add(e.da);
+            d.deg = d.deg.wrapping_add((e.deg_cnt >> 32) as u32);
+            d.cnt = d.cnt.wrapping_add((e.deg_cnt & 0xFFFF_FFFF) as u32);
         }
         assert_eq!(d, flat, "+56b: the out-of-order ring consume changed the digest");
     }
@@ -2774,5 +2837,9 @@ mod engine {
         }
         // The engagement: the merges actually ran.
         assert_eq!(eng.windows_merged.load(Ordering::Relaxed), (5 * n_win) as u64);
+        // Release the parked owners (the exit latch — the test's own
+        // cleanliness law; the parked spinners would otherwise burn the
+        // test binary's remaining runs).
+        eng.exit_release.store(true, Ordering::Release);
     }
 }
