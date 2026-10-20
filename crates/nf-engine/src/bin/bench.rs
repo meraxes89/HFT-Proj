@@ -1362,7 +1362,14 @@ fn run_hydra_sustained_5s(
             // tiling) arm the elision on BOTH lanes: each lane's
             // machine steps at every boundary (the multi-boundary
             // collector's bracket discipline), so the counts scale by
-            // the worker count verbatim.
+            // the worker count verbatim. R42: the upper slack widens by
+            // +64/worker — under starved workers (loaded boxes, the
+            // recording orbit's live walk outrun by the submission) the
+            // work-assist fires and each inline episode HOLES the phase
+            // script (the designed discard law), re-recording it as a
+            // live pass; the slack absorbs the honest re-record count
+            // while a double-crossing protocol break still reads
+            // crossed ≈ 2·(n·d_passes), far past any slack.
             if res_replay_on && n_workers >= 1 {
                 let crossed = replayed + live;
                 assert!(
@@ -1371,10 +1378,10 @@ fn run_hydra_sustained_5s(
                      < {n_workers}x{d_passes} (replayed={replayed} live={live})"
                 );
                 assert!(
-                    crossed <= n_workers * (d_passes + 8),
+                    crossed <= n_workers * (d_passes + 8 + 64),
                     "R36-E engagement: the workers crossed {crossed} boundaries \
                      > {n_workers}x{} (a re-record loop?)",
-                    d_passes + 8
+                    d_passes + 8 + 64
                 );
                 assert!(
                     replayed > 0,

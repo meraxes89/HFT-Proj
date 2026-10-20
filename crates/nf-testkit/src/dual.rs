@@ -94,31 +94,32 @@ pub const CUR_BATCH_MASK: u64 = (1u64 << 20) - 1;
 /// The poison word's clean value.
 pub const POISON_CLEAN: u64 = u64::MAX;
 
-/// The shared leaf ring's capacity (leaves). R41b: 2048 → 16384 — the
+/// The shared leaf ring's capacity (leaves). R41b: 2048 → 8192 — the
 /// R41 fleet (run 39405512333) priced the 21-pass quantum: P1 filled
 /// the old ring every ~21 passes and parked (21.6M parks on the record
 /// draw — the arrival frontier moved in 21-pass quanta paced by P0's
-/// merge bursts, the completion-pace stall's successor). The wide ring
-/// (with the per-pass PRE-COMPOSED leaves below: ~1 leaf/pass steady)
-/// holds thousands of passes of lead; the degenerate raw-leaf shapes
-/// (~200 leaves/pass) still hold ~80 passes — the quantum amortizes
-/// ~4-8× whatever the shape.
+/// merge bursts, the completion-pace stall's successor). R42's coarse
+/// grid cuts the steady leaf count to ~16/pass (the 512-span runs), so
+/// the wide ring holds (8192 − 1024)/16 ≈ 448 passes of lead — the
+/// park cadence amortizes ~5× further than R41b's 83-pass quantum; the
+/// degenerate raw-leaf shapes still park proportionally earlier (the
+/// fail-soft bound).
 pub const J1_CAP: usize = 8192;
 /// The push gate's headroom: P1 parks when `len − consumed` exceeds
 /// this (the margin keeps P0's in-flight merge reads stable — the
 /// disjoint-slot law). R41b: 256 → 1024 — the same 1/8 share of the
 /// widened ring (the composed steady law never reaches it; the
-/// degenerate raw-leaf shapes park at ~36 passes — the fail-soft
-/// bound).
+/// degenerate raw-leaf shapes park at the fail-soft bound).
 pub const J1_HEADROOM: u64 = 1024;
 /// The arrival ring's slots (a power of two ≥ 2× the push-gate's
-/// lead bound). R41b: 64 → 256 — the widened j1 lead bound is
-/// (8192 − 1024) leaves ≈ 36 passes at the worst degenerate raw-leaf
-/// law (~200 leaves/pass) and thousands at the pre-composed steady
-/// law (~1 leaf/pass); 256 slots ≥ 3× the worst bound (the original
+/// lead bound). R42: 256 → 2048 — the coarse grid's lead bound is
+/// (8192 − 1024) leaves / ~16 leaves-per-pass ≈ 448 passes (the
+/// steady law; the degenerate shapes lead LESS — the ring fills
+/// faster), so 2048 slots ≥ 4× the worst steady bound (the original
 /// law: a lap would overwrite an unconsumed arrival — the slot-pass
-/// debug assert's class).
-pub const ARR_SLOTS: usize = 256;
+/// debug assert's class). The slots are 32 B each — 64 KB once at
+/// spawn.
+pub const ARR_SLOTS: usize = 2048;
 
 /// The lane-territory projection: the end position of `lane`'s res
 /// sub-stream when the global stream stands at `s`. If `s` falls
@@ -1142,20 +1143,26 @@ mod tests {
     /// The lane-territory projection law: for every global position the
     /// projection lands exactly where the lane's sub-stream resumes,
     /// and the two lanes' projections bracket the global cursor.
+    /// R42: the positions re-derived on the 512-span grid (chunk 1 =
+    /// [512, 1024) is lane 1's; chunk 2 = [1024, 1536) is lane 0's).
     #[test]
     fn t_r40_lane_end_law() {
         assert_eq!(lane_end_at(0, 0), 0);
         assert_eq!(lane_end_at(0, 1), 0);
-        // Mid-chunk on lane 1 (chunk 15 = [960, 1024)): lane 1 projects
+        // Mid-chunk on lane 1 (chunk 1 = [512, 1024)): lane 1 projects
         // to s, lane 0 to the chunk start.
         assert_eq!(lane_end_at(1000, 1), 1000);
-        assert_eq!(lane_end_at(1000, 0), 960);
-        // A chunk-aligned s on lane-0 territory (chunk 14 ends at 960):
-        assert_eq!(lane_end_at(960, 0), 960);
-        assert_eq!(lane_end_at(960, 1), 896);
-        // A chunk-aligned s ending a lane-1 chunk (chunk 15 ends 1024):
+        assert_eq!(lane_end_at(1000, 0), 512);
+        // Mid-chunk on lane 0 (chunk 2 = [1024, 1536)): lane 0 projects
+        // to s, lane 1 to the chunk start.
+        assert_eq!(lane_end_at(1100, 0), 1100);
+        assert_eq!(lane_end_at(1100, 1), 1024);
+        // A chunk-aligned s ending a lane-1 chunk (chunk 1 ends 1024):
         assert_eq!(lane_end_at(1024, 1), 1024);
-        assert_eq!(lane_end_at(1024, 0), 960);
+        assert_eq!(lane_end_at(1024, 0), 512);
+        // A chunk-aligned s ending a lane-0 chunk (chunk 2 ends 1536):
+        assert_eq!(lane_end_at(1536, 0), 1536);
+        assert_eq!(lane_end_at(1536, 1), 1024);
         // Exhaustive vs the reference derivation (chunk parity).
         for s in 1..(CHUNK * 8) {
             for lane in [0u64, 1u64] {

@@ -323,17 +323,17 @@ echo "=== 11u. R15: Worker Drain Granularity Sweep (the supply-side rebalance) =
 # docs/27 §7's third queue item: with the R13/R14/R15 kernel gains the
 # workers drain faster, and the batch shape that paced the result
 # publications against main's ordered fold may want re-tuning per class.
-# HFT_WORKER_BATCH (a multiple of the 64-span CHUNK, clamped to [64, 256])
-# is read once per worker spawn; the default 128 is the R8 shape. Two
-# soaks per draw price the direction; the evidence ledger records whatever
-# the silicon says.
+# HFT_WORKER_BATCH (a multiple of the 512-span CHUNK, clamped to
+# [512, 2048]) is read once per worker spawn; the default 1024 (two
+# coarse chunks) is the R42 shape. Two soaks per draw price the
+# direction; the evidence ledger records whatever the silicon says.
 # R17 NOTE: post-flip these soaks run on the RING path (the A3-a pricing —
 # the R15 batch cap postdates the R12-era 1,186.1M ring+siblings
 # reference; draw 16 priced both sweep points +4.6% over the 128 default).
-HFT_WORKER_BATCH=64 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_wbatch_64.txt
+HFT_WORKER_BATCH=512 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_wbatch_64.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_wbatch_64.txt
 grep -q "allocs=0" /tmp/bench_wbatch_64.txt
-HFT_WORKER_BATCH=256 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_wbatch_256.txt
+HFT_WORKER_BATCH=2048 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_wbatch_256.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_wbatch_256.txt
 grep -q "allocs=0" /tmp/bench_wbatch_256.txt
 
