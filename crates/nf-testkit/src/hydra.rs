@@ -6346,8 +6346,8 @@ impl<'a> HydraSpanSink<'a> {
                 // Compact 8-byte span desc: offset | len. One aligned u64
                 // store — 8 descs per L1 line.
                 let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
-                debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
-                debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
                 // The word at pos & DESC_MASK is producer-owned (space
                 // checked at chunk start) and unread by the worker until
                 // the Release publish below.
@@ -6490,9 +6490,9 @@ impl<'a> HydraSpanSink<'a> {
                     idx < st.cap(),
                     "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
                 );
-                debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
                 let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
-                debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
                 let w = desc8_pack_span(off as u32, body.len() as u16)
                     | if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
                 if st.get_arr(self.rx_win_slot, idx) != w {
@@ -6524,9 +6524,9 @@ impl<'a> HydraSpanSink<'a> {
                 idx < st.cap(),
                 "rxdesc window exceeds array cap (HFT_RXDESC_CAP)"
             );
-            debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+            assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
             let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
-            debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+            assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
             let w = desc8_pack_span(off as u32, body.len() as u16)
                 | if self.rx_affine { RX_AFFINE_FLAG } else { 0 };
             if st.get_arr(self.rx_win_slot, idx) != w {
@@ -6750,8 +6750,8 @@ impl<'a> HydraSpanSink<'a> {
                 for g in 0..8 {
                     let body = recs[i + g].body;
                     let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
-                    debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
-                    debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                    assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                    assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
                     expect[g] = desc8_pack_span(off as u32, body.len() as u16) | affine_flag;
                 }
                 let bad = st.check_arr8(self.rx_win_slot, base_idx, &expect);
@@ -6784,9 +6784,9 @@ impl<'a> HydraSpanSink<'a> {
                 let body = recs[i].body;
                 let idx = (self.next_span - self.rx_win_base) as usize;
                 assert!(idx < st.cap(), "rxdesc window exceeds array cap (HFT_RXDESC_CAP)");
-                debug_assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
+                assert!(body.len() <= u16::MAX as usize, "Desc8 len overflows u16");
                 let off = (body.as_ptr() as usize).wrapping_sub(self.blob_base);
-                debug_assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
+                assert!(off <= u32::MAX as usize, "Desc8 offset overflows u32");
                 let w = desc8_pack_span(off as u32, body.len() as u16) | affine_flag;
                 if st.get_arr(self.rx_win_slot, idx) != w {
                     // R27: the toroidal window's shared-slot write — wait
@@ -7279,9 +7279,20 @@ impl<'a> HydraSpanSink<'a> {
         // An unconditional anchor means the worker NEVER extrapolates
         // across any chunk boundary.
         if self.desc8 && self.blob_base != 0 {
-            // Write-once-per-lane blob base (ordered before this chunk's
-            // publish; the worker reads it after its desc_head Acquire).
-            if lane.base.load(Ordering::Relaxed) == 0 {
+            // R43 / SCOPE.MD A-2: PER-GENERATION RE-CAPTURE. The old
+            // write-once-per-lane law (`if base == 0`) was the ONE silent
+            // wrong-answer face in the fold core: a second HydraSpanSink
+            // over a REUSED fabric with a transport blob at a different
+            // address leaves the stale base in place — span ids stay
+            // correct, the fold-order assert PASSES, and the workers CRC
+            // garbage or freed memory (wrong SPANHASH, silent; UB if the
+            // old blob dropped). The lane's ownership protocol already
+            // transfers producer→consumer per chunk (the SPSC pair), so
+            // re-storing whenever the base DIFFERS is sound: the store
+            // precedes this chunk's desc_head Release and the worker's
+            // read follows its desc_head Acquire — the new base is
+            // visible before any new chunk is consumed.
+            if lane.base.load(Ordering::Relaxed) != self.blob_base as u64 {
                 lane.base.store(self.blob_base as u64, Ordering::Release);
             }
         }

@@ -1599,7 +1599,11 @@ fn rx_thread(
         // last-writer-wins chain was N redundant stores for 1 value).
         let mut pub_clock: u64 = 0;
         let rx_start = rxs.idx;
-        debug_assert!(rx_start <= u32::MAX as usize);
+        // R43 / SCOPE.MD F-7: RUNTIME width guard (was debug-only — a
+        // >4G-frame pass-local index wraps in the u32 cast below → wrong
+        // master slice → bounds panic AFTER the ledger identity guard may
+        // have matched a wrong record).
+        assert!(rx_start <= u32::MAX as usize, "F-7: rx_start overflows u32");
         let t_prod = std::time::Instant::now();
         while acc + 256 <= ENTRY_CAP {
             let tp0 = if diag {

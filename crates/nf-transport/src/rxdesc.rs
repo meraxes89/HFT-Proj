@@ -492,7 +492,10 @@ pub fn rxdesc_affine_enabled() -> bool {
 /// generation base span id (record). A 48-bit span id covers 280T spans.
 #[inline(always)]
 pub fn rx_pack_u64(gen: u64, value: u64) -> u64 {
-    debug_assert!(gen < (1 << 16) && value < (1 << 48));
+    // R43 / SCOPE.MD F-4: RUNTIME width guard (was debug-only — the
+    // 200B+ corridor sustains 48-bit span counts in ~minutes; a silent
+    // truncation aliases an older generation's window).
+    assert!(gen < (1 << 16) && value < (1 << 48));
     (gen << 48) | value
 }
 
@@ -527,8 +530,12 @@ const _: () = assert!(RX_NARR <= 8, "R27 aslot field is 3 bits");
 /// sustained headroom; `debug_assert`ed at pack time).
 #[inline(always)]
 pub fn rx_pack_record(gen: u64, base_span: u64, pass_start: bool, arr_slot: u8) -> u64 {
-    debug_assert!(gen < (1 << 16) && base_span < (1 << 44));
-    debug_assert!((arr_slot as usize) < RX_NARR);
+    // R43 / SCOPE.MD F-4: RUNTIME width guards (were debug-only — at the
+    // 200B corridor a 44-bit base_span truncates in ~88 s sustained and
+    // aliases an older window's record → wrong-window descriptors →
+    // lane hash divergence, the exact class the mission briefs).
+    assert!(gen < (1 << 16) && base_span < (1 << 44));
+    assert!((arr_slot as usize) < RX_NARR);
     (gen << 48)
         | if pass_start {
             RX_REC_PASS_BIT | (base_span & RX_REC_BASE_MASK)
@@ -1097,7 +1104,10 @@ impl RxdescState {
         delta: u64,
         flag: u64,
     ) -> u8 {
-        debug_assert!(delta <= u32::MAX as u64, "R28 delta overflows u32");
+        // R43 / SCOPE.MD F-8: RUNTIME guard (was debug-only — a delta
+        // past u32::MAX carries into the len field and the check-and-fix
+        // "fixes" HEALTHY descriptors with wrong values).
+        assert!(delta <= u32::MAX as u64, "R28 delta overflows u32");
         #[cfg(target_arch = "x86_64")]
         {
             if r25c_avx512f() {
@@ -1166,7 +1176,8 @@ impl RxdescState {
         delta: u64,
         flag: u64,
     ) -> u16 {
-        debug_assert!(delta <= u32::MAX as u64, "R31-B delta overflows u32");
+        // R43 / SCOPE.MD F-8: RUNTIME guard (the 16-wide twin's law).
+        assert!(delta <= u32::MAX as u64, "R31-B delta overflows u32");
         #[cfg(target_arch = "x86_64")]
         {
             if r25c_avx512f() {
