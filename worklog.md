@@ -420,3 +420,19 @@ Work Log:
 
 Stage Summary:
 - The quantum widening is sound except its journal margin — fixed. The corridor attempt continues on the fleet.
+
+---
+Task ID: R41-FINAL
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41c fleet verdict + the session's closing state (PR #23, branch feat/r41-completion-cadence-200b @ d918806).
+
+Work Log:
+- THE R41c DRAW (run 39413975293): 39/40 shards green; shard 37 died on the MONO/affine arm's `ALLOC_DELTA must be 0` (left: 2) — a rare in-window allocation face on the non-dual path (selfserve=0, the assist regime), 1/40, rate-irrelevant, not the dual machinery (the merge telemetry only runs under the dual arm). The run's conclusion: failure on that single shard.
+- THE R41c DUAL RATES (the quantum-widened draws): shard 3: 116.9B, 17: 111.9B, 19: 115.3B, 27: 111.9B, 30: 113.9B (+ the r40x counterfactual's 86.8B) — a modest lift over R41's 108.9-113.9B; the corridor NOT reached.
+- THE DEFINITIVE ANATOMY (shard 3's dual arm): passes=1,156,987 (4.32us/pass) = work 0.54 + fold-share 0.56 + MERGE 2.31 (merge_ms=2678.5 = 54% of the period) + the coupling slack. THE BOUNDARY MERGE IS THE WALL, PRICED BY THE NEW TELEMETRY — exactly the class the directive's "Deferred Boundary Amortization" targeted.
+- THE PRE-COMPOSE REFUTATION (this session's mathematical result): one lane's per-pass composite reorders the globally-interleaved merge sequence and the semidirect law is non-commutative — divergence. Only globally-contiguous groups compose; the interleave granularity IS the leaf granularity.
+- R42'S DESIGN (pinned by the telemetry): THE COARSE-RECORD GRID — the workers' composite records at 512-span granularity (4x coarser chunks) -> ~24 leaves/pass instead of ~194 -> the boundary tree drops ~3 levels -> the merge ~0.3-0.5us/pass -> the period ~2.5us -> the 200B corridor. The grid rework (the chunk-parity law, the lane projections, the k<=fold_rem asserts, the record/boundary split discipline) is the next session's program.
+
+Stage Summary:
+- LANDED (CI-verified, bit-exact, allocs=0): the arrival-handshake kill (R41), the mid-drain-park deadlock fix (the crossing cursor store), the quantum widening + the FJ_CAP contamination fix (R41b/c), the rendezvous spin law, PASS_RING=512, the merge pricing telemetry.
+- THE HONEST CORRIDOR STATUS: 108.9-116.9B (from the 108.1-117.4B baseline) — the handshake is dead but the merge serialization is the named successor wall at 2.31us/pass. The 200B line needs R42's coarse-record grid. The pre-compose dead-end is documented in the code as the law's own record.
