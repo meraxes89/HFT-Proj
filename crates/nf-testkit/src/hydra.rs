@@ -900,9 +900,20 @@ struct PassRec {
 /// workers are throughput-bound (the ring protocol's desc-ring backpressure
 /// capped the lag at ~1 pass). The harvest ring must hold that lag plus
 /// margin; R27c's 64-slot record ring raises the reachable fold lag to
-/// ~63 windows, so the harvest ring runs 64 deep to match. The records
+/// ~63 windows, so the harvest ring ran 64 deep to match. The records
 /// are 40 B each — 2.6 KB total.
-pub const PASS_RING: usize = 64;
+///
+/// R41: 64 -> 512 — the strict pass-by-pass parking threshold is
+/// DELETED (the completion-pace gate's 56-slot bound + the head advance
+/// on the next line made the cadence park→submit-one-pass→park: a 1:1
+/// lockstep with the completion frontier that cost 65% of the record
+/// window). The cursor-gated completion and the record-slot reuse gate
+/// (REC_RING=64, the fold frontier) are the LIVE flow controls now;
+/// the pass ring at 512 sits far beyond both as pure insurance, so
+/// `begin_pass`'s park fires only on a degenerate run (a completion
+/// frontier stalled > ~460 passes — the fail-loud diagnostics' domain,
+/// not the steady path). 512 × 40 B = 20 KB.
+pub const PASS_RING: usize = 512;
 
 /// Cache-line-padded cursor to keep producer and consumer writes on
 /// different lines (no false sharing between main and worker cores).
@@ -4528,6 +4539,14 @@ pub struct HydraSpanSink<'a> {
     dual_passes: u64,
     dual_merges: u64,
     dual_poisoned: bool,
+    /// R41: THE COUNT LAW'S CONSTANT — the script's per-pass odd total
+    /// (the frozen schedule's suppressed-batch count; cached at the arm,
+    /// one script walk). The cursor-gated completions publish it as the
+    /// pass's P1 contribution (the R40c ground-truth law: the script IS
+    /// the exact count for the suppressed surface, independent of P1's
+    /// drain progress); the arrival fast path carries the same value
+    /// (P1 publishes the same constant).
+    dual_c1_pass: u64,
     /// R40: the sink's begin_pass sequence (1-based; stamped into the
     /// pass records — the arrival-pass key).
     pass_counter: u64,
@@ -4678,6 +4697,7 @@ impl<'a> HydraSpanSink<'a> {
             dual_passes: 0,
             dual_merges: 0,
             dual_poisoned: false,
+            dual_c1_pass: 0,
             pass_counter: 0,
             z1_fold_pos: 0,
             z1_fold_rem: CHUNK,
@@ -4796,6 +4816,15 @@ impl<'a> HydraSpanSink<'a> {
         self.fold_pos = f0;
         self.fold_rem = CHUNK - (f0 % CHUNK);
         self.fold_lane = 0;
+        // R41: THE COUNT LAW'S CONSTANT — the script's per-pass odd total,
+        // cached once (the cursor-gated completions publish it as every
+        // armed pass's P1 contribution; the script is filled BEFORE this
+        // call on THIS thread, and P1 is still blocked on the `armed`
+        // word until the caller's `gate.arm()` — the single-writer law).
+        self.dual_c1_pass = {
+            let s = gate.script();
+            s.odd_totals_before(s.n)
+        };
         self.dual = Some(gate);
         self.dual_armed = true;
         self.p1_suppress = false;
@@ -4878,11 +4907,11 @@ impl<'a> HydraSpanSink<'a> {
             return;
         };
         // The bounded terminal wait (the ownership transfer's law —
-        // P1's exit is its next owned-batch check or its pass-end
-        // drain's natural completion; both µs-scale, both feed-forward).
+        // P1's exit is its next drain-cycle poison observation, µs-scale
+        // under the continuous drainer). R41: the RENDEZVOUS SPIN.
         let mut sb = 0u32;
         while !gate.p1_done() {
-            crate::affinity::polite_spin(&mut sb);
+            crate::affinity::rendezvous_spin(&mut sb);
         }
         // Capture the zombie's lane-1 state (stable post-done).
         self.z1_fold_pos = gate.p1_fold();
@@ -5042,68 +5071,77 @@ impl<'a> HydraSpanSink<'a> {
         // a pass-start window (its record carries the flag; the
         // composite-fold workers split their segment at this span).
         self.pass_start_span = self.next_span;
-        // R40c: THE COMPLETION-PACE GATE — under the dual the boundary
-        // completions depend on P1's arrivals (ANOTHER thread's pace),
-        // and the fleet's first 11r40 draw proved P0's pass driving can
-        // outrun them: 64 pending passes and the ring's capacity assert
-        // fires (~100ms into the sustained window, every target-silicon
-        // shard). The mono never had this — its completions self-pace on
-        // its OWN fold. THE LAW: P0's pass-driving lead over the
-        // COMPLETION frontier is bounded (PASS_RING − the margin); at
-        // the bound, P0 parks (folding + completing — the arrivals land
-        // as P1 drains) until the harvest frees slots. THE DIAGNOSTICS:
-        // a stall line at 250ms (a healthy park is microseconds — the
-        // line fires only when P1 is genuinely stuck, and it carries the
-        // full rendezvous state), and a bounded patience of 10s (way
-        // beyond any legitimate transient) that fails LOUD with the same
-        // dump — the shard dies in minutes with the data, never a
-        // 35-minute timeout.
+        // R41: THE COMPLETION-PACE GATE, REWORKED — the R40c shape
+        // (park at PASS_RING−8 = 56 of 64, with `pass_head` advancing
+        // the very next line) made the cadence park→submit-ONE-pass→
+        // park: a strict 1:1 lockstep with the completion frontier,
+        // each exit needing P1's per-pass arrival — 65% of the record
+        // window parked, the passes' own telemetry. THE R41 LAWS: the
+        // completions are CURSOR-GATED (P1's drain cursor, not its
+        // per-pass handshake), P1 drains CONTINUOUSLY (no per-pass
+        // barrier), and the pass ring runs 512 deep — the park below
+        // is pure ring-capacity flow control that only a degenerate
+        // run reaches (the record-slot reuse gate at REC_RING=64 is
+        // the live submission bound, and it rides the fold frontier,
+        // which advances at the workers' pace with zero handshakes).
+        // THE SPIN: the RENDEZVOUS SPIN — a fixed PAUSE burst, never a
+        // yield (the 1:1-pinned topology has no other runnable thread;
+        // the old escalation's `yield_now()` was a scheduler
+        // round-trip per rendezvous), and the stall diagnostics read
+        // the clock once per 2^15 polls (the old per-iteration
+        // `elapsed()` was a vDSO call on this path). The 250ms stall
+        // line and the 10s bounded patience (fail LOUD with the
+        // rendezvous state) carry over verbatim.
         if self.dual.is_some() {
-            let mut sb = 0u32;
             let park_start = std::time::Instant::now();
             let mut logged = false;
+            let mut sb = 0u32;
+            let mut polls: u64 = 0;
             while (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING >= PASS_RING - 8 {
                 self.fold_available();
-                crate::affinity::polite_spin(&mut sb);
-                let el = park_start.elapsed();
-                if !logged && el >= std::time::Duration::from_millis(250) {
-                    logged = true;
-                    if let Some(g) = &self.dual {
-                        let (l1_head, l1_tail) = self
-                            .fabric
-                            .map(|f| (f.lane(1).r40_res_head(), f.lane(1).r40_res_tail_load()))
-                            .unwrap_or((0, 0));
-                        eprintln!(
-                            "R40_PACE_STALL pending_passes={} armed_from={} p1_fold={} p1_done={} arrivals={} j1_len_snapshot={} j1_consumed={} next_span={} fold_pos={} lane1_res_head={} lane1_res_tail={} (R40c: the completion-pace gate bound — P0 waiting on the rendezvous; a healthy park is microseconds, this line means P1 is stuck or starved)",
-                            (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING,
-                            g.armed_from(),
-                            g.p1_fold(),
-                            g.p1_done(),
-                            g.arrival_count(),
-                            g.j1.snapshot(),
-                            g.j1.consumed(),
-                            self.next_span,
-                            self.fold_pos,
-                            l1_head,
-                            l1_tail
+                crate::affinity::rendezvous_spin(&mut sb);
+                polls = polls.wrapping_add(1);
+                if polls & 0x7FFF == 0 {
+                    let el = park_start.elapsed();
+                    if !logged && el >= std::time::Duration::from_millis(250) {
+                        logged = true;
+                        if let Some(g) = &self.dual {
+                            let (l1_head, l1_tail) = self
+                                .fabric
+                                .map(|f| (f.lane(1).r40_res_head(), f.lane(1).r40_res_tail_load()))
+                                .unwrap_or((0, 0));
+                            eprintln!(
+                                "R41_PACE_STALL pending_passes={} armed_from={} p1_fold={} p1_done={} arrivals={} j1_len_snapshot={} j1_consumed={} next_span={} fold_pos={} lane1_res_head={} lane1_res_tail={} (R41: the completion-pace gate bound — P0 waiting on the CURSOR rendezvous; a healthy park is microseconds, this line means P1 or the workers are stuck or starved)",
+                                (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING,
+                                g.armed_from(),
+                                g.p1_fold(),
+                                g.p1_done(),
+                                g.arrival_count(),
+                                g.j1.snapshot(),
+                                g.j1.consumed(),
+                                self.next_span,
+                                self.fold_pos,
+                                l1_head,
+                                l1_tail
+                            );
+                        }
+                    }
+                    if el >= std::time::Duration::from_secs(10) {
+                        if let Some(g) = &self.dual {
+                            eprintln!(
+                                "R41_PACE_TIMEOUT armed_from={} p1_fold={} p1_done={} arrivals={} j1={} consumed={} (the rendezvous is dead — failing loud)",
+                                g.armed_from(),
+                                g.p1_fold(),
+                                g.p1_done(),
+                                g.arrival_count(),
+                                g.j1.snapshot(),
+                                g.j1.consumed()
+                            );
+                        }
+                        panic!(
+                            "R41: the completion-pace gate exhausted its patience — the dual rendezvous is dead (see R41_PACE_TIMEOUT above)"
                         );
                     }
-                }
-                if el >= std::time::Duration::from_secs(10) {
-                    if let Some(g) = &self.dual {
-                        eprintln!(
-                            "R40_PACE_TIMEOUT armed_from={} p1_fold={} p1_done={} arrivals={} j1={} consumed={} (the rendezvous is dead — failing loud)",
-                            g.armed_from(),
-                            g.p1_fold(),
-                            g.p1_done(),
-                            g.arrival_count(),
-                            g.j1.snapshot(),
-                            g.j1.consumed()
-                        );
-                    }
-                    panic!(
-                        "R40c: the completion-pace gate exhausted its patience — the dual rendezvous is dead (see R40_PACE_TIMEOUT above)"
-                    );
                 }
             }
         }
@@ -5304,25 +5342,52 @@ impl<'a> HydraSpanSink<'a> {
                             break;
                         }
                         if pass_id >= armed {
-                            // … and P1's arrival for THIS pass (the lazy
-                            // law: a lagging P1 defers the completion;
-                            // P0 never blocks — the tail folds during
-                            // the next pass exactly as the mono's does).
-                            // R40d: the FULL arrival — the count AND the
-                            // pre-staged j1 run window (P1's boundary
-                            // step; the compacted run-drain's operands).
+                            // … and R41: THE CURSOR GATE — P1's lane-1
+                            // cursor crossed the boundary's projection
+                            // (`p1_fold`, published at every drain's end).
+                            // THE OLD LAW (the per-pass arrival handshake:
+                            // P0 waits for P1's ARRIVAL, which waits for
+                            // P1's whole per-pass cycle — the dispatch,
+                            // the pass-end drain barrier, the publication)
+                            // locked the completion frontier 1:1 to P1's
+                            // cycle cadence: P0's begin_pass park consumed
+                            // 65% of the record window waiting for
+                            // arrivals that trailed the DRAIN by the
+                            // ceremony's own overhead. THE R41 LAW: the
+                            // CURSOR is the rendezvous (the pre-arm path's
+                            // own proven gate — `dual_lanes_past` reads
+                            // the same word); the ARRIVAL (published by
+                            // the continuous drainer AT the crossing,
+                            // BEFORE its cursor store) is the run-window
+                            // FAST PATH, always visible when the gate
+                            // passes; the count is script-direct (the
+                            // R40c ground-truth law) on the fallback.
+                            if gate.p1_fold() < crate::dual::lane_end_at(end_span, 1) {
+                                gate.arrival_defers.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
                             match gate.arrival_full(pass_id) {
-                                Some((c1, run_start, run_len)) => self.dual_complete_one(
-                                    &gate,
-                                    end_span,
-                                    Some(c1),
-                                    0,
-                                    false,
-                                    Some((run_start, run_len)),
-                                ),
+                                Some((c1, run_start, run_len)) => {
+                                    gate.r41_fast.fetch_add(1, Ordering::Relaxed);
+                                    self.dual_complete_one(
+                                        &gate,
+                                        end_span,
+                                        Some(c1),
+                                        0,
+                                        false,
+                                        Some((run_start, run_len)),
+                                    );
+                                }
                                 None => {
-                                    gate.arrival_defers.fetch_add(1, Ordering::Relaxed);
-                                    break;
+                                    gate.r41_scan.fetch_add(1, Ordering::Relaxed);
+                                    self.dual_complete_one(
+                                        &gate,
+                                        end_span,
+                                        Some(self.dual_c1_pass),
+                                        0,
+                                        false,
+                                        None,
+                                    );
                                 }
                             }
                         } else {
@@ -5880,9 +5945,12 @@ impl<'a> HydraSpanSink<'a> {
             if end != u64::MAX {
                 let mut sb = 0u32;
                 // R40: the dual/zombie lanes-past law (both cursors).
+                // R41: the RENDEZVOUS SPIN (never a yield — the
+                // completion-path law; this gate is the rotation
+                // regime's live submission bound).
                 while !self.dual_lanes_past(end) {
                     self.fold_available();
-                    crate::affinity::polite_spin(&mut sb);
+                    crate::affinity::rendezvous_spin(&mut sb);
                 }
             }
             // Warm start: copy the previous window's span-indexed entries
@@ -5943,9 +6011,16 @@ impl<'a> HydraSpanSink<'a> {
         if rend != u64::MAX {
             let mut sb = 0u32;
             // R40: the dual/zombie lanes-past law (both cursors).
+            // R41: THE RENDEZVOUS SPIN — this gate is the DUAL
+            // regime's LIVE submission bound (the assist valve is
+            // closed at the arm, so the RX_PACE gate never fires;
+            // REC_RING=64 windows of lead over the fold frontier,
+            // each exit costing one fold-period of progress — the
+            // never-yield law keeps the exit's observation latency at
+            // ~100ns instead of a scheduler round-trip).
             while !self.dual_lanes_past(rend) {
                 self.fold_available();
-                crate::affinity::polite_spin(&mut sb);
+                crate::affinity::rendezvous_spin(&mut sb);
             }
         }
         // R25a: the pass-start flag — a window opening exactly at the
@@ -7797,17 +7872,18 @@ impl<'a> HydraSpanSink<'a> {
             self.rx_win_ss = false;
             self.rx_win_pre = 0;
             if self.dual_armed || self.dual_poisoned {
-                // R40c: THE DUAL/ZOMBIE FINISH — drain both lanes to
+                // R40c/R41: THE DUAL/ZOMBIE FINISH — drain both lanes to
                 // their projections, then (armed only) wait for P1's
                 // terminal state. The harness posted
                 // `initiate_shutdown(next_span)` BEFORE this call: P1's
-                // exit path is the SHUTDOWN SWEEP (it drains its
-                // remaining lane-1 territory pass-by-pass to the
-                // frontier, publishing each pass's arrival from the
-                // script's totals) and only then posts p1_done — so
-                // this wait terminates with every boundary complete
+                // exit path is the drain's own continuation (the
+                // continuous drainer sweeps its remaining lane-1
+                // territory to the frontier's projection — the records
+                // all exist, P0 drove them — publishing each boundary's
+                // arrival at its crossing) and only then posts p1_done —
+                // so this wait terminates with every boundary complete
                 // and every tuple harvestable. The loop itself retires
-                // j1 in lockstep (each arrival-gated completion fires
+                // j1 in lockstep (each cursor-gated completion fires
                 // inside fold_available/complete_boundaries), which
                 // keeps P1's push gate open through the sweep. The
                 // zombie has no P1 to wait for (the state was captured
@@ -7822,7 +7898,10 @@ impl<'a> HydraSpanSink<'a> {
                     {
                         break;
                     }
-                    crate::affinity::polite_spin(&mut fb);
+                    // R41: the RENDEZVOUS SPIN — the final drain's
+                    // handshake rides the completion path (never a
+                    // yield on the 1:1 topology).
+                    crate::affinity::rendezvous_spin(&mut fb);
                 }
                 self.complete_boundaries();
             } else {

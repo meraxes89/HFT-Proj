@@ -1211,6 +1211,28 @@ fn run_hydra_sustained_5s(
             g.p1_parks.load(std::sync::atomic::Ordering::Relaxed),
             poison
         );
+        // R41: THE ARRIVAL-PACED COMPLETION BATCHING's verdict line —
+        // the corridor unlock's engagement row: fast = the cursor-gated
+        // completions that consumed the arrival's pre-staged run window
+        // (the steady law — the arrival is ALWAYS visible when the
+        // cursor gate passes); scan = the position-scan fallback (the
+        // pre-arm/edge shape); arrivals = P1's opportunistic boundary
+        // publications (the continuous drainer's crossings ≈ the dual
+        // pass count); defers = the CURSOR-gate deferrals (P1's drain
+        // lagging P0's lane-0 fold — the new meaning under R41, the
+        // arrival handshake is gone). The corridor's own law: reset_ms
+        // collapses (the DIAG sustained line) and the rate crosses the
+        // 200B line.
+        let (fast, scan, arr) = g.r41_stats();
+        println!(
+            "PR1_R41_COMPLETION_CADENCE_VERDICT rate={} fast={} scan={} arrivals={} cursor_defers={} p1_parks={} (R41: arrival-paced completion batching — the cursor-gated boundary completions + the continuous lane-1 drainer; the per-pass arrival handshake and its completion-pace park are deleted, PASS_RING=512; the record-slot reuse gate is the live submission bound riding the fold frontier)",
+            sustained_rate,
+            fast,
+            scan,
+            arr,
+            g.arrival_defers.load(std::sync::atomic::Ordering::Relaxed),
+            g.p1_parks.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
     // R40d: THE ZERO-THREAD INGEST's verdict line — the self-serve
     // transport's engagement row (armed=true on every frozen-regime

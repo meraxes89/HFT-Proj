@@ -348,3 +348,34 @@ Work Log:
 
 Stage Summary:
 - THE 3-DIRECTIVE PROGRAM IS FLEET-PROVEN: (D1) the zero-thread ingest — the RX retired, 4T/4vCPU, no mailbox protocol (wait_ms 665-900 -> 9-30ms); (D2) the compacted run-drains + the arriving-last election (the merge's j1 scan gone; the run-window publication + the block copies; fetch_max exactly-once); (D3) the alloc deltas latched out (the probe reads delta=0 at every phase). The fleet's measurement: 108.1B-117.4B (the record's new class — the previous best draw was 74.6B), 41/41 green, the same-draw dual-vs-mono delta now prices ONLY the split (the mono also carries the self-serve transport). The 180-200B corridor's remaining distance is the completion-cadence wall — precisely telemetried (the pace gate at 65% of the window, the arrival-gated completions) — the next session's structural target.
+
+---
+Task ID: R41-1
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: PR #23 — Arrival-Paced Completion Batching on feat/r41-completion-cadence-200b (from main @ 7f5bb25, the 117.4B record). Kill the 65% completion-pace stall (reset_ms=3,246.8ms of the 5.0s window) → the 200B corridor.
+
+Work Log:
+- Read the telemetry anatomy: pass period 4.3µs = 0.55µs submit + 0.8µs fold + 2.95µs begin_pass park (1,157,759 passes).
+- Located the gate: hydra.rs:5065 — the park fires at pending >= PASS_RING-8 = 56 and pass_head advances the very next line, so the cadence is park→submit-1-pass→park (a strict 1:1 lockstep with the completion frontier).
+- Traced the completion chain: complete_boundaries ACTIVE SPLIT requires gate.arrival_full(pass_id) per pass; P1's per-pass cycle = dispatch accumulation + pass-end drain (spin for ALL of the pass's lane-1 records) + arrival; both P0's park spin and P1's drain spin escalate polite_spin → std::thread::yield_now() after 6 idle polls.
+- ROOT CAUSE: on the 1:1-pinned Champion-4T box (P0+W0 on Core0's SMT pair, P1+W1 on Core1's — 4 threads, 4 vCPUs, zero other runnable threads) every yield is a full deschedule+wakeup ON THE PER-PASS RENDEZVOUS PATH (~µs each), plus Instant::elapsed() per park iteration. The per-pass arrival handshake + yield storms = the 3,246ms stall.
+- Secondary coupling found: rx_open_window's record-slot reuse gate (REC_RING=64) bounds the submission lead at ~64 passes over dual_lanes_past (the CURSOR frontier) — same magnitude as the 56-slot pass ring, so BOTH rings must widen together for burst submission.
+- DESIGN (R41): (1) CURSOR-GATED COMPLETIONS — complete armed passes on gate.p1_fold() >= lane_end_at(end_span,1) (the pre-arm path's proven law), count_1 = the script's per-pass odd total (the R40c ground-truth law), j1 partition = the position scan fallback; (2) P1 becomes a CONTINUOUS lane-1 drainer — no per-pass barrier, no dispatch ceremony, opportunistic arrival publication at boundary crossings (ordered BEFORE the p1_fold store so the arrival fast path is always available when the cursor gate passes); (3) PASS_RING 64→512 + REC_RING 64→512 (burst submission, parks become rare ring-capacity flow control); (4) rendezvous_spin — a fixed 8-pause burst, NEVER yields (PAUSE donates SMT slots to the worker sibling — the coherence dividend), throttled elapsed() diagnostics (every 2^15 polls).
+
+Stage Summary:
+- Analysis complete; implementation begins: affinity.rs (rendezvous_spin) → dual.rs (continuous drainer) → hydra.rs (cursor gate + wide ring + park rework) → rxdesc.rs (REC_RING 512).
+
+---
+Task ID: R41-2
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41 implementation + the intermittent-hang root cause and fix (PR #23's pre-push validation).
+
+Work Log:
+- Implemented the four R41 changes: (1) CURSOR-GATED COMPLETIONS in hydra.rs complete_boundaries (the armed-pass arrival wait replaced by the p1_fold cursor gate + the arrival run-window fast path + the script-direct count fallback, dual_c1_pass cached at dual_arm); (2) THE CONTINUOUS DRAINER in dual.rs lane1_run/drain_lane1 (the per-pass cycle — dispatch accumulation, pass-end drain barrier, arrival pacing — DELETED; opportunistic arrival publication at boundary crossings inside the drain; the shutdown sweep = the drain's own continuation); (3) PASS_RING 64→512 (the strict 56-slot per-pass parking threshold deleted — the record-slot reuse gate at REC_RING=64 is the live submission bound); (4) rendezvous_spin (affinity.rs) — a fixed 8-pause burst, NEVER a yield — at begin_pass's park, both rx reuse gates, finish's dual loop, the disarm wait, P1's idle spin, and P1's j1 backpressure park; throttled stall diagnostics (one clock read per 2^15 polls).
+- THE INTERMITTENT HANG (2-4/20 on this 2-CPU sandbox, zero on the base): empirically bisected through five instrumented hunts (thread-state dumps + R41_TRACE + worker/completion/j1-park/finish stall prints). The final picture: R41_J1PARK j1_len=1793 consumed=0 + R41_FINSTALL p1_fold=54976 (stale at the arm) while P1's true cursor was 305344.
+- ROOT CAUSE: the uncapped continuous drain can park MID-CALL on the j1 backpressure (a burst crossing many boundaries); the p1_fold store only fires at drain END, so the published cursor froze at the previous call's end while the arrivals above it were already visible. P0's cursor gate deferred on the stale word → the completions never fired → j1 never retired → P1 never unparked: a circular wait. The OLD design escaped because its completion gate read the ARRIVALS (published inside the drain at crossings — fresh), not the cursor.
+- THE FIX (dual.rs drain_lane1's crossing loop): publish p1_fold AT EVERY BOUNDARY CROSSING, with the arrival (both precede any park the same drain can enter) — the cursor becomes as fresh as the arrival, a monotone lower bound of the true cursor; the gates' >= compares stay exact. P1's exit paths (poison/shutdown) still run at loop tops — post-drain — so the zombie capture's state triple (p1_fold/res_tail/j1_len) stays consistent.
+- VALIDATION: parity cell 30+50 consecutive clean hammers + poison cell 20 clean + t_r40 8/8 + hydra 39/39 + dual 6/6 + affinity 9/9 + transport 36/36 + workspace --lib 232/232 + clippy --workspace --all-targets -D warnings CLEAN + the local bench integration (BIT-EXACT, allocs=0 through all probe windows, the 5s sustained loop clean, no stalls).
+
+Stage Summary:
+- The R41 corridor unlock is implemented and locally validated; the dual's engagement telemetry (r41 fast/scan/arrivals/cursor_defers + the PR1_R41_COMPLETION_CADENCE_VERDICT line) arms the CI verdict. Ready to commit/push/monitor.

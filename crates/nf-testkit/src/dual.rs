@@ -38,20 +38,30 @@
 //!   ledger order), and the tuple assert runs VERBATIM on the merged
 //!   composite at every boundary — the same oracle, one assert per
 //!   pass.
-//! * **THE ARRIVAL PROTOCOL**: P1 publishes `(pass, count_1)` at every
-//!   pass close (Release); P0's completion fires when BOTH lanes'
-//!   cursors crossed the boundary (`lane_end_at`) and P1's arrival
-//!   landed — the lazy law (a lagging P1 defers the completion; P0
-//!   never blocks mid-pass; the deferred boundary folds during the
-//!   next pass exactly as the mono's tail does).
+//! * **THE ARRIVAL PROTOCOL (R41: THE CONTINUOUS DRAINER)**: P1 drains
+//!   lane 1's res ring continuously — no per-pass cycle, no dispatch
+//!   ceremony, no pass-end barrier — and publishes the arrival
+//!   `(pass, count_1, run_start, run_len)` OPPORTUNISTICALLY at every
+//!   boundary crossing inside the drain (ordered BEFORE the `p1_fold`
+//!   cursor store, both Release). P0's completion fires when BOTH
+//!   lanes' cursors crossed the boundary (`lane_end_at`) — the CURSOR
+//!   GATE; the arrival, already visible whenever the cursor gate
+//!   passes, is the run-window FAST PATH (the count is script-direct
+//!   on the fallback — the R40c ground-truth law). The old law (the
+//!   completion waited for the per-pass arrival handshake — P1's whole
+//!   cycle per boundary) locked the completion frontier 1:1 to P1's
+//!   cadence and parked P0 for 65% of the record window; the cursor
+//!   gate deletes the handshake while keeping the exact merge.
 //! * **THE POISON LAW**: any regime break (a live re-scan, a non-SS
-//!   window) poisons the engine permanently — P1 stops dispatching at
-//!   the next batch check, publishes its final count + cursor, and P0
-//!   computes the deterministic overlap correction from the script
-//!   (the odd batches in `[poison_batch, p1_cursor]`) so the merged
-//!   count stays exact. The pass completes under the merge (the
-//!   insertion-sorted path — the post-poison journal concatenation is
-//!   not sorted), and every later pass runs the MONO loop verbatim.
+//!   window) poisons the engine permanently — P1 observes the word at
+//!   its next drain cycle and posts its terminal state (the zombie
+//!   captures whatever cursor/j1 state P1 reached — sound because every
+//!   completion count is script-direct, independent of P1's drain
+//!   progress), and P0 computes the deterministic overlap correction
+//!   from the script (the odd batches in `[poison_batch, p1_cursor]`)
+//!   so the merged count stays exact. The pass completes under the merge
+//!   (the insertion-sorted path — the post-poison journal concatenation
+//!   is not sorted), and every later pass runs the MONO loop verbatim.
 //!
 //! SOUNDNESS (the guard chain, fail-loud everywhere):
 //! 1. The batch identity: P0's `try_replay` bounds/watermark guards run
@@ -365,6 +375,21 @@ pub struct DualGate {
     pub p1_parks: AtomicU64,
     /// Telemetry: boundaries deferred on P1's lag.
     pub arrival_defers: AtomicU64,
+    /// R41: telemetry — completions that took the ARRIVAL FAST PATH
+    /// (the run window consumed; the cursor gate passed and the arrival
+    /// was already visible — the steady law).
+    pub r41_fast: AtomicU64,
+    /// R41: telemetry — completions that fell back to the POSITION SCAN
+    /// (the pre-arm/edge shape; the arrival had not landed when the
+    /// cursor gate passed).
+    pub r41_scan: AtomicU64,
+    /// R41: telemetry — P1's opportunistic arrival publications (the
+    /// continuous drainer's boundary crossings).
+    pub r41_arrivals: AtomicU64,
+    /// R41: the trace flag — `R41_TRACE=1` arms the per-crossing print
+    /// (read ONCE at construction, outside every measured window: the
+    /// old per-pass `env::var` was a locked lookup on the hot path).
+    trace: AtomicBool,
     /// R40d: THE ARRIVING-LAST ELECTION WORD — the end position of the
     /// LAST finalized boundary (monotone; `fetch_max` at the
     /// completion's top is the atomic swap). P1's boundary step is its
@@ -421,6 +446,10 @@ impl DualGate {
             p1_batches: AtomicU64::new(0),
             p1_parks: AtomicU64::new(0),
             arrival_defers: AtomicU64::new(0),
+            r41_fast: AtomicU64::new(0),
+            r41_scan: AtomicU64::new(0),
+            r41_arrivals: AtomicU64::new(0),
+            trace: AtomicBool::new(std::env::var("R41_TRACE").is_ok()),
             boundary_taken: AtomicU64::new(0),
             exit_hold: AtomicBool::new(false),
             exit_release: AtomicU64::new(0),
@@ -480,6 +509,25 @@ impl DualGate {
             .ok();
     }
 
+    /// R41: whether the per-crossing trace is armed (the construction-
+    /// time env read — never on the hot path).
+    #[inline]
+    pub fn trace_on(&self) -> bool {
+        self.trace.load(Ordering::Relaxed)
+    }
+
+    /// R41: telemetry — the completion path's engagement row
+    /// `(fast, scan, arrivals)`: the cursor-gated completions that took
+    /// the arrival fast path vs the position-scan fallback, and P1's
+    /// opportunistic arrival publications.
+    pub fn r41_stats(&self) -> (u64, u64, u64) {
+        (
+            self.r41_fast.load(Ordering::Relaxed),
+            self.r41_scan.load(Ordering::Relaxed),
+            self.r41_arrivals.load(Ordering::Relaxed),
+        )
+    }
+
     /// The poison state: `None` = clean; `Some((pass, batch))`.
     #[inline]
     pub fn poison_at(&self) -> Option<(u64, u64)> {
@@ -513,16 +561,18 @@ impl DualGate {
         self.shutdown_end.load(Ordering::Acquire)
     }
 
-    /// P1's arrival publication (its pass close) — R40d: with the
-    /// boundary's run bounds (the compacted run-drain's operands: the
-    /// leaves [run_start, run_start+run_len) are EXACTLY this pass's
-    /// j1 window — P1's frontier cap parks any record ending beyond
-    /// the pass target, so every pushed leaf ends at or below the lane
-    /// projection ≤ the boundary; the window IS the merge partition,
-    /// pre-computed on P1's clock). This is P1's HALF of the boundary
-    /// step: after the publication P1 proceeds into its next pass
-    /// immediately (it never waits on P0 — the arriving-last law's
-    /// other side).
+    /// P1's arrival publication — R41: published OPPORTUNISTICALLY at
+    /// the boundary crossings inside the continuous drain (P1's HALF of
+    /// the boundary step, with the WAITING DELETED — the drain never
+    /// blocks on the pass grid). The run bounds are the merge's
+    /// pre-staged operands: the leaves [run_start, run_start+run_len)
+    /// are EXACTLY this pass's j1 window (records never straddle a pass
+    /// boundary — the worker's break discipline — so the leaves pushed
+    /// since the last crossing all end ≤ this boundary, and the cursor
+    /// lands exactly ON the lane projection at the crossing). The
+    /// ORDERING LAW: this store precedes the drain's `p1_fold` store,
+    /// so P0's cursor gate passing the boundary implies this arrival is
+    /// already visible (the fast path is always armed).
     pub fn publish_arrival(&self, pass: u64, count_1: u64, run_start: u64, run_len: u64) {
         let a = &self.arrivals[(pass & (ARR_SLOTS as u64 - 1)) as usize];
         a.pass.store(pass, Ordering::Relaxed);
@@ -726,7 +776,13 @@ impl DualScript {
     }
 }
 
-/// R40: P1's per-thread state (stack-local, zero alloc).
+/// R40: P1's per-thread state (stack-local, zero alloc). R41: the
+/// CONTINUOUS DRAINER's grid — `pass`/`pass_end`/`next_bound` carry the
+/// boundary ladder (the next arrival's pass id, its lane-1 projection —
+/// the crossing compare — and its GLOBAL position — the ladder's
+/// advance operand), `pass_base` is the FIXED arm anchor (the run-start
+/// correction's law), and `count_1` is the script constant (the frozen
+/// schedule's per-pass odd total — every arrival publishes it).
 pub struct Lane1State {
     pub pass: u64,
     /// The local mirror of the shared ring's length.
@@ -738,30 +794,53 @@ pub struct Lane1State {
     pub fold_rem: u64,
     /// Lane 1's res-ring consumer cursor.
     pub res_tail: u64,
-    /// This pass's count (P1's dispatched totals).
+    /// R41: the per-pass count constant (the script's odd total — the
+    /// arrival's count law under the frozen schedule).
     pub count_1: u64,
-    /// This pass's drain target (the script's pass end, global).
+    /// R41: the next boundary's LANE-1 PROJECTION (the crossing
+    /// compare — records never straddle a pass boundary, so the cursor
+    /// lands exactly ON the projection at the crossing).
     pub pass_end: u64,
     pub done: bool,
-    /// R40d: THE COMPACTED RUN-DRAIN's window — the current pass's
-    /// base (the PREVIOUS boundary; the run is the leaves with end in
-    /// (base, this pass's boundary]) and the run's first leaf index
-    /// (maintained per-record: every leaf ending ≤ the base advances
-    /// it — the pre-arm tail of the FIRST armed pass drains below the
-    /// base and must stay OUTSIDE the run; later passes have no such
-    /// leaves by the territory-gap law, so the pass-top init stands).
+    /// The run-start correction's anchor: the ARM's pass base (fixed
+    /// for the whole run — leaves ending ≤ it are the first armed
+    /// pass's pre-arm tail and stay OUTSIDE the first run; positions
+    /// are global/monotone, so the advance never fires again).
     pub pass_base: u64,
+    /// R41: THE COMPACTED RUN-DRAIN's window — the current run's first
+    /// leaf index (reset at every boundary crossing; maintained
+    /// per-record against the FIXED `pass_base` anchor above).
     pub run_start: u64,
+    /// R41: the next boundary's GLOBAL position (the ladder's advance
+    /// operand: `next_bound += pass_spans`, projection =
+    /// `lane_end_at(next_bound, 1)`).
+    pub next_bound: u64,
+    /// R41: the script's per-pass span count (the ladder's stride —
+    /// cached at P1's start, one script read).
+    pub pass_spans: u64,
 }
 
-/// R40: P1's lane-1 drain — the per-lane twin of the sink's composite
-/// drain. Consumes lane 1's res ring into the shared journal,
-/// asserting the per-lane contiguity law (`span_id == fold_pos`) and
-/// the chunk cap (`k ≤ fold_rem`); the LANE SKIP (a chunk-end record
-/// advances the cursor across the sibling lane's interposed chunk —
-/// `+CHUNK`) keeps the cursor on lane-1 territory. The wrap-aware
-/// frontier cap parks records that end beyond the current pass target
-/// (they stay buffered — the same law as the mono's R29 cap).
+/// R41: THE CONTINUOUS LANE-1 DRAIN — P1's engine, decoupled from the
+/// pass grid. Consumes lane 1's res ring into the shared journal (the
+/// per-lane contiguity assert + the chunk cap + the LANE SKIP — all the
+/// R40 laws verbatim), with the R40 pass-target cap DELETED: the drain
+/// takes every published record up to the ring head (the workers'
+/// production is itself capped by P0's published windows — the
+/// submission frontier remains the effective bound, exactly as the
+/// mono's R29 law reaches P1 through the worker).
+///
+/// At every record boundary the drain checks the BOUNDARY LADDER: while
+/// the cursor stands at or past the next boundary's lane projection,
+/// publish the arrival — `(count_1, run_start, run_len)` — and advance
+/// the ladder. Records never straddle a pass boundary (the worker's
+/// break discipline — the same invariant P0's lane-0 drain asserts), so
+/// the leaves pushed since the last crossing are EXACTLY the boundary's
+/// j1 window, and the cursor lands exactly ON the projection (the lane
+/// skip steps chunk ends; the boundary split ends records at the
+/// boundary). THE ORDERING LAW: the arrival's stores precede the
+/// `p1_fold` store at the drain's end (both Release) — P0's cursor gate
+/// passing a boundary therefore implies the arrival for it is already
+/// visible: the fast path is ALWAYS armed when the gate opens.
 ///
 /// Returns true if any record was consumed.
 pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -> bool {
@@ -773,18 +852,11 @@ pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -
     }
     let slots = lane.r40_res_slots();
     let mask = crate::hydra::r40_res_mask();
-    let target32 = st.pass_end as u32;
+    let c1 = st.count_1;
     let mut consumed: u64 = 0;
     while tail + consumed < head {
         let r = &slots[((tail + consumed) & mask) as usize];
         let k = r.aux as u64;
-        // R29's wrap-aware frontier cap (the serial-number compare —
-        // records ending beyond the pass target stay buffered).
-        let end32 = r.span_id.wrapping_add(k as u32);
-        let dcap = end32.wrapping_sub(target32);
-        if dcap != 0 && dcap < 0x8000_0000 {
-            break;
-        }
         assert_eq!(
             r.span_id, st.fold_pos as u32,
             "R40 lane-1 drain: fold-order violation (got span {}, cursor {})",
@@ -798,23 +870,22 @@ pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -
         // The journal push gate — the backpressure parks P1 behind
         // P0's boundary retire (the disjoint-slot law's margin). R40c:
         // NO shutdown bail — the sweep's drains must push through (P0's
-        // finish retires j1 in lockstep: its wait loop completes every
-        // arrival-gated boundary each poll); a bail here would strand
-        // the sweep mid-record and freeze the cursor exactly where the
-        // old deadlock did. The gate parks only on P0's retire lag —
-        // a dead P0 hangs visibly (the fail-loud law) rather than
-        // exiting with a lying arrival.
+        // finish retires j1 in lockstep); a bail here would strand the
+        // sweep mid-record. R41: THE RENDEZVOUS SPIN — never a yield
+        // (the 1:1-pinned topology has no other runnable thread; every
+        // yield was a scheduler round-trip on the rendezvous path).
         let mut sb = 0u32;
         while st.j1_len - gate.j1.consumed() > (J1_CAP as u64) - J1_HEADROOM {
-            crate::affinity::polite_spin(&mut sb);
+            crate::affinity::rendezvous_spin(&mut sb);
             gate.p1_parks.fetch_add(1, Ordering::Relaxed);
         }
         gate.j1.push(&mut st.j1_len, k as u32, r.value, st.fold_pos + k);
-        // R40d: the run window's per-record law — a leaf ending at or
-        // below the pass base belongs to an EARLIER boundary (the
+        // The run window's per-record law — a leaf ending at or below
+        // the FIXED arm anchor belongs to an EARLIER boundary (the
         // first armed pass's pre-arm tail): advance the run start past
-        // it so the arrival's window carries exactly this pass's
-        // leaves (the merge's partition, pre-staged).
+        // it so the first arrival's window carries exactly the first
+        // armed pass's leaves (positions are global/monotone — the
+        // advance never fires again after the arm).
         if st.fold_pos + k <= st.pass_base {
             st.run_start = st.j1_len;
         }
@@ -827,19 +898,81 @@ pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -
             st.fold_rem = CHUNK;
         }
         consumed += 1;
+        // ── R41: THE OPPORTUNISTIC BOUNDARY PUBLICATION ─────────────
+        // While the cursor stands at or past the next boundary's lane
+        // projection, publish the arrival and advance the ladder. The
+        // run is [run_start, j1_len) — the leaves since the last
+        // crossing (the straddle invariant pins the last leaf's end ≤
+        // the boundary). This is P1's HALF of the boundary step with
+        // the WAITING DELETED: the old engine parked its whole cycle
+        // on each pass's stragglers; the continuous drain crosses
+        // boundaries as they come, never blocking, never pacing.
+        while st.fold_pos >= st.pass_end {
+            debug_assert!(
+                st.j1_len == 0 || gate.j1.leaf(st.j1_len - 1).2 <= st.next_bound,
+                "R41 lane-1 leaf straddled a pass boundary ({} > {})",
+                gate.j1.leaf(st.j1_len - 1).2,
+                st.next_bound
+            );
+            if st.j1_len > st.run_start {
+                gate.r41_arrivals.fetch_add(1, Ordering::Relaxed);
+            }
+            gate.publish_arrival(st.pass, c1, st.run_start, st.j1_len - st.run_start);
+            // R41: THE CROSSING CURSOR STORE — the projection of the
+            // boundary JUST crossed, published WITH the arrival. THE
+            // DEADLOCK LAW: the uncapped drain can park MID-CALL on the
+            // j1 backpressure (a burst crossing many boundaries); the
+            // drain-end `p1_fold` store alone would then hold a cursor
+            // from a PREVIOUS call while the arrivals above are already
+            // visible — P0's cursor gate would defer on the stale word,
+            // the retires would never open the push gate, and P1 would
+            // never unpark (the 2-CPU parity cell's intermittent hang:
+            // p1_fold frozen at the arm's neighborhood while j1_len
+            // climbed to the cap). The crossing store makes the cursor
+            // AS FRESH AS THE ARRIVAL (both precede any park the same
+            // drain can enter), and it is a monotone lower bound of the
+            // true cursor — the gates' ≥ compares stay exact.
+            gate.p1_fold.store(st.pass_end, Ordering::Release);
+            if gate.trace_on() {
+                eprintln!(
+                    "R41P1 pass={} bound={} proj={} cursor={} j1len={} run=[{}, {}) arrived_seq={}",
+                    st.pass,
+                    st.next_bound,
+                    st.pass_end,
+                    st.fold_pos,
+                    st.j1_len,
+                    st.run_start,
+                    st.j1_len,
+                    gate.arrival_seq.load(Ordering::Relaxed)
+                );
+            }
+            st.run_start = st.j1_len;
+            st.pass += 1;
+            st.next_bound += st.pass_spans;
+            st.pass_end = lane_end_at(st.next_bound, 1);
+        }
     }
     st.res_tail += consumed;
     lane.r40_res_tail_store(st.res_tail);
+    if consumed > 0 {
+        gate.p1_batches.fetch_add(consumed, Ordering::Relaxed);
+    }
     gate.p1_fold.store(st.fold_pos, Ordering::Release);
     consumed > 0
 }
 
-/// R40: P1's engine loop. Spins on the arm word, then cycles the
-/// script: the odd batches' dispatch (the count adds + the poison
-/// checks + the cursor publications), the interleaved lane-1 drain,
-/// the pass-end drain to the lane projection, and the arrival
-/// publication. Exits on the shutdown word (the harness's finish) or
-/// the poison (the permanent fallback — the final state posted).
+/// R41: P1's engine loop — THE CONTINUOUS DRAINER. Spins on the arm
+/// word, then drains lane 1's res ring flat: every published record is
+/// consumed the moment it lands (the R40 per-pass cycle — dispatch
+/// accumulation, the pass-end drain barrier, the arrival pacing — is
+/// DELETED; the counts are script-direct on P0's side by the R40c law,
+/// and the arrivals publish opportunistically at the boundary
+/// crossings inside the drain). The poison observation (loop top, one
+/// Acquire per cycle) posts the terminal state for the zombie capture;
+/// the shutdown sweep is the drain's own continuation — the records all
+/// exist (P0 drove everything before the word), so P1 drains to the
+/// frontier's lane projection and posts `p1_done`. The idle spin is the
+/// RENDEZVOUS SPIN (never a yield — the 1:1 topology's law).
 pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
     if let Some(c) = p1_cpu {
         let _ = crate::affinity::pin_current_to(c);
@@ -859,209 +992,113 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
         }
         crate::affinity::polite_spin(&mut sb);
     };
+    let script = gate.script();
+    debug_assert!(script.pass_spans > 0, "R41: degenerate script (pass_spans=0)");
+    // R41: the count law's constant — the frozen schedule's per-pass odd
+    // total (the R40c ground-truth law: the script IS the suppressed
+    // surface's exact count, whatever the drain's progress; the old
+    // dispatch loop accumulated the same sum per pass).
+    let c1_const = script.odd_totals_before(script.n);
+    // R40: THE PASS-GRID ANCHOR — the TRUE boundary at the arm (the
+    // sink's next_span). R41: FIXED for the whole run (the ladder's
+    // origin; the per-record run-start correction anchors here).
+    let pass_base = gate.pass_base_load();
+    // R41: THE BOUNDARY LADDER — the first armed pass's end, its lane
+    // projection, and the pass-id key of the first arrival.
+    let next_bound = pass_base + script.pass_spans;
     let mut st = Lane1State {
         pass: first_pass,
         j1_len: 0,
         fold_pos: gate.fold_init_load(),
         fold_rem: CHUNK - (gate.fold_init_load() % CHUNK),
         res_tail: gate.res_tail_init_load(),
-        count_1: 0,
-        pass_end: 0,
+        count_1: c1_const,
+        pass_end: lane_end_at(next_bound, 1),
         done: false,
-        pass_base: 0,
+        pass_base,
         run_start: 0,
+        next_bound,
+        pass_spans: script.pass_spans,
     };
-    // R40: THE PASS-GRID ANCHOR — the TRUE boundary at the arm (the
-    // sink's next_span), NOT the fold projection (which may sit inside
-    // the previous pass's deferred tail — the drift class the parity
-    // cell caught). P1's cursor starts at the projection and drains
-    // the tail on its way to the first target.
-    let mut pass_base = gate.pass_base_load();
-    let script = gate.script();
+    let mut idle_polls: u32 = 0;
+    let mut idle_iters: u64 = 0;
+    let mut idle_start = std::time::Instant::now();
+    let mut logged = false;
     'outer: loop {
-        if st.done {
-            break;
+        // ── the poison: observed every cycle (a drain in flight when
+        // the word lands finishes its burst first — sound: the zombie
+        // captures whatever cursor/j1 state P1 reached, and every
+        // completion count is script-direct, independent of P1's drain
+        // progress — the R40c law). P1 contributes nothing more.
+        if gate.poison_at().is_some() {
+            break 'outer;
         }
-        // R40c: THE SHUTDOWN SWEEP — the harness's clean finish (all
-        // passes driven by P0; `initiate_shutdown(frontier)` posted
-        // the end BEFORE the word). P1 does NOT exit on the word
-        // alone: its remaining lane-1 territory is still P1's to
-        // drain (nobody else owns the cursor pre-poison), and P0's
-        // finish waits on `dual_lanes_past(frontier)` — a bare exit
-        // freezes the cursor mid-stream and hangs the finish (the
-        // parity cell's 2-of-6 deadlock face). The sweep processes
-        // the remaining passes — the accounting from the script (the
-        // completions' count operand — identical to the dispatch's
-        // accumulation), the FULL pass-end drain (the records all
-        // exist: P0 submitted everything before the word), and the
-        // per-pass arrival — until the pass base reaches the
-        // frontier. The legacy bare-shutdown (end == 0) breaks at the
-        // top without sweeping (the pre-R40c call-site shape).
-        let sweeping0 = gate.shutdown.load(Ordering::Acquire);
-        let mut sweeping = sweeping0;
-        if sweeping {
+        // ── the shutdown sweep: the drain's own continuation. The
+        // legacy bare shape (end == 0) exits without sweeping; the clean
+        // shape drains to the frontier's lane projection (the records
+        // all exist — P0 drove everything before the word; the last
+        // boundary's arrival publishes at the crossing inside the
+        // drain) and only then posts the terminal state.
+        if gate.shutdown.load(Ordering::Acquire) {
             let end = gate.shutdown_end_load();
-            if end == 0 || pass_base >= end {
-                break;
+            if end == 0 {
+                break 'outer;
+            }
+            let target = lane_end_at(end, 1);
+            if st.fold_pos >= target {
+                break 'outer;
             }
         }
-        // The per-pass count resets FIRST (the pre-pass poison's
-        // final publication must carry the POISON pass's dispatched
-        // count — zero when nothing was dispatched).
-        st.count_1 = 0;
-        // R40d: the compacted run-drain's window init — the pass base
-        // (the previous boundary) and the run start (every leaf pushed
-        // so far ends ≤ the base by the cap + territory-gap laws; the
-        // per-record advance in drain_lane1 corrects it for the first
-        // armed pass's pre-arm tail).
-        st.pass_base = pass_base;
-        st.run_start = st.j1_len;
-        // The pre-pass poison: a break at an earlier pass (or this
-        // pass's batch 0) — P1 contributes nothing more.
-        if let Some((pp, _pb)) = gate.poison_at() {
-            if pp <= st.pass {
-                gate.p1_final.store(st.count_1, Ordering::Release);
-                gate.p1_done.store(true, Ordering::Release);
-                break;
+        if drain_lane1(gate, fabric, &mut st) {
+            // Progress resets the idle clock (the stall diagnostic's
+            // reference frame — a healthy drain NEVER idles long).
+            if idle_polls != 0 {
+                idle_polls = 0;
+                idle_iters = 0;
+                logged = false;
+                idle_start = std::time::Instant::now();
+            }
+            continue;
+        }
+        // ── the idle spin: the RENDEZVOUS SPIN (never a yield — the
+        // topology's law) with the throttled stall diagnostic (one
+        // clock read per 2^15 idle polls; the old per-iteration
+        // elapsed() was a vDSO call on the rendezvous path).
+        crate::affinity::rendezvous_spin(&mut idle_polls);
+        idle_iters = idle_iters.wrapping_add(1);
+        if idle_iters & 0x7FFF == 0 {
+            // R40c: the stall diagnostic — a healthy idle is
+            // microseconds (the workers publish at the µs cadence);
+            // 250ms without progress means the records are not coming.
+            if !logged && idle_start.elapsed() >= std::time::Duration::from_millis(250) {
+                logged = true;
+                let lane_dbg = fabric.lane(1);
+                eprintln!(
+                    "R41_P1_STALL pass={} next_bound={} proj={} cursor={} res_tail={} res_head={} j1_len={} j1_consumed={} shutdown={} (R41: the continuous drainer idle — the lane-1 records beyond the cursor are not arriving)",
+                    st.pass,
+                    st.next_bound,
+                    st.pass_end,
+                    st.fold_pos,
+                    st.res_tail,
+                    lane_dbg.r40_res_head(),
+                    st.j1_len,
+                    gate.j1.consumed(),
+                    gate.shutdown.load(Ordering::Acquire)
+                );
             }
         }
-        st.pass_end = pass_base + script.pass_spans;
-        if sweeping {
-            // ── the sweep's accounting: the script's owned totals ──
-            // (the dispatch already happened on P0's clock; the
-            // counts are the boundary completions' operand — the
-            // same accumulation the dispatch loop performs, minus
-            // the pacing.)
-            for j in 0..script.n {
-                if script.p1_owned[j] {
-                    st.count_1 += script.totals[j];
-                    gate.p1_batches.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        } else {
-            // ── the dispatch: the odd batches ──
-            for j in 0..script.n {
-                if !script.p1_owned[j] {
-                    continue;
-                }
-                // The mid-pass poison check (one Acquire per owned batch).
-                if let Some((pp, pb)) = gate.poison_at() {
-                    if pp < st.pass || (pp == st.pass && pb <= j as u64) {
-                        // Stop AT the poison batch: count_1 holds exactly
-                        // the odd totals dispatched so far (j's add has not
-                        // run) — the completion's overlap formula
-                        // (count_1 − odd_totals_before(poison_batch),
-                        // saturating) is exact for ANY progress here.
-                        gate.p1_final.store(st.count_1, Ordering::Release);
-                        gate.p1_done.store(true, Ordering::Release);
-                        break 'outer;
-                    }
-                }
-                st.count_1 += script.totals[j];
-                gate.p1_batches.fetch_add(1, Ordering::Relaxed);
-                // The drain interleave (every 4th owned batch — the
-                // records arrive with the window's walk).
-                if (j & 3) == 3 {
-                    drain_lane1(gate, fabric, &mut st);
-                }
-            }
-        }
-        // ── the pass-end drain: to the lane projection ──
-        // R40c: NO unconditional shutdown break — the drain MUST
-        // complete before the arrival publishes (an arrival with a
-        // short cursor is a LIE: P0's completion would partition j1 at
-        // the boundary and compose an incomplete leaf set — silent
-        // corruption). Under the harness's law the shutdown word
-        // implies every record of THIS pass exists (P0 drove it before
-        // the word). THE MID-DRAIN RE-CAP: P1 may have entered this
-        // pass in NORMAL mode (the phantom-pass race — P1's grid runs
-        // one ring-id ahead of P0's driven passes at the tail, so the
-        // pass beyond the frontier targets records that never exist);
-        // observing the word mid-drain re-caps the target to the
-        // frontier's projection — the sweep's own law, applied at the
-        // earliest observation point.
-        let mut lane1_target = if sweeping {
-            lane_end_at(gate.shutdown_end_load().min(st.pass_end), 1)
-        } else {
-            lane_end_at(st.pass_end, 1)
-        };
-        if std::env::var("R40_CELL_TRACE").is_ok() {
-            eprintln!(
-                "R40P1 pass={} target={} cursor={} j1len={} consumed={} arrived_seq={}",
-                st.pass, lane1_target, st.fold_pos, st.j1_len,
-                gate.j1.consumed(),
-                gate.arrival_seq.load(Ordering::Relaxed)
-            );
-        }
-        let mut sb2 = 0u32;
-        let drain_start = std::time::Instant::now();
-        let mut logged = false;
-        while st.fold_pos < lane1_target {
-            if !sweeping && gate.shutdown.load(Ordering::Acquire) {
-                sweeping = true;
-                let end = gate.shutdown_end_load();
-                let capped = if end == 0 {
-                    break;
-                } else {
-                    lane_end_at(end.min(st.pass_end), 1)
-                };
-                if st.fold_pos >= capped {
-                    break;
-                }
-                lane1_target = capped;
-                continue;
-            }
-            if !drain_lane1(gate, fabric, &mut st) {
-                // R40c: the stall diagnostic — a healthy drain spin is
-                // microseconds; 250ms without progress means the records
-                // are not coming (the fleet's 11r40 first draw: P1
-                // frozen at its target, the whole rendezvous dead behind
-                // it). One line per pass — the state pins WHERE the
-                // records stopped.
-                if !logged && drain_start.elapsed() >= std::time::Duration::from_millis(250) {
-                    logged = true;
-                    let lane_dbg = fabric.lane(1);
-                    eprintln!(
-                        "R40_P1_STALL pass={} target={} cursor={} res_tail={} res_head={} j1_len={} j1_consumed={} count_1={} sweeping={} (R40c: P1's pass-end drain stuck — the lane-1 records beyond the cursor are not arriving)",
-                        st.pass,
-                        lane1_target,
-                        st.fold_pos,
-                        st.res_tail,
-                        lane_dbg.r40_res_head(),
-                        st.j1_len,
-                        gate.j1.consumed(),
-                        st.count_1,
-                        sweeping
-                    );
-                }
-                crate::affinity::polite_spin(&mut sb2);
-            }
-        }
-        // ── the arrival ──
-        // R40d: the run bounds ride the publication (P1's HALF of the
-        // boundary step — the merge's j1 partition pre-staged on P1's
-        // clock; P0's completion consumes the window with NO ring
-        // scan). After the publication P1 proceeds into its next pass
-        // immediately (the arriving-last law: it never waits on P0).
-        gate.publish_arrival(
-            st.pass,
-            st.count_1,
-            st.run_start,
-            st.j1_len - st.run_start,
-        );
-        pass_base = st.pass_end;
-        st.pass += 1;
     }
     // Every exit path posts the terminal state (the finish's wait and
-    // the poison's count read depend on it). R40d: THE EXIT LATCH —
-    // the park keeps this thread's TWO teardown frees (the spawn
-    // closure + the Thread inner) OUTSIDE the harness's measurement
-    // window (see `exit_hold`'s law): the finish completes at
-    // `p1_done`, the harness snapshots the allocation counters, and
-    // only then releases the latch.
+    // the zombie's capture depend on it). The cursor is re-published
+    // defensively (a break between drains leaves the stored word stale
+    // by definition — the zombie captures `gate.p1_fold()`, which MUST
+    // be the final cursor).
+    gate.p1_fold.store(st.fold_pos, Ordering::Release);
+    gate.p1_final.store(c1_const, Ordering::Release);
     gate.p1_done.store(true, Ordering::Release);
     gate.exit_latch_park();
 }
+
 
 impl DualGate {
     #[inline]
