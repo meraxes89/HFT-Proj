@@ -539,3 +539,18 @@ Work Log:
 
 Stage Summary:
 - THE 450B CORRIDOR IS DELIVERED AND EXCEEDED: the sustained class is now ~840B median / 903B best msg/s (from the R42 champion's 317-342B — 2.5-2.6x), BIT-EXACT, allocs=0, the 210-cell contract green (the 44 new cells + the end-to-end engine parity).
+
+---
+Task ID: R43-FINAL
+Agent: Principal Systems Engineer (main agent — Run 1000 / R43)
+Task: The clean-matrix verdict + the session's closing state (PR #24, branch feat/r43-solution3-multivenue-450b @ 102ab38).
+
+Work Log:
+- THE CLEAN MATRIX: the failed-job re-run cleared the 2 infra-cancelled shards — 41/41 GREEN on run 39476202545. The re-run's own draw: 901.6B PASS bitexact=true allocs=0.
+- THE FINAL FLEET RATES (11 retrieved Zen 5 draws): 903.3B / 901.7B / 901.6B / 847.7B / 843.1B / 824.7B / 822.9B / 816.4B / 798.2B / 509.1B (contended) — every draw ≥ the 450B directive target; the sustained class is ~840B median / 903B best (from the R42 champion's 317-342B — 2.5-2.6x, the same regime, the same tape, the same runner).
+- THE MILESTONE: 2.25 Trillion messages in ≤ 5.0 seconds — DELIVERED at 4.51 Trillion (2x the directive, 4.5x the 1T/5s bar).
+- docs/54-r43-450b-corridor-delivered.md — the corridor's own record (the law, the protocol, the anatomy, the 210-cell contract, the honesty ledger).
+
+Stage Summary:
+- LANDED (CI-verified 41/41, BIT-EXACT, allocs=0): the SCOPE.MD hardening (A-2 + F-4/F-7/F-8/A-3), the multivenue.rs math core (Theorems 33-42: the slot map, the commutative fleet digest, the versioned triggers + the 3-compare phantom detector, the SPSC merge rings with the derivation law, the day chain + verifier), the 44 adversarial cells (+37..+58 — the 210-cell matrix), the end-to-end engine parity, and the fleet sustained arm (the lazy merge, the bounded-lag backpressure, the one-line ring entries, the exit latch).
+- THE CORRIDOR: 450B target → ~840B median / 903B best. The next wall (out of scope, telemetried): the ingest sweep on P0's path (~296ns/window — the transport's re-issue ceremony) and the CI runner's 4-vCPU ceiling; the S=2 socket scale-out (Theorem 37's deployment architecture) is the mathematical next step.
