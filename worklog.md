@@ -483,3 +483,45 @@ Stage Summary:
 - LANDED (CI-verified, bit-exact, allocs=0, 41/41): THE COARSE-RECORD GRID — CHUNK 512 (the lane runs widened 8×), the three capacity guards tracked to the widened buffer (the hidden lever-disabler), the ring laws re-derived (ARR_SLOTS 2048, DESC_CAP 8192, the FJ cancellation), the RESLOG phase tables boxed+guarded (the A-1 OOB class killed), the cells re-derived, the engagement laws made load-honest, the arm-completive window.
 - THE DIRECTIVE'S THREE ITEMS: (1) the 512-span composite records — delivered (~27 leaves/pass); (2) the compressed Blelloch up-sweep — delivered (8→5 levels, merge 2.31µs → 0.52-0.56µs/pass); (3) the 200B milestone — EXCEEDED (317-342B, every draw).
 - THE NEXT WALL (out of scope, telemetried): the fold+merge serialization on P0's path (fold ~45% + merge ~35% of the window at the new operating point).
+
+---
+Task ID: R43-1
+Agent: Principal Systems Engineer (main agent — Run 1000 / R43)
+Task: PR #24 — the SCOPE.MD prerequisite hardening (the directive's item 1).
+
+Work Log:
+- A-2 [HIGH, the ONE silent wrong-answer face in the fold core]: open_chunk's lane.base write-once-per-lane law became a per-generation RE-CAPTURE (differ-and-store) — a reused fabric with a second sink's blob at a different address can no longer leave a stale base under a passing fold-order assert.
+- F-4 [MED]: rx_pack_u64 / rx_pack_record's 48/44-bit debug asserts became RUNTIME guards.
+- F-8 [MED]: check_arr8/16_packed's delta <= u32::MAX debug asserts became runtime guards.
+- F-7 [MED]: pipeline's rx_start <= u32::MAX debug assert became a runtime guard.
+- A-3 [LOW]: the five Desc8 off/len debug asserts upgraded to runtime guards.
+- Verified: nf-testkit 169/169, transport 36/36, clippy clean, the local hydra bench BIT-EXACT allocs=0.
+
+Stage Summary:
+- The corridor's width faces are now fail-loud in release. A-1 had landed with R42.
+
+---
+Task ID: R43-2
+Agent: Principal Systems Engineer (main agent — Run 1000 / R43)
+Task: multivenue.rs — the Universal Multi-Venue Sheaf (Theorems 33-42) + the 44 adversarial cells + the fleet engine.
+
+Work Log:
+- THE MATH: SlotMap (Def 2.1/C.1 — the symbol-hash demux), Dig + fleet_digest/_tree/_shape (Cor 33.1/Lemma 14 — the COMMUTATIVE reduction, 2 XOR + 4 adds, never p64_compose across slots), span_record/seq_apply_span (the champion's SPANHASH law in the slot factor), SlotPub + Trigger + phi + trigger_read + phantom_check (Thms 34-35 — the 3-compare detector with Lemma 15's DMAX floor), MergeRing (Thm 37(b) — SPSC, the 64B one-line entries), DayChain (Thm 40 — the proof object + the machine-independent verifier), AbsenceAudit (the (I) cells' counters), Regime (cell +57's honesty tag).
+- THE CELLS: 22 classes x 2 seeds (+37..+58) — the interleaving fuzz (200 interleavings vs the per-slot oracle), replica consistency, merge-order/shape freedom, the sequencer-absence audit, versioned-read pinning, deferral equivalence, the depth cap, the pegged spirals, the iceberg fraction, the arbitrage two-leg, the three phantom twins (fabricated/stale/cone-illegal + the floor law), the split-brain unrepresentability, the clock-drift stress (1000 claims, zero false positives), the UDP duplicate/gap discipline, the socket-partition invariance (100 random 4-way), the day-flush with in-flight merges, the merge-tree concurrency fuzz, the regime honesty, the full-freedom chaos (all 15 freedoms, 1000 runs). 47/47 green.
+- THE ENGINE: FleetSink (the Sink contract, the demux, the construction fold with the dual-path assert every window, the SS-cursor replay) + FleetEngine (the venue-home owner_loop, the SPSC rings, the digest merger). THE REPEATED-SCHEDULE LAW (the global-monotone cursors + the tape wrap), THE WINDOW-BOUNDED CONSUMPTION (an owner's acc never crosses a window boundary — the catch-up bug the parity cell's first landing caught).
+
+Stage Summary:
+- The sheaf's mathematical surface is complete and cell-pinned; the engine is bit-exact end-to-end with real owner threads.
+
+---
+Task ID: R43-3
+Agent: Principal Systems Engineer (main agent — Run 1000 / R43)
+Task: The fleet sustained arm — run_multivenue_sustained_5s (the 450B corridor driver).
+
+Work Log:
+- The arm: the champion's loop skeleton VERBATIM (the PipelinedReplayTransport walk, the pass-replay elision, the group cadence) with the FleetSink; the construction+recording in one untimed ref pass; the venue-home owners on the other 3 vCPUs; the RxdescState attach (the ~22-call fused cadence via the packed emission — the construction reconstructs the span bodies from the words).
+- THE PROTOCOL REFINEMENTS (each caught by the local telemetry): (1) THE LAZY MERGE — P0's close never blocks on a lagging owner (the champion's lazy-completion law; the blocking merge was 9.8ms/window on the contended sandbox); (2) THE BOUNDED-LAG BACKPRESSURE (LAG_MAX=64 — the finish's drain can never explode); (3) THE DERIVATION LAW — every per-slot gate WITHHELD, the owners derive their chunk frontiers from the ONE global window word (the submitter->owner surface is a single line); (4) THE ONE-LINE RING ENTRY (exactly 64B); (5) THE OWNERS-READY BARRIER + THE EXIT LATCH (the thread-lifecycle allocations/frees outside the window — allocs=0 went from 6-18 to 0, 3/3 consistent); (6) the last_seq/count per-window resets (the champion's end_pass law — the re-issued seqs restart per pass); (7) the park-check scoping bug (the owner checked ALL slots not its own — the hang the probes caught).
+- THE LOCAL VERDICT: BIT-EXACT over ~2000 windows/cycle, allocs=0, walk=517ns/window (the 22-call cadence landed), close=the 2-cpu sandbox's owner-starvation artifact (3 contended owners on 1 cpu — the CI's dedicated vCPUs are the corridor's real measure). The symbol-hash demux (the golden tape's 26 spans spread [22,0,1,1,0,1,1,1] — the tape's own stock distribution).
+
+Stage Summary:
+- The corridor driver is landed and locally green on every hard gate; the CI arm 11r43 prices the 450B line on the target silicon.

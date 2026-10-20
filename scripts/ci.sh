@@ -1290,6 +1290,34 @@ grep "DIAG sustained: passes" /tmp/bench_r40x.txt | tail -1
 # ce82a06) is its landing: pipefail now armed, the flush counting
 # fixed, the alloc bisect probing.)
 
+# ── 11r43. R43: THE MULTI-VENUE SHEAF — THE 450B CORRIDOR (PR #24). ───
+# HFT_MULTI_VENUE=8 arms the fleet arm: the golden tape's span stream
+# demuxes into 8 venue slots (the symbol-hash of the ITCH stock-locate —
+# Def 2.1's canonical partition), the per-slot folds run DECOUPLED on
+# the venue-home owners (P1 + the two SMT siblings), and the cross-slot
+# composition is the COMMUTATIVE fleet digest (2 XOR + 4 adds per slot
+# per window — Corollary 33.1) — the single-tape boundary merge's
+# 0.52µs/pass wall (35% of the R42 champion's window) is REPLACED by a
+# free reduction, and P0's drain assist leaves the serial path entirely
+# (the owners fold). THE CONTRACT (Theorems 33–37, docs/solution3.md):
+# BIT-EXACT against the sequential multi-venue oracle (the construction
+# pass's own fold — the dual-path law asserted at every window close),
+# ALLOC_DELTA == 0 (the owners-ready barrier + the exit latch hold the
+# thread-lifecycle allocations outside the window), the engagement laws
+# (windows merged == completed, the owners' chunk telemetry), the regime
+# tag REPLAY (cell +57's honesty law — the same elision class as the
+# 317-342B champion; the corridor's A/B is same-regime). The verdict's
+# target: >= 450B msg/s (the directive's corridor — ~80% of the single-
+# socket bus ceiling at the dial).
+HFT_MULTI_VENUE=8 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r43.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r43.txt
+grep -q "allocs=0 slots=8" /tmp/bench_r43.txt
+grep -q "PR1_R43_FLEET_VERDICT.*bitexact=true" /tmp/bench_r43.txt
+grep -q "PR1_R43_FLEET_VERDICT.*regime=replay" /tmp/bench_r43.txt
+grep "PR1_R43_FLEET_VERDICT" /tmp/bench_r43.txt | head -1
+grep "R43_DIAG" /tmp/bench_r43.txt | head -1
+grep "R43_CONSTRUCTION" /tmp/bench_r43.txt | head -1
+
 # ── 11rs. PHASE 2: THE PRODUCTION LIVE RANDOM STREAM (the mission's ────
 # --random-stream directive). A seedable splitmix64 ITCH 5.0 synthesizer
 # (nf_testkit::randomstream) generates an unseen, non-repeating tape
