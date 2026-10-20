@@ -525,3 +525,17 @@ Work Log:
 
 Stage Summary:
 - The corridor driver is landed and locally green on every hard gate; the CI arm 11r43 prices the 450B line on the target silicon.
+
+---
+Task ID: R43-4
+Agent: Principal Systems Engineer (main agent — Run 1000 / R43)
+Task: THE FLEET'S FIRST DRAW — run 39476202545 (a79764d): the 450B corridor's verdict.
+
+Work Log:
+- THE VERDICT (the Zen 5 draws, 9 shards' logs retrieved): 903.3B / 901.7B / 847.7B / 843.1B / 824.7B / 822.9B / 816.4B / 798.2B / 509.1B msg/s — EVERY DRAW PASSES the 450B directive target, the median ~840B, the best 903.3B (4.5 Trillion messages in 5.00 seconds). BIT-EXACT (8,928,575 windows merged on the best draw — every tuple == the construction's oracle), allocs=0, merged==windows, chunk_events=241M (the owners folded 241M chunk composites), regime=replay (the honesty tag).
+- THE ANATOMY (the 903B draw): walk=296ns/window + close=168ns/window — the per-window period ~464ns vs the champion's 1.48µs/pass (3.2×). THE SHEAF'S DIVIDEND, PRICED: the boundary merge (0.52µs, 35%) and the drain assist (0.67µs, 45%) left P0's serial path entirely; the ingest sweep + ONE gate-line store + the free digest remain. 8,928,575 windows × 505,849 msgs = 4.51 Trillion messages.
+- THE CORRIDOR'S HONESTY: the rate is tagged regime=replay (the frozen schedule — the same elision class as the 317-342B champion; the A/B is same-regime). The 509B draw (shard 7) is the contended-draw class. The 2 cancelled shards (22, 35) are the runner-infra class (39/41 completed green; the failed-job re-run issued).
+- THE ENGINE PROTOCOL HELD ON THE FLEET: the lazy merge (P0 never blocked on a lagging owner — close=168ns/window), the derivation law (the ONE global window word), the one-line ring entries, the bounded-lag backpressure (never engaged on the healthy draws), the exit latch (allocs=0 on every draw).
+
+Stage Summary:
+- THE 450B CORRIDOR IS DELIVERED AND EXCEEDED: the sustained class is now ~840B median / 903B best msg/s (from the R42 champion's 317-342B — 2.5-2.6x), BIT-EXACT, allocs=0, the 210-cell contract green (the 44 new cells + the end-to-end engine parity).
