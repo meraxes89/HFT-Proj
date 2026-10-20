@@ -2,16 +2,28 @@
 
 #![allow(clippy::all)]
 
+/// R37 debug gate — read ONCE via OnceLock (env::var allocates a
+/// String; the measured window's paths must never allocate — the
+/// ALLOC_DELTA gate law). Shared by hydra's window/end_pass traces.
+pub fn res_dbg_gate() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var("HFT_RES_DBG").is_ok())
+}
+
 pub mod affinity;
 pub mod batch_parity;
 pub mod crcfold;
+pub mod dual;
 pub mod fakeserver;
 pub mod golden;
 pub mod hydra;
 pub mod lobstate;
 pub mod passreplay;
+pub mod orderscan;
 pub mod sigfabric;
+pub mod sigpush;
 pub mod polyhash;
+pub mod randomstream;
 pub mod spanfold;
 pub mod reference;
 pub mod sched;

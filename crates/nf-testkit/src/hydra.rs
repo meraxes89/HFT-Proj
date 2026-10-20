@@ -109,7 +109,77 @@ use std::thread::JoinHandle;
 /// ring capacities (ring-aligned chunks never wrap) and amortizes the
 /// cross-core handoff (~2 atomics + ~24 line transfers per chunk) 4x
 /// further than R6's CHUNK=16, collapsing per-span atomic-fence traffic.
-const CHUNK: u64 = 64;
+pub(crate) const CHUNK: u64 = 64;
+
+/// R39: THE EXACT LANE MODULUS — the fold grid's runtime `% n_lanes`
+/// (paid at every drain loop top — the lane re-derivation's division is
+/// a DIV instruction because the divisor is runtime: ~99.5M divides on
+/// the champion's 5s window at ~172 chunk switches per pass) becomes the
+/// precomputed division: one AND when the lane count is a power of two
+/// (the champion's 2 lanes — the modulo vanishes), else the
+/// Granlund–Montgomery exact invariant multiplication (m = floor(2^N/d)
+/// + 1 with N = 32 + floor(log2 d); q = (u·m) >> N — exact for every
+/// dividend u < 2^32, G–M Theorem 4.2; the fold grid u = fold_pos/CHUNK
+/// is < 2^32 with six orders of margin at the 200B target — 1T msgs ≈
+/// 21.7B spans ≈ 2^28.3 grid positions). The remainder is
+/// `u − q·n` (one widening multiply + subtract), ~4 cycles vs the DIV's
+/// 7–15 on the Zen 5 core.
+#[derive(Clone, Copy)]
+struct LaneMod {
+    /// The modulus (0/1 = the degenerate single-lane shapes).
+    n: u64,
+    /// true when n is a power of two (the AND path).
+    pow2: bool,
+    /// The G–M magic (valid when n is not a power of two).
+    magic: u128,
+    /// The magic's total shift N = 32 + floor(log2 n).
+    magic_sh: u32,
+}
+
+impl LaneMod {
+    fn new(n: u64) -> Self {
+        if n > 1 && n.is_power_of_two() {
+            Self {
+                n,
+                pow2: true,
+                magic: 0,
+                magic_sh: 0,
+            }
+        } else if n > 1 {
+            let l = 63 - n.leading_zeros(); // floor(log2 n)
+            let nbits = 32 + l;
+            let magic = ((1u128 << nbits) / n as u128) + 1;
+            Self {
+                n,
+                pow2: false,
+                magic,
+                magic_sh: nbits,
+            }
+        } else {
+            Self {
+                n,
+                pow2: false,
+                magic: 0,
+                magic_sh: 0,
+            }
+        }
+    }
+
+    /// `u % n` — exact for every `u < 2^32` (the G–M domain; asserted in
+    /// debug). The degenerate shapes (0/1 lanes) map everything to 0.
+    #[inline(always)]
+    fn rem(&self, u: u64) -> u64 {
+        if self.n <= 1 {
+            return 0;
+        }
+        if self.pow2 {
+            return u & (self.n - 1);
+        }
+        debug_assert!(u < (1u64 << 32), "LaneMod dividend {u} exceeds the G-M domain");
+        let q = ((u as u128) * self.magic >> self.magic_sh) as u64;
+        u - q * self.n
+    }
+}
 
 /// Result-ring capacity (power of two, multiple of CHUNK).
 const RES_CAP: usize = 4096;
@@ -197,12 +267,12 @@ fn desc8_unpack(w: u64) -> (u32, u16, bool) {
 ///   dependent ops.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Res {
-    span_id: u32,
+pub(crate) struct Res {
+    pub(crate) span_id: u32,
     /// Composite mode: the segment's span count k (1..=64). Per-span
     /// mode: always 0.
-    aux: u32,
-    value: u64,
+    pub(crate) aux: u32,
+    pub(crate) value: u64,
 }
 
 // R21 (Task 3): the descriptor COMPACTNESS invariant — every handoff
@@ -365,8 +435,12 @@ impl SegAcc {
 /// at ~110 per phase (4 phases). Overflow poisons to permanent live
 /// mode (the R32 capacity discipline — fail-safe, never wrong).
 const RESLOG_SEGS: usize = 65_536;
-/// The phase slots: the grid period (n_lanes × CHUNK) is at most 128.
-const RESLOG_PHASES: usize = 128;
+/// The phase slots. R38/L2: widened 128 → 512 — the phase modulus is
+/// `n_lanes × CHUNK` (64 at one lane, 128 at two — exactly the old
+/// capacity; 256+ under HFT_SUSTAINED_WORKERS=3+ would index out of
+/// bounds). 512 covers eight lanes; the arrays are worker-local and
+/// allocated once at spawn (the allocs=0 gate law).
+const RESLOG_PHASES: usize = 512;
 
 /// One recorded composite record: the segment's first span RELATIVE to
 /// the pass boundary (tape order), the span count, and the composed
@@ -399,6 +473,35 @@ struct ResLog {
     phase_n: [u32; RESLOG_PHASES],
     /// The phase's recorded pass boundary (the alignment operand).
     phase_rb: [u64; RESLOG_PHASES],
+    /// R38/L2 (Theorem 25): the phase's cached LANE composite
+    /// `X_ℓ^(e)` — `(K, B)`, the segment-monoid compose of the phase's
+    /// recorded segments (the lane's own tree-fold of its sub-grid
+    /// block; recomputed at every close, published by the worker at
+    /// the crossing via the lane's epoch slots). The replayed passes
+    /// re-publish the cached value verbatim (the emission IS the
+    /// script — the composite is the same by construction).
+    phase_bc: [(u32, u64); RESLOG_PHASES],
+    /// R38/L2: the epoch (pass) counter — the closed pass's sequence
+    /// number, the epoch-slot publication's tag (Theorem 26(b)'s
+    /// staleness bound: the published slot lags the true frontier by
+    /// at most one epoch).
+    epoch: u64,
+    /// R38/L2: the closed pass's composite (epoch, K, B) — staged at
+    /// the close, drained by the worker's publication after the
+    /// boundary step (one release-store triple per pass).
+    pending_bc: Option<(u64, u64, u64)>,
+    /// R38/L2: the CURRENT pass's running lane composite — the
+    /// segment-monoid compose of the pass's EMITTED segments so far
+    /// (the recording's push_segs, the replay's noted emissions, the
+    /// fallback's live remainder — all three paths note here), staged
+    /// as `pending_bc` at the close. Two u64s, worker-local.
+    bc_acc: (u64, u64),
+    /// R38/L2: THE LANE IDENTITY — the sub-grid's owner (the per-lane
+    /// tiling law's operand; the round-robin chunk grid is the static
+    /// epoch-block assignment of Def 3.1).
+    lane_idx: u64,
+    /// R38/L2: the lane count (the sub-grid geometry).
+    n_lanes: u64,
     /// The phase modulus — the grid period n_lanes × CHUNK.
     grid: u64,
     /// The current pass's boundary (u64::MAX before the first).
@@ -432,6 +535,12 @@ impl ResLog {
             phase_lo: [0; RESLOG_PHASES],
             phase_n: [0; RESLOG_PHASES],
             phase_rb: [0; RESLOG_PHASES],
+            phase_bc: [(0, 0); RESLOG_PHASES],
+            epoch: 0,
+            pending_bc: None,
+            bc_acc: (0, 0),
+            lane_idx: 0,
+            n_lanes,
             grid: n_lanes * CHUNK,
             cur_rb: u64::MAX,
             prev_rb: u64::MAX,
@@ -447,6 +556,13 @@ impl ResLog {
         }
     }
 
+    /// R38/L2: the lane's identity (the spawn's lane index — the
+    /// sub-grid tiling law's operand; the log is worker-local so the
+    /// field is set once at the worker's spawn, outside every window).
+    fn set_lane(&mut self, lane_idx: u64) {
+        self.lane_idx = lane_idx;
+    }
+
     /// The gen re-anchor: the span grid restarts at 0, so every phase's
     /// recorded boundary is stale — clear in place (the capacity is
     /// retained; zero allocation).
@@ -458,6 +574,13 @@ impl ResLog {
         self.cur_rb = u64::MAX;
         self.prev_rb = u64::MAX;
         self.pass_len = 0;
+        // R38/L2: the epoch sequence restarts with the generation (the
+        // main-side collector's pass counter is per-sink/per-gen — the
+        // two sequences re-align at the re-anchor), and the running
+        // composite clears with the bracket.
+        self.epoch = 0;
+        self.pending_bc = None;
+        self.bc_acc = (0, 0);
     }
 
     /// The capacity/protocol poison: permanent live mode (the fail-safe
@@ -468,16 +591,96 @@ impl ResLog {
         self.phase_n = [0; RESLOG_PHASES];
         self.recording = false;
         self.replaying = false;
+        self.pending_bc = None;
+        self.bc_acc = (0, 0);
     }
 
     /// THE BOUNDARY STEP — called at every pass-start record crossing,
     /// AFTER the ending pass's final segment was flushed+captured.
     /// Closes the recording bracket, runs the length law, and arms this
     /// pass's replay (or opens its recording bracket).
+    ///
+    /// R38/L2: THE PER-LANE TILING LAW — the coverage law generalized
+    /// from the full-pass grid to the LANE'S ROUND-ROBIN CHUNK SUB-GRID
+    /// (the static epoch-block assignment of Def 3.1 — the two-lane
+    /// elision's unlock). A phase script seals only when it TILES the
+    /// lane's own positions within the pass:
+    ///   * the HEAD: the first segment's rel is the lane's sub-grid
+    ///     entry `E = lane_span_entry(cur_rb)` — 0 when the boundary
+    ///     lands inside an own chunk (the walk splits the in-flight
+    ///     segment AT the boundary), the foreign head-gap otherwise;
+    ///   * the BODY: consecutive segments advance by `k_i` PLUS an
+    ///     allowed gap of {0 (a mid-chunk publish split),
+    ///     (n_lanes−1)·CHUNK (the chunk-end flush — the foreign chunks
+    ///     between own chunks)} — the interleaved sub-grid's stride;
+    ///   * the TAIL: the tiling ends exactly at the lane's sub-grid
+    ///     exit `X = lane_span_exit(rb)` — `rb` itself when the next
+    ///     boundary lands mid-own-chunk, the last own chunk's end
+    ///     otherwise.
+    /// At n_lanes == 1 the law degenerates VERBATIM to the R37c
+    /// coverage law (E = cur_rb, X = rb, the gap set collapses to
+    /// {0} — the one-lane scripts seal identically; the no-drift law).
+    /// The hole classes the law rejects are unchanged: a head-holed
+    /// script (the inline episode's chunk-skips carrying the eval
+    /// cursor across the boundary), a mid-pass inline claim (the skip
+    /// gap n_lanes·CHUNK is NOT in the allowed set), and a tail assist
+    /// (the tiling ends short of X) — each discarded (phase_n = 0, the
+    /// next orbit's same-phase pass re-records).
     fn on_boundary(&mut self, rb: u64) {
+        // R38/L2: THE CLOSE — stage the ending pass's lane composite
+        // `X_ℓ^(e)` (Theorem 25's protocol: the compose of the pass's
+        // EMITTED segments — the recording's push_segs, the replay's
+        // noted emissions, the fallback's live remainder — the running
+        // accumulator tracks all three verbatim) for the worker's
+        // epoch-slot publication, then clear it for the new bracket.
+        // The accumulator is the EMISSION's composite (not the sealed
+        // script's): a discarded script's spans were still emitted and
+        // still count — the fold consumed them.
+        let closed_bc = self.bc_acc;
+        self.bc_acc = (0, 0);
+        self.pending_bc = Some((self.epoch, closed_bc.0, closed_bc.1));
         if self.recording {
             let lo = self.phase_lo[self.phase] as usize;
-            self.phase_n[self.phase] = (self.segs.len() - lo) as u32;
+            let n = self.segs.len() - lo;
+            // R37c + R38/L2: THE PER-LANE COVERAGE LAW — the law
+            // statement lives in the method doc above.
+            let tiles = n > 0 && {
+                let head_rel = lane_span_entry(self.cur_rb, self.lane_idx, self.n_lanes)
+                    - self.cur_rb;
+                let tail_rel = lane_span_exit(rb, self.lane_idx, self.n_lanes)
+                    .saturating_sub(self.cur_rb);
+                let first = &self.segs[lo];
+                if first.rel as u64 != head_rel {
+                    false
+                } else {
+                    let mut end = first.rel as u64;
+                    let mut ok = true;
+                    for s in &self.segs[lo..lo + n] {
+                        let rel = s.rel as u64;
+                        // The sub-grid's allowed advance from `end` to
+                        // the next segment's rel: 0 (the mid-chunk
+                        // publish split) or the foreign gap between
+                        // own chunks. A skipped own chunk (the inline
+                        // assist) advances n_lanes·CHUNK — NOT allowed.
+                        if rel != end && rel != end + (self.n_lanes - 1) * CHUNK {
+                            ok = false;
+                            break;
+                        }
+                        end = rel + s.k as u64;
+                    }
+                    ok && end == tail_rel
+                }
+            };
+            if tiles {
+                self.phase_n[self.phase] = n as u32;
+                // R38/L2: the sealed phase's composite caches for the
+                // replayed passes' publications (the emission IS the
+                // script — the composite is identical by construction).
+                self.phase_bc[self.phase] = (closed_bc.0 as u32, closed_bc.1);
+            } else {
+                self.segs.truncate(lo);
+                self.phase_n[self.phase] = 0;
+            }
             self.recording = false;
         }
         // The length law: the boundary deltas must be constant.
@@ -497,6 +700,9 @@ impl ResLog {
         self.cur_rb = rb;
         self.phase = (rb % self.grid) as usize;
         self.replaying = false;
+        // R38/L2: the epoch sequence steps with the pass start (the
+        // closed pass's composite carries the pre-increment epoch).
+        self.epoch += 1;
         if self.poisoned || self.audit || !self.enabled {
             self.live_passes += 1;
             return;
@@ -534,6 +740,11 @@ impl ResLog {
     /// only). `first` is the segment's gen-relative first span; the rel
     /// is stored against the CURRENT pass's boundary.
     fn push_seg(&mut self, first: u64, k: u32, b: u64) {
+        // R38/L2: the running lane composite accumulates EVERY emitted
+        // segment — recording or not (the fallback pass's live
+        // remainder notes here too; the accumulator is the EMISSION's
+        // composite, the fold's consumption's twin).
+        self.note_emitted(k, b);
         if !self.recording || self.poisoned {
             return;
         }
@@ -543,6 +754,20 @@ impl ResLog {
         }
         let rel = (first - self.cur_rb) as u32;
         self.segs.push(ResLogSeg { rel, k, b });
+    }
+
+    /// R38/L2: the replay emission's composite note — one compose per
+    /// EMITTED script segment (the replayed pass's lane composite is
+    /// the script's own compose; the accumulator tracks it in the
+    /// emission order, so a mid-script fallback's mix composes exactly
+    /// as the fold consumed it).
+    #[inline]
+    fn note_emitted(&mut self, k: u32, b: u64) {
+        let (k2, b2) = crate::sink::seg_compose(
+            (self.bc_acc.0 as u32, self.bc_acc.1),
+            (k, b),
+        );
+        self.bc_acc = (k2 as u64, b2);
     }
 
     /// The mid-pass fallback (an inline-claimed chunk in the replay
@@ -577,6 +802,77 @@ impl ResLog {
     }
 }
 
+/// R37b: THE FALLBACK GRID LAW — the replay fallback's cursor
+/// re-derivation, extracted pure (the unit cell's target). Given the
+/// eval cursor (the last emitted segment's end — an OWN-chunk
+/// position: segments never cross chunk ends, so eval ∈ [own_start,
+/// own_end]), re-derive the walk's grid: the next OWN chunk at-or-above
+/// eval, and the walk's start — `max(eval, chunk_lo)`.
+///
+/// THE LAW (the CI 13-shard failure's arithmetic): when eval sits
+/// EXACTLY at its own chunk's end, it is simultaneously a FOREIGN
+/// chunk's start (the other lane's turn) — the naive `gid = eval` walk
+/// would evaluate the foreign chunk's spans [eval, chunk_lo) into THIS
+/// lane's res ring (the fold's composite order assert: "got span
+/// 98880, expected 98944, lane 0"). The clamp guarantees the walk
+/// never starts below its lane's grid. Structurally a no-op at
+/// n_lanes == 1 (no foreign chunks — the R36-E scope gate's mask).
+fn fallback_grid(eval: u64, lane_idx: u64, n_lanes: u64) -> (u64, u64) {
+    // The modular advance to the lane's next OWN chunk — the pre-R37b
+    // code's `chunk_id += 1` is exact ONLY at n_lanes <= 2 (the
+    // odd/even flip); at 3+ lanes a foreign chunk needs +k (the unit
+    // cell's catch: lane 0/3 at chunk 2), and the 8/16-lane CI arms
+    // (HFT_SUSTAINED_WORKERS) would walk foreign chunks on the fallback.
+    let chunk_id = eval / CHUNK;
+    let lane_of = chunk_id % n_lanes;
+    let advance = (lane_idx + n_lanes - lane_of) % n_lanes;
+    let chunk_lo = (chunk_id + advance) * CHUNK;
+    // THE CLAMP: spans below chunk_lo belong to the OTHER lanes' grid
+    // (the owner's res ring, or main's inline claim).
+    (chunk_lo, eval.max(chunk_lo))
+}
+
+/// R38/L2: THE LANE'S SUB-GRID ENTRY — the first span THIS lane owns
+/// at-or-above `p` (the round-robin chunk grid: chunk c belongs to
+/// lane `c % n_lanes`). `p` inside an own chunk (its start included)
+/// → `p` itself (a mid-chunk entry: the walk resumes there); `p`
+/// inside a foreign chunk → the next own chunk's start. The per-lane
+/// tiling law's HEAD operand (the script's first rel) and the walk's
+/// own re-entry share this arithmetic — `fallback_grid` is the
+/// chunk-lo form, this is the position form.
+#[inline]
+fn lane_span_entry(p: u64, lane_idx: u64, n_lanes: u64) -> u64 {
+    let chunk_id = p / CHUNK;
+    let lane_of = chunk_id % n_lanes;
+    if lane_of == lane_idx {
+        p
+    } else {
+        let advance = (lane_idx + n_lanes - lane_of) % n_lanes;
+        (chunk_id + advance) * CHUNK
+    }
+}
+
+/// R38/L2: THE LANE'S SUB-GRID EXIT — the lane's last own position
+/// emitted before the walk crosses the NEXT boundary `rb` (the tiling
+/// law's TAIL operand). Two cases: `rb` strictly inside an own chunk
+/// (not at its start) → the walk's crossing fires AT `rb` mid-chunk,
+/// the in-flight segment splits there, the script ends at `rb`;
+/// otherwise (rb in a foreign chunk, or exactly at an own chunk's
+/// start) → the walk's last own position is the PREVIOUS own chunk's
+/// end — `entry(rb) − (n_lanes−1)·CHUNK`. At n_lanes == 1 the law
+/// degenerates to `rb` in BOTH cases — the R37c coverage law's
+/// original operand (the no-drift guarantee: the one-lane shape's
+/// scripts seal identically under the generalized law).
+#[inline]
+fn lane_span_exit(rb: u64, lane_idx: u64, n_lanes: u64) -> u64 {
+    let entry = lane_span_entry(rb, lane_idx, n_lanes);
+    if entry == rb && rb % CHUNK != 0 {
+        rb
+    } else {
+        entry - (n_lanes - 1) * CHUNK
+    }
+}
+
 /// One pass's deferred-result record (GIGAHFT Lever 4). `count`/`msg_hash`
 /// are captured synchronously at `end_pass`; `hash` is captured when the
 /// ordered fold crosses the pass's final span — possibly DURING a later
@@ -591,6 +887,10 @@ struct PassRec {
     /// Captured span-fold hash (valid when `done`).
     hash: u64,
     done: bool,
+    /// R40: the sink's begin_pass sequence number (1-based) — the
+    /// dual gate's arrival-pass key (P1's arrivals are keyed by the
+    /// same ids; the mono path never reads it).
+    pass_id: u64,
 }
 
 /// Completed-pass records kept per sink (harvested by the harness each
@@ -665,6 +965,18 @@ pub struct HydraLane {
     /// Written by main (Release) after folding a batch; read by worker
     /// (Acquire) before overwriting (defensive — never blocking by proof).
     res_tail: Pad,
+    /// R38/L2 (Theorem 25's protocol): the lane's EPOCH SLOTS — the
+    /// per-pass boundary composite `X_ℓ^(e) = (K, B)` published by the
+    /// worker at every pass close (one release-store triple; the
+    /// degree `K`, the composed constant `B`, and the epoch tag `e`).
+    /// The main's multi-boundary collector reads them at the boundary
+    /// flush for the sheaf degree law — the asynchronous merge
+    /// surface. No lane ever waits on the other's publication (the
+    /// slots are monotone per lane; Theorem 26(b) bounds the
+    /// staleness at one epoch).
+    bc_k: Pad,
+    bc_b: Pad,
+    bc_epoch: Pad,
 }
 
 // SAFETY: see the struct-level contract. Pointer dereference is confined to
@@ -689,7 +1001,34 @@ impl HydraLane {
             )),
             res_head: Pad::zeroed(),
             res_tail: Pad::zeroed(),
+            bc_k: Pad(AtomicU64::new(0)),
+            bc_b: Pad(AtomicU64::new(0)),
+            // u64::MAX = nothing published yet (the epoch sequence
+            // starts at 0 — the tag's "unset" state must not collide).
+            bc_epoch: Pad(AtomicU64::new(u64::MAX)),
         })
+    }
+
+    /// R38/L2 (Theorem 25's protocol): the worker's epoch-slot
+    /// publication — `(K, B)` for epoch `e`, the constant data first
+    /// and the tag LAST under Release (the collector that Acquires the
+    /// tag sees the composite; the tag's monotonicity is the
+    /// publication predicate of Def 3.2 — non-monotone publication is
+    /// unrepresentable under the store discipline).
+    #[inline]
+    fn publish_bc(&self, epoch: u64, k: u64, b: u64) {
+        self.bc_k.store(k, Ordering::Relaxed);
+        self.bc_b.store(b, Ordering::Relaxed);
+        self.bc_epoch.store(epoch, Ordering::Release);
+    }
+
+    /// R38/L2: the collector's read — `(epoch, K, B)` as published (the
+    /// tag's Acquire exposes the composite pair; a torn read is
+    /// impossible under the publication's store discipline).
+    #[inline]
+    fn read_bc(&self) -> (u64, u64, u64) {
+        let e = self.bc_epoch.load(Ordering::Acquire);
+        (e, self.bc_k.load(Ordering::Relaxed), self.bc_b.load(Ordering::Relaxed))
     }
 
     /// Consumer-side descriptor words (worker thread only).
@@ -723,6 +1062,31 @@ impl HydraLane {
         // immutable to main until it releases res_tail.
         unsafe { &*self.res.get() }
     }
+
+    // ── R40: the dual-producer drain surface (crate::dual's lane-1
+    // consumer view — the same SPSC protocol, P1 as the consumer) ──
+    #[inline(always)]
+    pub fn r40_res_head(&self) -> u64 {
+        self.res_head.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    pub fn r40_res_tail_load(&self) -> u64 {
+        self.res_tail.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    pub fn r40_res_tail_store(&self, v: u64) {
+        self.res_tail.store(v, Ordering::Release);
+    }
+    #[inline(always)]
+    pub(crate) fn r40_res_slots(&self) -> &[Res; RES_CAP] {
+        self.res_slots_read()
+    }
+}
+
+/// R40: the res ring's slot mask (the dual drain's indexing operand).
+#[inline]
+pub fn r40_res_mask() -> u64 {
+    RES_MASK
 }
 
 /// Legacy-format desc load: desc `pos` → (ptr, len, span_id).
@@ -1046,6 +1410,25 @@ pub struct WorkerStats {
     /// R36-E: passes walked live (the recording orbit, the fallbacks,
     /// the rollback/audit shapes).
     pub res_live: AtomicU64,
+    /// R39a: LAYER-1 guard fires — the segment capacity law's defensive
+    /// mid-chunk flushes (the SegAcc held 64 spans at a push boundary;
+    /// the flush is a LEGAL extra segment split — the composition law
+    /// is exact for every k — so the counter is telemetry, never a
+    /// failure). Steady state: 0. Non-zero on a run = the residual
+    /// cursor-discipline family (docs/49 §8) fired and was CONTAINED.
+    pub seg_guards: AtomicU64,
+    /// R39a: LAYER-2 guard fires — the chunk-cursor containment resyncs
+    /// (the eval cursor left [chunk_lo, chunk_lo+CHUNK] between walk
+    /// entries; the cursors re-derived positionally via `fallback_grid`).
+    /// Steady state: 0 (the legal boundary case eval == chunk_lo+CHUNK
+    /// is handled by the normal path, not the resync).
+    pub cursor_resyncs: AtomicU64,
+    /// R39a: LAYER-3 guard fires — the record-window snaps (the adopted
+    /// record's base sits AHEAD of the eval cursor: the record stream
+    /// jumped over a mid-chunk publish-split hole — an inline-claimed
+    /// remainder — and the skipped spans are NOT this lane's to
+    /// evaluate; the cursor snaps to the record's base). Steady state: 0.
+    pub record_snaps: AtomicU64,
     /// This worker's pinned cpu (usize::MAX when unpinned).
     pub cpu: AtomicU64,
 }
@@ -1069,6 +1452,9 @@ impl WorkerStats {
             res_recs: AtomicU64::new(0),
             res_fb: AtomicU64::new(0),
             res_live: AtomicU64::new(0),
+            seg_guards: AtomicU64::new(0),
+            cursor_resyncs: AtomicU64::new(0),
+            record_snaps: AtomicU64::new(0),
             cpu: AtomicU64::new(u64::MAX),
         }
     }
@@ -1740,6 +2126,15 @@ fn lane_worker_rxdesc(
                 // R25a: composite mode buffers the term (per-span mode
                 // emits the R23 shape verbatim — the rollback).
                 if composite {
+                    // R39a LAYER 1 (the scalar face, the pre-diet twin):
+                    // the capacity law — a full buffer flushes FIRST (the
+                    // legal extra split; the composition law is exact for
+                    // every k). This worker has no ResLog (the pre-R36-E
+                    // shape), so the flush emits without the capture.
+                    if seg.len == 64 {
+                        let _ = seg.flush(res_slots, rhead, &mut nres);
+                        stats.seg_guards.fetch_add(1, Ordering::Relaxed);
+                    }
                     seg.push(gid, value);
                 } else {
                     res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
@@ -1882,17 +2277,29 @@ fn lane_worker_rxdesc_diet(
     let reslog_enabled = res_replay_override
         .unwrap_or_else(|| std::env::var("HFT_RES_REPLAY").as_deref() == Ok("1"))
         && composite
-        && !null
-        // R36-E (the ship's scope gate): the SINGLE-LANE shape. The
-        // two-lane replay's frontier couples to the window publication
-        // cadence (the ready gate, the SS pre-publish, the pace spin's
-        // fold dependency) — a residual interaction the fleet's timing
-        // exposes (the local slice cannot); the next session's debug
-        // lands it. The single-lane elision is proven: the local
-        // champion at 2.3–2.85x, BIT-EXACT, allocs=0, every gate.
-        && n_lanes == 1;
+        && !null;
+        // R37 (solution2.md Part II, Theorems 23–26): the SINGLE-LANE
+        // scope gate is LIFTED. The R36-E two-lane coupling was the
+        // fold-frontier dependency: the workers' res rings filled at
+        // the serial fold's drain pace (2.08 µs/pass — B1), the pace
+        // spin throttled the faster lane to the slower, and the
+        // ready-gate ordered the commutative path behind the hash
+        // frontier. With the R37 tree fold the drain runs ~13× ahead
+        // of the record stream and the frontier's fold dependency
+        // dissolves — the lanes' round-robin chunk grid IS the static
+        // epoch-block assignment of Def 3.1 (a fixed function of the
+        // tape, never of timing), the per-lane res rings are the SPSC
+        // epoch rings, and the fold's strict-order drain is the
+        // static-order merge (Theorem 23(b)). The champion arm 11r37
+        // runs the two-worker shape armed; the fleet prices the lane
+        // interference efficiency η (gate 12: 2-lane vs 1-lane on
+        // identical tapes). The one-worker shape stays available via
+        // HFT_SUSTAINED_WORKERS=1 (arm 11r36 — the attribution twin).
     let reslog_audit = std::env::var("HFT_RES_AUDIT").is_ok();
     let mut reslog = ResLog::new(reslog_enabled, reslog_audit, n_lanes);
+    // R38/L2: the lane's identity (the per-lane tiling law's operand —
+    // the sub-grid this worker's scripts tile).
+    reslog.set_lane(lane_idx);
     let pf = PfCfg::detect(kernel);
     // The drain batch (read ONCE at worker start — outside every window;
     // worker_batch() parses an env var, which ALLOCATES).
@@ -1946,6 +2353,20 @@ fn lane_worker_rxdesc_diet(
     let mut pf_base: u64 = 0;
     let mut pf_wb: u64;
     let mut backoff: u32 = 0;
+    // R38/L2: THE DEFER-BACKOFF — the replay emission gate's stall
+    // pause counter (the exhausted-script defer + the mid-script
+    // frontier break). The pre-R38 defer cycle re-entered `'batch`
+    // with no pause: the emission gate's record-wait spins at MHz
+    // against the batch top, and on a SHARED core (the dev slices,
+    // the contended CI draws) the spin starves the OTHER lane's
+    // worker — the fold's order coupling then throttles the main's
+    // publication and the record this lane waits for lands late (the
+    // amplified thrash: the two-lane elision's local 8x collapse).
+    // The DEEP pause keeps the fleet's dedicated-core shape verbatim
+    // (the first ~20 laps are pure PAUSE bursts — the wake latency is
+    // one lap, far under the pass-open cadence) and only yields after
+    // ~100µs of true idleness — the sibling gets its slice.
+    let mut defer_bo: u32 = 0;
     // R26: the spray auto-mute — consecutive TAGGED spans seen by this
     // worker (tagged spans need ZERO payload lines, so the spray's
     // per-span walk is pure overhead in the all-tagged steady regime).
@@ -2012,6 +2433,29 @@ fn lane_worker_rxdesc_diet(
     /// rides the flush — the ending pass's log), steps the res log's
     /// phase machine, fires Worker 0's per-pass SPANHASH surface, and
     /// returns the next window boundary.
+    ///
+    /// R38/L2: THE MULTI-BOUNDARY COLLECTOR. `multi = true` (the LIVE
+    /// WALK's own crossings — never the replay emission gate): the
+    /// resolve may adopt SEVERAL records in one jump (the chunk-skip
+    /// episodes carry the eval cursor across window boundaries without
+    /// a crossing; the walk-side hole guard discards the interrupted
+    /// script but the phase machine still loses a step per jumped
+    /// PASS boundary — the R37c count face). The collector re-walks
+    /// the adopted record range in ring order and fires the boundary
+    /// step for EVERY crossed pass boundary — the bracket discipline
+    /// the per-lane phase scripts require (each pass opens/closes its
+    /// bracket exactly once, in order, on every lane). The R37c
+    /// livelock analysis (docs/49 §8-pre) pinned the reverted
+    /// close-side collector's failure to the EMISSION GATE's
+    /// exhausted-script defer cycle — the multi-fire here fires ONLY
+    /// at the live walk's crossings, the documented fix direction.
+    ///
+    /// R38/L2: THE EPOCH-SLOT PUBLICATION (Theorem 25's protocol) — at
+    /// every closed pass the worker publishes its lane composite
+    /// `X_ℓ^(e) = (K, B)` into the lane's epoch slots (one
+    /// release-store triple; the main's boundary collector reads them
+    /// for the sheaf degree law — the asynchronous merge surface; no
+    /// lane ever waits on the other's publication).
     #[allow(clippy::too_many_arguments)]
     fn boundary_cross(
         rx: &RxdescState,
@@ -2020,6 +2464,7 @@ fn lane_worker_rxdesc_diet(
         rec_base: &mut u64,
         arr_slot: &mut u8,
         gid: u64,
+        lane: &HydraLane,
         lane_idx: u64,
         sig_armed: bool,
         audit_mode: bool,
@@ -2031,7 +2476,11 @@ fn lane_worker_rxdesc_diet(
         res_slots: &mut [Res; RES_CAP],
         rhead: u64,
         nres: &mut u64,
+        multi: bool,
     ) -> (u64, bool) {
+        // The pre-crossing slot — the adopted range's left edge (the
+        // multi-fire re-walks (entry, *rec_slot] after the resolve).
+        let entry = *rec_slot;
         let is_pass = resolve_rec(rx, gen, rec_slot, rec_base, arr_slot, gid);
         let wb = probe_wb(rx, gen, *rec_slot, *rec_base);
         // R25a: the record covering this span opens a pass — split the
@@ -2044,16 +2493,52 @@ fn lane_worker_rxdesc_diet(
         // fail-safe, not fail-loud. R36-E: the capture rides the flush
         // (the segment belongs to the ENDING pass — cur_rb still the
         // old boundary; on_boundary below re-latches it).
-        if composite && is_pass {
-            if let Some((first, k, b)) = seg.flush(res_slots, rhead, nres) {
-                reslog.push_seg(first, k, b);
+        let mut crossed_pass = false;
+        if multi {
+            // R38/L2: the multi-fire — every crossed PASS boundary in
+            // ring order. The in-flight segment splits at the FIRST
+            // crossed pass start (the flush above rides each close;
+            // after the first the accumulator is empty — the jump
+            // episodes arrive with an empty segment, the normal
+            // crossing with one ending exactly at the boundary).
+            let mut s = entry;
+            while s != *rec_slot {
+                s = (s + 1) % REC_RING as u8;
+                let (rg, rb, rf, _ras) = rx.read_record(s);
+                if rg == gen && rf {
+                    crossed_pass = true;
+                    if composite {
+                        if let Some((first, k, b)) = seg.flush(res_slots, rhead, nres) {
+                            reslog.push_seg(first, k, b);
+                        }
+                    }
+                    reslog.on_boundary(rb);
+                    // The epoch-slot publication (every closed pass —
+                    // the intermediate passes of a jump publish too).
+                    if let Some((e, kk, bb)) = reslog.pending_bc.take() {
+                        lane.publish_bc(e, kk, bb);
+                    }
+                }
             }
-        }
-        // R36-E: the log's boundary step — the length law, the phase
-        // lookup, the arming (this pass replays) or the recording
-        // bracket (it walks live).
-        if is_pass {
-            reslog.on_boundary(*rec_base);
+        } else {
+            // The single-fire (the replay emission gate's crossings —
+            // the legacy law verbatim; the gate adopts at most one
+            // record per crossing by the probe's construction).
+            if composite && is_pass {
+                if let Some((first, k, b)) = seg.flush(res_slots, rhead, nres) {
+                    reslog.push_seg(first, k, b);
+                }
+            }
+            // R36-E: the log's boundary step — the length law, the phase
+            // lookup, the arming (this pass replays) or the recording
+            // bracket (it walks live).
+            if is_pass {
+                crossed_pass = true;
+                reslog.on_boundary(*rec_base);
+                if let Some((e, kk, bb)) = reslog.pending_bc.take() {
+                    lane.publish_bc(e, kk, bb);
+                }
+            }
         }
         // R35-B: THE 𝒜₅.₀ FABRIC HOOK (Worker 0, once per pass). The
         // bake (the first pass): the ledger bodies → the frozen
@@ -2064,7 +2549,11 @@ fn lane_worker_rxdesc_diet(
         // off the eval's critical accounting (it runs in the
         // boundary-crossing branch, ~once per 22k spans; its cost is
         // priced by sig_digest_ns).
-        if is_pass && sig_armed && lane_idx == 0 {
+        // R38/L2: the hook's fire condition is "a pass boundary was
+        // crossed" (the multi-fire may cross several; the surfaces are
+        // the frozen-table laws — pass-invariant — so one fire per
+        // crossing keeps the pre-R38 cost shape).
+        if crossed_pass && sig_armed && lane_idx == 0 {
             if let Some(sf) = sig_fabric.get() {
                 // THE PER-PASS REPLAY: the global Σ walk over the frozen
                 // 512-chunk table (the R34 law — ~977 combines, the
@@ -2130,7 +2619,7 @@ fn lane_worker_rxdesc_diet(
                     .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
-        (wb, is_pass)
+        (wb, crossed_pass)
     }
 
     loop {
@@ -2194,6 +2683,7 @@ fn lane_worker_rxdesc_diet(
             pf_arr_slot = arr_slot;
             pf_base = 0;
             backoff = 0;
+            defer_bo = 0;
         }
         if blob_base == 0 {
             // Ordered before the first ready Release of this generation —
@@ -2251,6 +2741,31 @@ fn lane_worker_rxdesc_diet(
         let res_slots = lane.res_slots();
         let mut nres: u64 = 0;
         'batch: while n_total < wbatch {
+            // R37: THE STALE-READY REFRESH (the two-lane deadlock's
+            // root, docs/48 §1's scoped-out class now closed). The
+            // multi-lane gap keeps THIS lane's eval cursor BELOW the
+            // global publication frontier (the other lane's chunks
+            // fill the gap), so Strand A's refresh (`eval >= ready`)
+            // never fires on the replay path — the frontier break +
+            // the liveness publish's `continue 'batch` spin against a
+            // STALE local `ready` while the register already holds the
+            // window's SS pre-publication, and the cycle closes
+            // through the main thread's pace gate (pending > RX_PACE →
+            // the fold → this lane's records → the stale frontier).
+            // ONE Acquire per chunk-iteration, only while the replay
+            // is armed and only when Strand A itself won't refresh —
+            // the single-lane shape's eval tracks the ready and never
+            // pays the load's branch.
+            if reslog.replaying && eval < ready {
+                let (g2, r2) = rx.load_ready();
+                if g2 == gen && r2 > ready {
+                    ready = r2;
+                    // STRAND B: the ready-advance refresh (the boundary
+                    // records may have landed with the publication).
+                    next_wb = probe_wb(&rx, gen, rec_slot, rec_base);
+                    pf_wb = probe_wb(&rx, gen, pf_slot, pf_base);
+                }
+            }
             if eval >= ready {
                 // STRAND A — the frontier hit: publish the partial run
                 // FIRST (liveness), then wait at the frontier hot.
@@ -2327,6 +2842,10 @@ fn lane_worker_rxdesc_diet(
             // records respect the fold's chunk-grid and pass-boundary
             // break discipline exactly (they were emitted under it).
             if reslog.replaying {
+                // R38/L2: the stall flag — the emission gate's two wait
+                // faces (the exhausted-script defer, the mid-script
+                // frontier) mark the cycle for the defer pause below.
+                let mut stalled = false;
                 while n_total < wbatch {
                     // THE BOUNDARY CHECK on the pending position — the
                     // position this walk is about to touch: the next
@@ -2352,6 +2871,7 @@ fn lane_worker_rxdesc_diet(
                             &mut rec_base,
                             &mut arr_slot,
                             pending,
+                            &lane,
                             lane_idx,
                             sig_armed,
                             audit_mode,
@@ -2363,6 +2883,7 @@ fn lane_worker_rxdesc_diet(
                             res_slots,
                             rhead,
                             &mut nres,
+                            false, // the emission gate: the single-fire (the livelock law — docs/49 §8-pre)
                         );
                         if reslog.rp_next >= reslog.rp_end && new_wb == next_wb {
                             // The script is exhausted and no boundary
@@ -2370,6 +2891,7 @@ fn lane_worker_rxdesc_diet(
                             // visible yet: defer to the batch top (the
                             // frontier wait / the ready advance will
                             // publish it).
+                            stalled = true;
                             break;
                         }
                         next_wb = new_wb;
@@ -2387,7 +2909,8 @@ fn lane_worker_rxdesc_diet(
                         // The frontier: the segment's spans are not all
                         // published yet — wait at the batch top (the
                         // Strand A machinery, shared verbatim).
-                        if std::env::var("HFT_RES_DBG").is_ok() {
+                        stalled = true;
+                        if crate::res_dbg_gate() {
                             eprintln!(
                                 "R36EDBG lane{lane_idx} frontier: eval={eval} first={first} end={end} ready={ready} rp={}/{} rb={} phase={} rec_base={} next_wb={}",
                                 reslog.rp_next, reslog.rp_end, reslog.cur_rb, reslog.phase, rec_base, next_wb
@@ -2431,6 +2954,10 @@ fn lane_worker_rxdesc_diet(
                     eval = end;
                     reslog.rp_next += 1;
                     reslog.emitted += 1;
+                    // R38/L2: the replay emission's composite note (the
+                    // pass's lane composite tracks the EMISSION — the
+                    // fold's consumption's twin; one compose per segment).
+                    reslog.note_emitted(k, b);
                 }
                 if reslog.replaying {
                     // R36-E: THE LIVENESS PUBLISH — the frontier break can
@@ -2439,6 +2966,7 @@ fn lane_worker_rxdesc_diet(
                     // is gated on THIS lane's records): the pending run
                     // MUST be published before the wait (the Strand A's
                     // own law, applied at the replay's exit).
+                    let progressed = nres > 0;
                     if nres > 0 {
                         std::hint::black_box(&res_slots[(rhead & RES_MASK) as usize]);
                         // SAFETY: slots [rhead, rhead+nres) fully written
@@ -2447,8 +2975,44 @@ fn lane_worker_rxdesc_diet(
                         rhead += nres;
                         nres = 0;
                     }
+                    // R37b: THE REPLAY CYCLE'S SHUTDOWN ESCAPE — the
+                    // cycle (the frontier break / the exhausted-script
+                    // force-cross defer) re-enters `'batch` while
+                    // `eval < ready`, so the outer loop's idle path
+                    // (the ONLY shutdown-checked park) is never reached.
+                    // At a full-tape ending the multi-lane gap holds
+                    // this lane's eval BELOW ready forever (the other
+                    // lane owns the tail spans; no further record will
+                    // ever land) — the join spins hot and the fabric
+                    // drop hangs. The bench's 5s window almost always
+                    // ends mid-pass (eval == ready, the idle path, the
+                    // clean park); the boundary-aligned ending and the
+                    // full-tape cells hit it deterministically. Publish
+                    // FIRST (above — the Strand A law), THEN check: the
+                    // exit leaves nothing unpublished.
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // R38/L2: THE DEFER PAUSE — a stalled cycle (no
+                    // emission, no boundary adopted) escalates the deep
+                    // pause instead of re-entering the gate at MHz: on
+                    // a shared core the unpaused cycle starves the
+                    // OTHER lane's worker and the fold's order coupling
+                    // amplifies the stall into the main's publication
+                    // throttle (the two-lane elision's dev-slice 8x
+                    // collapse). On a dedicated core the first ~20 laps
+                    // are pure PAUSE bursts (the wake latency is one
+                    // lap — far under the pass-open cadence; the fleet
+                    // shape is unchanged).
+                    if progressed {
+                        defer_bo = 0;
+                    } else if stalled {
+                        stats.idle_iters.fetch_add(1, Ordering::Relaxed);
+                        crate::affinity::polite_spin_deep(&mut defer_bo);
+                    }
                     continue 'batch;
                 }
+
                 // THE FALLBACK: re-derive the live walk's grid cursors
                 // from the eval cursor (the R29 derived-grid discipline
                 // — position-derived, drift-impossible) and fall through
@@ -2460,11 +3024,22 @@ fn lane_worker_rxdesc_diet(
                 // covering the eval is re-found by a scan — the gen
                 // re-anchor's pattern (the fallback is the rare path;
                 // the scan's cost is irrelevant here).
-                chunk_id = eval / CHUNK;
-                if chunk_id % n_lanes != lane_idx {
-                    chunk_id += 1;
-                }
-                chunk_lo = chunk_id * CHUNK;
+                // R37b: the grid re-derivation + THE OWN-CHUNK-END
+                // COINCIDENCE CLAMP (the pure law, `fallback_grid`):
+                // when eval sits exactly at its own chunk's end it is
+                // simultaneously a FOREIGN chunk's start — the walk
+                // must start at the lane's own grid, never below it
+                // (the foreign chunk's spans belong to the owning
+                // lane's ring / main's inline claim — the naive
+                // `gid = eval` walk emitted the foreign record into
+                // THIS lane's ring, the fold's order assert: "got span
+                // 98880, expected 98944, lane 0" — the 13-shard CI
+                // failure class; impossible at n_lanes == 1, the R36-E
+                // scope gate's mask).
+                let (lo, walk_start) = fallback_grid(eval, lane_idx, n_lanes);
+                chunk_id = walk_start / CHUNK;
+                chunk_lo = lo;
+                eval = walk_start;
                 {
                     let mut best = 0u64;
                     let mut got = false;
@@ -2510,6 +3085,53 @@ fn lane_worker_rxdesc_diet(
                     continue 'batch;
                 }
             }
+            // R39a: THE WALK-ENTRY GUARD LAWS (the Shard-28 SegAcc
+            // family's closure — docs/49 §8's census: "the chunk cursors
+            // desyncing behind gid, the chunk-end flush missing, the seg
+            // growing unbounded", exposed by the two-lane shape's
+            // record-adoption interleavings at ~2.5%/shard on the fleet).
+            // Three position-derived, self-correcting invariants checked
+            // at the single choke point every walk entry passes through.
+            // Steady state: all three are no-ops (two register compares
+            // on locals); a fire is CONTAINMENT, never a behavior change
+            // on a healthy stream — each guard restores the invariant
+            // the walk's own discipline already assumes.
+            //
+            // LAYER 3 — THE RECORD-WINDOW SNAP: the adopted record's base
+            // sits AHEAD of the eval cursor (the emission gate's
+            // exhausted-script crossings adopt at `pending = next_wb`,
+            // which the multi-lane gap can hold BEYOND the cursor; the
+            // walk's `idx = eval - rec_base` would then WRAP to a huge
+            // usize and read the arrays out of bounds — the 16-span
+            // mid-chunk publish-split hole of the R37c census is this
+            // face's geometry). The skipped spans belong to NO record
+            // this lane can evaluate (an inline-claimed remainder or a
+            // foreign window): the only sound position is the record's
+            // own base.
+            if eval < rec_base {
+                stats
+                    .record_snaps
+                    .fetch_add(rec_base - eval, Ordering::Relaxed);
+                eval = rec_base;
+            }
+            // LAYER 2 — THE CURSOR CONTAINMENT RESYNC: the eval cursor
+            // must sit inside [chunk_lo, chunk_lo + CHUNK] (the closed
+            // end is the LEGAL fully-consumed boundary the chunk-end
+            // flush below owns). The replay emission can advance eval by
+            // whole passes while chunk_lo stays put; a desynced-behind
+            // chunk_lo silently DISABLES the chunk-end flush (gid never
+            // equals chunk_lo + CHUNK again) and the segment accumulator
+            // grows past its 64-span law — the SegAcc::push8 overflow
+            // verbatim. The resync is `fallback_grid`'s position law
+            // (drift-impossible by construction): the lane's own chunk
+            // at-or-above the cursor, the cursor clamped up to it.
+            if eval < chunk_lo || eval > chunk_lo + CHUNK {
+                let (lo, ws) = fallback_grid(eval, lane_idx, n_lanes);
+                chunk_id = ws / CHUNK;
+                chunk_lo = lo;
+                eval = ws;
+                stats.cursor_resyncs.fetch_add(1, Ordering::Relaxed);
+            }
             let chunk_hi = (chunk_lo + CHUNK).min(ready);
             let mut gid = eval;
             let mut idx = (eval - rec_base) as usize;
@@ -2521,13 +3143,14 @@ fn lane_worker_rxdesc_diet(
                 // in ONE place — `boundary_cross` — shared verbatim with
                 // the res-record replay path (the no-drift law).
                 if gid >= next_wb {
-                    let (new_wb, is_pass) = boundary_cross(
+                    let (new_wb, crossed) = boundary_cross(
                         &rx,
                         gen,
                         &mut rec_slot,
                         &mut rec_base,
                         &mut arr_slot,
                         gid,
+                        &lane,
                         lane_idx,
                         sig_armed,
                         audit_mode,
@@ -2539,6 +3162,21 @@ fn lane_worker_rxdesc_diet(
                         res_slots,
                         rhead,
                         &mut nres,
+                        // R38/L2: THE SCOPE GATE — the multi-boundary
+                        // collector fires ONLY on the multi-lane shape
+                        // (n_lanes >= 2, where the per-lane bracket
+                        // discipline needs every crossed pass stepped).
+                        // The ONE-lane live walk keeps the pre-R38
+                        // crossing semantics VERBATIM (the fleet-proven
+                        // 41/41 shape — the run-39165939083 verdict:
+                        // the plain R6/R7 gate's 1-worker sustained arm
+                        // tripped the fold-order assert on a rare
+                        // publication interleaving with the multi-fire
+                        // armed; the R37c ship's-gate discipline applies
+                        // — the collector's count-face benefit is
+                        // unreachable at the CI watermarks in the 1-lane
+                        // shape, so the proven shape wins the scope).
+                        n_lanes > 1,
                     );
                     next_wb = new_wb;
                     idx = (gid - rec_base) as usize;
@@ -2552,7 +3190,11 @@ fn lane_worker_rxdesc_diet(
                     // the order guard's exact catch). The recording
                     // passes (the next phase's log still empty) keep the
                     // verbatim continuation — the walk IS the recorder.
-                    if is_pass && reslog.replaying {
+                    // R38/L2: `crossed` (a pass boundary was crossed,
+                    // possibly several under the multi-fire) replaces
+                    // the legacy last-record flag — the handoff's law
+                    // is "the machine armed the next script".
+                    if crossed && reslog.replaying {
                         break;
                     }
                 }
@@ -2590,6 +3232,27 @@ fn lane_worker_rxdesc_diet(
                         // spans per 64 B of sidecar traffic.
                         let v8 = rx.get_values8(arr_slot, idx);
                         if composite {
+                            // R39a LAYER 1 — THE SEGMENT CAPACITY LAW: the
+                            // group may never push past the 64-span law
+                            // (the SegAcc overflow's panic face, Shard 28:
+                            // `index out of bounds: the len is 0 but the
+                            // index is 0` — a full buffer at push8). The
+                            // pre-push flush is a LEGAL extra segment
+                            // boundary: the composition law is exact for
+                            // every k (the R25a split law), so the fold's
+                            // result is bit-identical — the guard converts
+                            // the latent overflow into an extra record and
+                            // a telemetry counter, never a wrong answer.
+                            if seg.len + 8 > 64 {
+                                if let Some((first, k, b)) =
+                                    seg.flush(res_slots, rhead, &mut nres)
+                                {
+                                    reslog.push_seg(first, k, b);
+                                }
+                                stats
+                                    .seg_guards
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             seg.push8(gid, &v8);
                         } else {
                             for k in 0usize..8 {
@@ -2723,6 +3386,19 @@ fn lane_worker_rxdesc_diet(
                 // at the flush points) — per-span mode emits the R23
                 // shape verbatim (the HFT_COMPOSITE_FOLD=0 rollback).
                 if composite {
+                    // R39a LAYER 1 (the scalar face): the same capacity
+                    // law as the group path — a full buffer flushes FIRST
+                    // (a legal extra segment split; the composition law
+                    // is exact for every k, so the fold's result is
+                    // bit-identical — see the group path's comment).
+                    if seg.len == 64 {
+                        if let Some((first, k, b)) =
+                            seg.flush(res_slots, rhead, &mut nres)
+                        {
+                            reslog.push_seg(first, k, b);
+                        }
+                        stats.seg_guards.fetch_add(1, Ordering::Relaxed);
+                    }
                     seg.push(gid, value);
                 } else {
                     res_slots[((rhead + nres) & RES_MASK) as usize] = Res {
@@ -3066,6 +3742,11 @@ impl HydraFabric {
         ok
     }
 
+    /// R40: the lane accessor (the dual producer's P1 drain surface).
+    pub fn lane(&self, i: usize) -> &HydraLane {
+        &self.lanes[i]
+    }
+
     /// R8 phase-2 diagnostics: one always-on telemetry line per run covering
     /// the fabric's life (worker utilization, CRC time, idle spins, pins).
     /// Read-only, post-run — never inside a measurement window's decision
@@ -3086,7 +3767,7 @@ impl HydraFabric {
             };
             let placement = &self.worker_cpus;
             eprintln!(
-                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1} res_replays={} res_recs={} res_fb={} res_live={}",
+                "DIAG worker[{i}] {label}: {pin} placement={placement:?} batches={} spans={} eval_ms={:.1} idle_iters={} res_waits={} fw={} fw_ms={:.1} sig_replays={} sig_replay_us={:.1} sig_bake_ms={:.1} res_replays={} res_recs={} res_fb={} res_live={} seg_guards={} cursor_resyncs={} record_snaps={}",
                 ws.batches.load(Ordering::Relaxed),
                 ws.spans.load(Ordering::Relaxed),
                 ws.eval_ns.load(Ordering::Relaxed) as f64 / 1e6,
@@ -3101,6 +3782,9 @@ impl HydraFabric {
                 ws.res_recs.load(Ordering::Relaxed),
                 ws.res_fb.load(Ordering::Relaxed),
                 ws.res_live.load(Ordering::Relaxed),
+                ws.seg_guards.load(Ordering::Relaxed),
+                ws.cursor_resyncs.load(Ordering::Relaxed),
+                ws.record_snaps.load(Ordering::Relaxed),
             );
         }
         // R35-B: the 𝒜₅.₀ fabric's engagement line (always printed —
@@ -3119,7 +3803,8 @@ impl HydraFabric {
                 .map(|w| w.sig_digest_ns.load(Ordering::Relaxed))
                 .sum();
             eprintln!(
-                "SIGFABRIC_DIAGNOSTIC {label}: baked=true msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} span_hash={:#x} span_records={} span_deg={} span_merge_ok={} (R35-B+R36: the A5.0 signature fabric + the Res-fold's span layer — the Phase-R bake, the per-pass wide replay with the fail-stop digest, and the O(1) SPANHASH application + the Galois merge law, docs/46-47)",
+                "SIGFABRIC_DIAGNOSTIC {label}: baked=true order_scan={} msgs={} locates={} chunks={} L={} digest={:#x} sig_replays={} sig_replay_us={:.1} span_hash={:#x} span_records={} span_deg={} span_merge_ok={} (R35-B+R36+R38: the A5.0 signature fabric + the Res-fold's span layer — the Phase-R bake (R38/L3: the Theorem-29 push scan or the OrderCache pull — HFT_ORDER_SCAN's arm), the per-pass wide replay with the fail-stop digest, and the O(1) SPANHASH application + the Galois merge law, docs/46-49)",
+                if sf.resolve_push { "push" } else { "pull" },
                 sf.n_msgs,
                 sf.n_locates,
                 sf.chunks,
@@ -3320,8 +4005,242 @@ fn assist_slots_from_env() -> usize {
         .clamp(4, 4096)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// R37 (Run 900) — THE FOLD JOURNAL (docs/solution2.md §2.7–§2.8:
+// the L1 journal + the tree-fold landing, Theorems 19–22)
+// ─────────────────────────────────────────────────────────────────────
+
+/// The tree journal's leaf capacity. The champion's steady pass
+/// pushes ~194 composite records (docs/48 §8: 113,186,154 records /
+/// 583,434 passes); 512 leaves × 12 B = 6 KB — L1-resident with the
+/// SoA columns side by side (Corollary 19.1's residency law). An
+/// overflow (a boundary-less burst run, an unsegmented fallback
+/// burst) flushes early — exact at ANY point by associativity
+/// (Theorem 19's remark (ii): a partially-evaluated prefix composed
+/// with a tree over the remaining records is just another tree
+/// shape); capacity is a performance dial, never a correctness
+/// constraint.
+/// The fold journal's leaf capacity. R37 sized it for the MONO steady
+/// law (one pass's live leaves ≈ ≤215 — the boundary flush retires
+/// each pass promptly). R40c: THE DUAL'S DEFERRAL BOUND — the lazy law
+/// lets completions defer on P1's lagging arrivals while P0's fold
+/// keeps journaling; the arrival lead over the retire is bounded by
+/// P1's push gate ((J1_CAP − J1_HEADROOM)/86 ≈ 21 passes), so the
+/// live journal can legitimately hold ~22 passes × ~110 lane-0
+/// leaves ≈ 2400 (the degenerate shapes wider still). A capacity
+/// flush under a deferred boundary composes leaves ACROSS pending
+/// boundaries into the running hash — every pending boundary's
+/// snapshot then reads the contaminated chain (the parity cell's
+// 6th catch: ten consecutive wrong composites). 8192 covers the
+/// bound at 3×+ margin; the flush stays the unreachable safety net
+/// it was designed to be (the `overflows` telemetry prices any fire).
+const FJ_CAP: usize = 8192;
+
+/// THE FOLD JOURNAL: the pass's fold records, journaled as
+/// `(k, B)` S-records on the ROTATION ring (the segment monoid
+/// `sink::tree_fold_segments` composes — Theorem 28's ring
+/// polymorphism, the rotl-13 twin of the SPANHASH records) instead
+/// of applied serially into `hash`. The serial chain
+/// `S_p = S_{p−1} ⨂ R_p` — 322 dependent applies, the 2.08 µs/pass
+/// cross-pass loop-carried barrier (the 61B wall, B1) — becomes a
+/// leaf array the boundary flush evaluates as a ⌈log₂ K⌉-depth
+/// up-sweep and applies in ONE `fold_compose_apply` hop. Records
+/// never straddle a pending pass boundary (the worker's split law +
+/// the R29/Lever-4 caps), so each leaf belongs to exactly one pass
+/// and `flush_upto(boundary)` partitions exactly at the leaf edges;
+/// `end[]` tracks the fold position after each leaf — strictly
+/// monotone, the partition key.
+///
+/// Soundness is Theorem 22 verbatim (the tree is a re-bracketing of
+/// the serial chain — every coordinate bit-exact), pinned by the
+/// whole hydra matrix running the tree path by default plus the
+/// dedicated journal cells (forced overflows, mid-journal boundary
+/// splits, the serial rollback differential).
+struct FoldJournal {
+    /// The leaf records' span counts (the rotation degrees).
+    k: Box<[u32]>,
+    /// The leaf records' segment constants.
+    b: Box<[u64]>,
+    /// fold_pos AFTER each leaf (the boundary partition key).
+    end: Box<[u64]>,
+    /// Live leaf count.
+    len: usize,
+    /// `false` = the R36 serial chain verbatim (the rollback arm's
+    /// attribution shape; `HFT_TREE_FOLD=0`).
+    tree: bool,
+    /// Telemetry: boundary + overflow flushes.
+    flushes: u64,
+    /// Telemetry: capacity-driven early flushes.
+    overflows: u64,
+    /// Telemetry: total records journaled.
+    records: u64,
+    /// Telemetry: max leaves in one flush (the compose_max dial).
+    compose_max: u64,
+}
+
+impl FoldJournal {
+    /// Construction-time allocation (sinks are built outside every
+    /// measurement window — the allocs=0 gate law). `cap` exists for
+    /// the unit cells (forced-overflow shapes); production uses
+    /// [`FJ_CAP`].
+    fn with_capacity(tree: bool, cap: usize) -> Self {
+        assert!(cap >= 1 && cap <= FJ_CAP, "journal cap out of range");
+        FoldJournal {
+            k: vec![0u32; cap].into_boxed_slice(),
+            b: vec![0u64; cap].into_boxed_slice(),
+            end: vec![0u64; cap].into_boxed_slice(),
+            len: 0,
+            tree,
+            flushes: 0,
+            overflows: 0,
+            records: 0,
+            compose_max: 0,
+        }
+    }
+
+    fn tree_fold_enabled() -> bool {
+        // The rollback: `HFT_TREE_FOLD=0` restores the R36 serial
+        // per-record apply verbatim (the attribution arm 11r37r —
+        // the same-draw delta prices the tree's contribution).
+        std::env::var("HFT_TREE_FOLD").as_deref() != Ok("0")
+    }
+
+    /// Journal one record (or apply it serially under the rollback).
+    /// `end` = the fold position AFTER this record — callers know it
+    /// (the composite drain's record end; the per-span sites' +1).
+    #[inline(always)]
+    fn push(&mut self, hash: &mut u64, k: u32, b: u64, end: u64) {
+        if !self.tree {
+            // The R36 champion's law, verbatim (Theorem 22's oracle).
+            *hash = crate::sink::fold_compose_apply(*hash, k, b);
+            self.records += 1;
+            return;
+        }
+        if self.len == self.k.len() {
+            // Capacity flush: every journaled leaf has end ≤ fold_pos
+            // < every PENDING boundary (the boundary is stamped at
+            // end_pass at the submission frontier ≥ fold_pos), so
+            // flushing all is exact — the associativity license.
+            self.overflows += 1;
+            self.apply_prefix(hash, self.len);
+            self.len = 0;
+        }
+        self.k[self.len] = k;
+        self.b[self.len] = b;
+        self.end[self.len] = end;
+        self.len += 1;
+        self.records += 1;
+    }
+
+    /// Flush the prefix of leaves with `end ≤ boundary` — the
+    /// completed pass's records — into `hash` (the tree + one apply),
+    /// shifting any remainder (next-pass leaves already drained past
+    /// this boundary; structurally empty in the steady law, exact
+    /// regardless — Theorem 19's heterogeneous shapes).
+    fn flush_upto(&mut self, hash: &mut u64, boundary: u64) {
+        if self.len == 0 || !self.tree {
+            return;
+        }
+        let p = self.end[..self.len].partition_point(|&e| e <= boundary);
+        if p == 0 {
+            return;
+        }
+        self.apply_prefix(hash, p);
+        let rem = self.len - p;
+        if rem > 0 {
+            self.k.copy_within(p..self.len, 0);
+            self.b.copy_within(p..self.len, 0);
+            self.end.copy_within(p..self.len, 0);
+        }
+        self.len = rem;
+    }
+
+    /// R40: the partition length — the number of leading leaves with
+    /// `end ≤ boundary` (the merge's journal_0 operand; the caller
+    /// composes the MERGED staging itself, so the retire below is
+    /// compose-free).
+    fn partition_len(&self, boundary: u64) -> usize {
+        self.end[..self.len].partition_point(|&e| e <= boundary)
+    }
+
+    /// R40: the compose-free retire — `flush_upto`'s shift without the
+    /// tree apply (the dual boundary composes the MERGED staging —
+    /// journal_0's leaves joined with P1's j1 leaves by position — so
+    /// this journal's own prefix is retired WITHOUT composing it).
+    /// R40c-IV: the dual completion's flush accounting — the merge
+    /// composes through the tree law exactly as flush_upto does; the
+    /// engagement assert's counter must see it (see dual_complete_one).
+    fn note_flush(&mut self) {
+        self.flushes += 1;
+    }
+
+    fn retire_upto(&mut self, boundary: u64) {
+        if self.len == 0 {
+            return;
+        }
+        let p = self.end[..self.len].partition_point(|&e| e <= boundary);
+        if p == 0 {
+            return;
+        }
+        let rem = self.len - p;
+        if rem > 0 {
+            self.k.copy_within(p..self.len, 0);
+            self.b.copy_within(p..self.len, 0);
+            self.end.copy_within(p..self.len, 0);
+        }
+        self.len = rem;
+    }
+
+    /// Flush everything (the finish path: the burst shape's direct
+    /// `hash` field reads require the chain current with no
+    /// boundaries pending; the pass shape's tail past the last
+    /// boundary).
+    fn flush_all(&mut self, hash: &mut u64) {
+        if self.len == 0 || !self.tree {
+            return;
+        }
+        self.apply_prefix(hash, self.len);
+        self.len = 0;
+    }
+
+    /// THE TREE FLUSH: the up-sweep over the first `p` leaves (in
+    /// place, ⌈log₂ p⌉ levels) + the single composite application.
+    /// `rotl(h, 13K) ^ V` — one `fold_compose_apply`, exactly the
+    /// serial chain's iterated result (Theorem 22).
+    fn apply_prefix(&mut self, hash: &mut u64, p: usize) {
+        let (kk, bb) = crate::sink::tree_fold_segments(
+            &mut self.k[..p],
+            &mut self.b[..p],
+        );
+        *hash = crate::sink::fold_compose_apply(*hash, kk, bb);
+        self.flushes += 1;
+        self.compose_max = self.compose_max.max(p as u64);
+    }
+
+    /// The reset path: drop any residue (all boundaries completed ⇒
+    /// structurally empty; defensive regardless).
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The telemetry contract (the FOLDTREE_DIAGNOSTIC line):
+    /// `(tree, flushes, overflows, records, compose_max, live_len)`.
+    fn stats(&self) -> (bool, u64, u64, u64, u64, u64) {
+        (
+            self.tree,
+            self.flushes,
+            self.overflows,
+            self.records,
+            self.compose_max,
+            self.len as u64,
+        )
+    }
+}
+
 pub struct HydraSpanSink<'a> {
     fabric: Option<&'a HydraFabric>,
+    // ── R37: the fold journal (the tree's leaf array — see FoldJournal) ──
+    journal: FoldJournal,
     // ── observable state: field-for-field identical to SpanConformanceSink ──
     pub hash: u64,
     pub count: u64,
@@ -3354,6 +4273,10 @@ pub struct HydraSpanSink<'a> {
     /// ~40-80c/span of pure main-thread fat. Incremental advance + wrap
     /// replaces the division with an add and a compare.
     n_lanes: usize,
+    /// R39: the fold grid's exact lane modulus (the drain loop top's
+    /// derived-grid re-derivation `% n_lanes` — the runtime DIV becomes
+    /// the AND/magic path; see LaneMod).
+    lane_mod: LaneMod,
     /// Lane of the chunk containing `next_span` (submit side).
     submit_lane: usize,
     /// Spans remaining in the submit-side chunk.
@@ -3406,10 +4329,40 @@ pub struct HydraSpanSink<'a> {
     harvest_pos: usize,
     /// A pass is open (begin_pass called, end_pass pending).
     pass_open: bool,
+    // ── R38/L2: THE MULTI-BOUNDARY COLLECTOR (Theorem 25's merger) ──
+    /// Completed passes so far (the epoch sequence — the workers'
+    /// published composite tags must land on it, one epoch ahead or
+    /// behind the fold's frontier by Theorem 26(b)'s staleness bound).
+    sheaf_completed: u64,
+    /// The CURRENT pass's lane-drained span count (the composite
+    /// records' k sum — the fold's independent account of what the
+    /// lanes emitted; the inline path's spans are excluded by the
+    /// law: the composites track the LANE emissions only).
+    sheaf_lane_k: u64,
+    /// The PREVIOUS completed pass's lane-drained span count (the
+    /// one-behind check's operand).
+    sheaf_prev_lane_k: u64,
+    /// Telemetry: boundaries whose lane composites were verified
+    /// (the degree law) / skipped (the slots stale or torn across
+    /// epochs — the jump episodes).
+    sheaf_checked: u64,
+    sheaf_missed: u64,
     // ── R16b: the rxdesc submission state ──
     /// The fabric's rxdesc state (None = the legacy ring path — the
     /// per-run constant from the fabric).
     rx: Option<Arc<RxdescState>>,
+    /// R39: THE CACHED BORROW — the same state as a `&'a` reference (the
+    /// fabric's own Arc, dereferenced once at construction). The hot
+    /// submit paths (`submit_span_rx` / `submit_span_batch_rx` /
+    /// `submit_packed_batch_rx`) previously paid an `Arc::clone` + drop
+    /// PER CALL — two locked RMWs on the shared refcount line, ~25-40
+    /// cycles each on the elision champion's every-batch cadence — for a
+    /// pointer the sink already owns. The borrow's lifetime is the
+    /// FABRIC's (`'a`), not any `&self`/`&mut self` method borrow, so it
+    /// coexists freely with the mutable self calls the commit paths
+    /// make (a copy of a shared reference; no aliasing — all the state's
+    /// methods are `&self` with interior/atomic mutability).
+    rx_ref: Option<&'a RxdescState>,
     /// This sink's generation (workers re-anchor spans to 0 on change).
     rx_gen: u64,
     /// A submission window is open (its pass record is published).
@@ -3550,6 +4503,41 @@ pub struct HydraSpanSink<'a> {
     /// R31-A: the copy-skip engagement telemetry (windows opened without
     /// the warm copy; read post-run by the verdict lines).
     rx_warm_skips: u64,
+    // ── R40: THE DUAL-PRODUCER SPLIT (crate::dual; docs/52) ──
+    /// The rendezvous (set at the arm; None = the mono loop verbatim).
+    dual: Option<std::sync::Arc<crate::dual::DualGate>>,
+    /// The dual split is ACTIVE (false from the poison on — the
+    /// permanent mono fallback; the gate stays for the telemetry).
+    dual_armed: bool,
+    /// The per-batch dispatch suppress bit: the CURRENT batch's packed
+    /// calls re-issue with the count/last-seq/G-INV suppressed (P1
+    /// owns them — the odd batches' totals come from the script). The
+    /// SS cursor arithmetic still runs (P0's next_span tracks the
+    /// GLOBAL frontier — the window machine and the boundary stamps
+    /// depend on it).
+    p1_suppress: bool,
+    /// R40: the boundary merge's staging — the position-ordered leaf
+    /// arrays (journal_0's partition + j1's partition, two-finger
+    /// merged). Pre-allocated at construction (the allocs=0 law);
+    /// P0-only mutable.
+    dual_staging_k: Box<[u32; crate::dual::J1_CAP]>,
+    dual_staging_b: Box<[u64; crate::dual::J1_CAP]>,
+    dual_staging_e: Box<[u64; crate::dual::J1_CAP]>,
+    /// R40 telemetry: dual passes, boundary merges, deferred
+    /// completions, the poison's lifetime engagement.
+    dual_passes: u64,
+    dual_merges: u64,
+    dual_poisoned: bool,
+    /// R40: the sink's begin_pass sequence (1-based; stamped into the
+    /// pass records — the arrival-pass key).
+    pass_counter: u64,
+    // ── R40: THE ZOMBIE (the post-poison lane-split — P0 runs BOTH
+    // lane drains; the mono interleave can NEVER resume because lane
+    // 1's records below P1's cursor live in j1, not the ring) ──
+    z1_fold_pos: u64,
+    z1_fold_rem: u64,
+    z1_res_tail: u64,
+    z1_j1_len: u64,
 }
 
 impl<'a> HydraSpanSink<'a> {
@@ -3584,10 +4572,17 @@ impl<'a> HydraSpanSink<'a> {
         // (construction time — outside every window; a fresh generation
         // re-anchors the workers' span grid to 0).
         let rx = fabric.and_then(|f| f.rxdesc.clone());
+        // R39: the cached borrow — the fabric's own Arc, dereferenced
+        // once (the lifetime rides 'a; the hot paths stop cloning).
+        let rx_ref: Option<&'a RxdescState> = fabric.and_then(|f| f.rxdesc.as_deref());
         let rx_gen = rx.as_ref().map_or(0, |st| st.next_gen());
         let rx_affine = rx.as_ref().is_some_and(|st| st.affine_armed());
         let sink = Self {
             fabric,
+            // R37: the tree journal — allocation at construction (outside
+            // every window); the serial rollback rides the same struct
+            // (`HFT_TREE_FOLD=0`).
+            journal: FoldJournal::with_capacity(FoldJournal::tree_fold_enabled(), FJ_CAP),
             hash: Self::SPAN_SEED,
             count: 0,
             last_gen: 0,
@@ -3606,6 +4601,7 @@ impl<'a> HydraSpanSink<'a> {
             pending_lane: 0,
             pending_head: 0,
             n_lanes: fabric.map(|f| f.lanes.len()).unwrap_or(0),
+            lane_mod: LaneMod::new(fabric.map(|f| f.lanes.len()).unwrap_or(0) as u64),
             // Chunk 0 → lane 0; advance on chunk completion (after-use).
             submit_lane: 0,
             submit_rem: CHUNK,
@@ -3631,12 +4627,19 @@ impl<'a> HydraSpanSink<'a> {
                 msg_hash: 0,
                 hash: 0,
                 done: false,
+                pass_id: 0,
             }; PASS_RING],
             pass_head: 0,
             pass_tail: 0,
             harvest_pos: 0,
             pass_open: false,
+            sheaf_completed: 0,
+            sheaf_lane_k: 0,
+            sheaf_prev_lane_k: 0,
+            sheaf_checked: 0,
+            sheaf_missed: 0,
             rx,
+            rx_ref,
             rx_gen,
             rx_win_open: false,
             rx_win_slot: 0,
@@ -3666,6 +4669,20 @@ impl<'a> HydraSpanSink<'a> {
             rx_slot_count: [u64::MAX; RX_NARR],
             rx_warm_epoch: std::env::var("HFT_WARM_EPOCH").as_deref() != Ok("0"),
             rx_warm_skips: 0,
+            dual: None,
+            dual_armed: false,
+            p1_suppress: false,
+            dual_staging_k: Box::new([0u32; crate::dual::J1_CAP]),
+            dual_staging_b: Box::new([0u64; crate::dual::J1_CAP]),
+            dual_staging_e: Box::new([0u64; crate::dual::J1_CAP]),
+            dual_passes: 0,
+            dual_merges: 0,
+            dual_poisoned: false,
+            pass_counter: 0,
+            z1_fold_pos: 0,
+            z1_fold_rem: CHUNK,
+            z1_res_tail: 0,
+            z1_j1_len: 0,
         };
         // R21 (Task 2, the fused arm's flip-validation instrument): prove
         // the fused shape armed — printed ONCE per process at the first
@@ -3692,6 +4709,235 @@ impl<'a> HydraSpanSink<'a> {
     //  form serves CI diagnostics; this form serves in-process tests).
     pub fn force_inline_mode(&mut self) {
         self.force_inline = true;
+    }
+
+    /// R37b: the assist-watermark override — the in-process form of
+    /// `HFT_ASSIST_WATERMARK` (the env is process-global and races the
+    /// parallel tests' fabrics; the spawn-override law, applied to the
+    /// sink-side dial). The claim-stress cells drive it LOW (the claims
+    /// fire on the submission's transient lead) to exercise the replay
+    /// fallback's grid re-derivation under real interleaving — the
+    /// two-lane shape the R36-E single-lane scope gate never ran.
+    pub fn set_assist_watermark(&mut self, wm: u64) {
+        self.rx_assist_wm = wm;
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // R40: THE DUAL-PRODUCER SPLIT (crate::dual; docs/52)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// R40: the arm's readiness (the real law — call at a pass TOP,
+    /// after the previous window closed): the SS window count proved
+    /// the regime (`rx_ss_wins` advanced for `min_ss` consecutive
+    /// passes), the steady epoch is toroidal, and the lanes are two.
+    pub fn dual_arm_ready_ss(&self, min_ss: u64) -> bool {
+        // R40c: THE CLAIM-FREE EDGE — the arm closes the assist valve
+        // (the inline path has no lane-split twin: the sealed entries
+        // feed the MONO fold's consumption loop, and the lane-0 drain
+        // has no inline reader), so an outstanding claim at the arm
+        // ORPHANS: the odd batches' suppressed dispatch never evaluates
+        // the claimed chunk's remaining spans, the inline entry never
+        // seals, and the lane-0 drain parks on the stale mark FOREVER
+        // (the parity cell's 5th catch — the fold frozen mid-run, the
+        // deferred merges composing empty journal_0 partitions). The
+        // gate requires the fold AT the submission frontier (every
+        // inline entry consumed — no marks left in the fold's path;
+        // the pass-grid anchor also becomes exact: pbase == fold_pos,
+        // the lazy-tail drift structurally unreachable) and no mark at
+        // the cursor chunk (the zero-spans-claimed edge — a claim taken
+        // at a chunk start with the batch boundary exactly there holds
+        // fold_pos == next_span while the entry is empty). Post-arm
+        // the claim sites are dead (the assist watermark is 0; the
+        // straddle re-claim needs a marked boundary chunk, impossible
+        // with the frontier clear) — the armed regime is structurally
+        // claim-free.
+        let claim_free = self.rx.as_ref().is_none_or(|st| {
+            !st.is_inline(self.next_span / CHUNK) && self.fold_pos == self.next_span
+        });
+        self.fabric.map(|f| f.lanes.len()) == Some(2)
+            && self.journal.tree
+            && self.rx_steady_epoch >= 2
+            && self.rx_ss_wins >= min_ss
+            && self.rx_selfserve
+            && self.batch_submit
+            && self.packed_emission
+            && !self.force_inline
+            && claim_free
+    }
+
+    /// R40: THE ARM — hand the sink the rendezvous and split the fold
+    /// cursors. The mono `fold_pos` (global) projects onto each lane's
+    /// sub-stream (`lane_end_at` — the per-lane resume points: every
+    /// lane-ℓ record the mono already consumed sits at or below lane ℓ's
+    /// projection); P0 keeps lane 0, P1 starts at lane 1's projection
+    /// (published through the gate by the caller's `arm()`). The arm is
+    /// sound at ANY fold position — a deferred boundary's tail leaves
+    /// both lanes' pending records in the mono journal, and the merge
+    /// is provenance-agnostic (position-keyed). Boundaries for passes
+    /// BEFORE the armed pass complete on the pure mono path (the
+    /// completion's pass check). The assist valve closes (the inline
+    /// path has no dual twin; the pace-spin's merged-pending drain
+    /// remains the backpressure).
+    pub fn dual_arm(&mut self, gate: std::sync::Arc<crate::dual::DualGate>) {
+        assert!(self.fabric.is_some(), "R40 arm without a fabric");
+        assert!(self.journal.tree, "R40 arm requires the tree journal (HFT_TREE_FOLD=0 composes in call order — the merged two-lane flush is the only sound law)");
+        assert!(!self.pass_open, "R40 arm mid-pass (call at the pass top)");
+        let mut f0 = crate::dual::lane_end_at(self.fold_pos, 0);
+        // THE PRE-SKIP: the projection may land on a SIBLING chunk's
+        // start (the gap between this lane's chunks — the mono cursor
+        // sat inside the sibling's territory); this lane's next record
+        // sits one chunk further. Without the pre-skip the cursor
+        // starts mid-gap and the first drain's order assert fires
+        // (the t_r40_parity cell's catch).
+        if (f0 / CHUNK) % 2 == 1 {
+            f0 += CHUNK;
+        }
+        debug_assert!(f0 <= self.fold_pos + CHUNK);
+        self.fold_pos = f0;
+        self.fold_rem = CHUNK - (f0 % CHUNK);
+        self.fold_lane = 0;
+        self.dual = Some(gate);
+        self.dual_armed = true;
+        self.p1_suppress = false;
+        self.rx_assist_wm = 0;
+    }
+
+    /// R40: P1's lane-1 cursor at the arm (the gate's init operand) —
+    /// the projection with the PRE-SKIP (a landing on a sibling
+    /// chunk's start advances one chunk — the next lane-1 record's
+    /// exact position; the parity cell's law).
+    pub fn dual_fold_pos_1_init(&self) -> u64 {
+        let mut f1 = crate::dual::lane_end_at(self.fold_pos, 1);
+        if (f1 / CHUNK) % 2 == 0 {
+            f1 += CHUNK;
+        }
+        f1
+    }
+
+    /// R40: lane 1's res-ring consumer cursor at the arm (P1's init).
+    pub fn dual_res_tail_1_init(&self, fabric: &HydraFabric) -> u64 {
+        fabric.lane(1).r40_res_tail_load()
+    }
+
+    /// R40: THE PASS-GRID ANCHOR — the true pass boundary at the arm
+    /// (`next_span` at the pass top == the last pass's `end_span`).
+    /// Call BEFORE `begin_pass` (the arm's own law).
+    pub fn dual_pass_base_at_arm(&self) -> u64 {
+        self.next_span
+    }
+
+    /// R40c: THE SUBMISSION FRONTIER — P0's `next_span` at the clean
+    /// shutdown (the last pass's `end_span`, exact). The harness passes
+    /// it to `gate.initiate_shutdown` — P1's exit sweep drains its
+    /// remaining lane-1 territory to this frontier before posting its
+    /// terminal state (the finish's `dual_lanes_past` wait terminates
+    /// on it).
+    pub fn submission_frontier(&self) -> u64 {
+        self.next_span
+    }
+
+    /// R40: the per-batch dispatch suppress bit (the harness toggles it
+    /// around each `try_replay`: the odd batches' packed calls advance
+    /// the SS cursor but leave the count/last-seq/G-INV to P1).
+    #[inline]
+    pub fn set_p1_suppress(&mut self, on: bool) {
+        self.p1_suppress = on;
+    }
+
+    /// R40: the arm's first pass id (the sink's own begin_pass sequence
+    /// — the gate's arm word and P1's arrival keys use the same ids).
+    pub fn dual_first_pass(&self) -> u64 {
+        self.pass_counter + 1
+    }
+
+    /// R40: whether the split is ACTIVE (the harness's mirror — it
+    /// lags the sink's own disarm on the begin_pass non-SS poison, so
+    /// the poison sites consult THIS, not the local flag).
+    #[inline]
+    pub fn dual_is_armed(&self) -> bool {
+        self.dual_armed
+    }
+
+    /// R40: the CURRENT pass's id (the poison publication's key).
+    #[inline]
+    pub fn dual_current_pass(&self) -> u64 {
+        self.pass_counter
+    }
+
+    /// R40: THE POISON — the permanent fallback. THE MONO INTERLEAVE
+    /// CAN NEVER RESUME: lane 1's records below P1's cursor live in j1
+    /// (consumed off the ring), so the verbatim mono drain's
+    /// order-assert would fail at the first interleave. The fallback
+    /// is therefore the ZOMBIE LANE-SPLIT: P0 keeps its lane-0 drain
+    /// AND adopts lane 1's drain (the same code, pushing into j1 —
+    /// the ownership transferred by P1's terminal publication). The
+    /// submit path returns to full mono (the suppress bit off); the
+    /// assist valve stays CLOSED (the zombie has no inline twin).
+    pub fn dual_disarm_poison(&mut self) {
+        let Some(gate) = self.dual.clone() else {
+            return;
+        };
+        // The bounded terminal wait (the ownership transfer's law —
+        // P1's exit is its next owned-batch check or its pass-end
+        // drain's natural completion; both µs-scale, both feed-forward).
+        let mut sb = 0u32;
+        while !gate.p1_done() {
+            crate::affinity::polite_spin(&mut sb);
+        }
+        // Capture the zombie's lane-1 state (stable post-done).
+        self.z1_fold_pos = gate.p1_fold();
+        self.z1_fold_rem = CHUNK - (self.z1_fold_pos % CHUNK);
+        self.z1_res_tail = self
+            .fabric
+            .map(|f| f.lane(1).r40_res_tail_load())
+            .unwrap_or(0);
+        self.z1_j1_len = gate.j1.snapshot();
+        // fold_pos STAYS the lane-0 cursor (the zombie's own). The
+        // assist valve stays CLOSED (the zombie has no inline twin).
+        self.dual_armed = false;
+        self.p1_suppress = false;
+        self.dual_poisoned = true;
+    }
+
+    /// R40 telemetry: the dual engagement contract (the verdict line's
+    /// source).
+    pub fn dual_stats(&self) -> (bool, bool, u64, u64) {
+        (self.dual.is_some(), self.dual_armed, self.dual_passes, self.dual_merges)
+    }
+
+    /// R40: the merged fold position (the pace gate's operand) — the
+    /// largest global position both lanes' cursors have passed. Under
+    /// the dual split the sink's own `fold_pos` is LANE-0's cursor; a
+    /// lagging lane 1 must still gate the submission pace (a raw
+    /// lane-0 read would let P0 outrun the res rings).
+    pub fn dual_merged_fold(&self) -> u64 {
+        if let Some(gate) = &self.dual {
+            if self.dual_armed {
+                return self.fold_pos.min(gate.p1_fold());
+            }
+            if self.dual_poisoned {
+                return self.fold_pos.min(self.z1_fold_pos);
+            }
+        }
+        self.fold_pos
+    }
+
+    /// R40: whether BOTH lanes' cursors crossed the global position
+    /// `pos` (each through its own territory projection — the window
+    /// watermark's operand under the split and the zombie).
+    fn dual_lanes_past(&self, pos: u64) -> bool {
+        if self.dual.is_none() {
+            return self.fold_pos >= pos;
+        }
+        if self.fold_pos < crate::dual::lane_end_at(pos, 0) {
+            return false;
+        }
+        let l1 = if self.dual_armed {
+            self.dual.as_ref().map(|g| g.p1_fold()).unwrap_or(0)
+        } else {
+            self.z1_fold_pos
+        };
+        l1 >= crate::dual::lane_end_at(pos, 1)
     }
 
     /// Sequential-equivalent mode: no fabric, no threads — evaluates and
@@ -3724,6 +4970,10 @@ impl<'a> HydraSpanSink<'a> {
         // grid-aligned chunk-open writes an ANCHOR desc (first span 0),
         // re-anchoring every worker's derivation absolutely.
         self.hash = Self::SPAN_SEED;
+        // R37: the chain's journal resets with it (all boundaries
+        // completed by the drain assert above — structurally empty;
+        // defensive regardless).
+        self.journal.clear();
         self.count = 0;
         self.last_gen = 0;
         self.gap_open_gen = None;
@@ -3792,6 +5042,71 @@ impl<'a> HydraSpanSink<'a> {
         // a pass-start window (its record carries the flag; the
         // composite-fold workers split their segment at this span).
         self.pass_start_span = self.next_span;
+        // R40c: THE COMPLETION-PACE GATE — under the dual the boundary
+        // completions depend on P1's arrivals (ANOTHER thread's pace),
+        // and the fleet's first 11r40 draw proved P0's pass driving can
+        // outrun them: 64 pending passes and the ring's capacity assert
+        // fires (~100ms into the sustained window, every target-silicon
+        // shard). The mono never had this — its completions self-pace on
+        // its OWN fold. THE LAW: P0's pass-driving lead over the
+        // COMPLETION frontier is bounded (PASS_RING − the margin); at
+        // the bound, P0 parks (folding + completing — the arrivals land
+        // as P1 drains) until the harvest frees slots. THE DIAGNOSTICS:
+        // a stall line at 250ms (a healthy park is microseconds — the
+        // line fires only when P1 is genuinely stuck, and it carries the
+        // full rendezvous state), and a bounded patience of 10s (way
+        // beyond any legitimate transient) that fails LOUD with the same
+        // dump — the shard dies in minutes with the data, never a
+        // 35-minute timeout.
+        if self.dual.is_some() {
+            let mut sb = 0u32;
+            let park_start = std::time::Instant::now();
+            let mut logged = false;
+            while (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING >= PASS_RING - 8 {
+                self.fold_available();
+                crate::affinity::polite_spin(&mut sb);
+                let el = park_start.elapsed();
+                if !logged && el >= std::time::Duration::from_millis(250) {
+                    logged = true;
+                    if let Some(g) = &self.dual {
+                        let (l1_head, l1_tail) = self
+                            .fabric
+                            .map(|f| (f.lane(1).r40_res_head(), f.lane(1).r40_res_tail_load()))
+                            .unwrap_or((0, 0));
+                        eprintln!(
+                            "R40_PACE_STALL pending_passes={} armed_from={} p1_fold={} p1_done={} arrivals={} j1_len_snapshot={} j1_consumed={} next_span={} fold_pos={} lane1_res_head={} lane1_res_tail={} (R40c: the completion-pace gate bound — P0 waiting on the rendezvous; a healthy park is microseconds, this line means P1 is stuck or starved)",
+                            (self.pass_head + PASS_RING - self.pass_tail) % PASS_RING,
+                            g.armed_from(),
+                            g.p1_fold(),
+                            g.p1_done(),
+                            g.arrival_count(),
+                            g.j1.snapshot(),
+                            g.j1.consumed(),
+                            self.next_span,
+                            self.fold_pos,
+                            l1_head,
+                            l1_tail
+                        );
+                    }
+                }
+                if el >= std::time::Duration::from_secs(10) {
+                    if let Some(g) = &self.dual {
+                        eprintln!(
+                            "R40_PACE_TIMEOUT armed_from={} p1_fold={} p1_done={} arrivals={} j1={} consumed={} (the rendezvous is dead — failing loud)",
+                            g.armed_from(),
+                            g.p1_fold(),
+                            g.p1_done(),
+                            g.arrival_count(),
+                            g.j1.snapshot(),
+                            g.j1.consumed()
+                        );
+                    }
+                    panic!(
+                        "R40c: the completion-pace gate exhausted its patience — the dual rendezvous is dead (see R40_PACE_TIMEOUT above)"
+                    );
+                }
+            }
+        }
         // Ring capacity: one slot must remain free for this record.
         assert_ne!(
             (self.pass_head + 1) % PASS_RING,
@@ -3826,7 +5141,9 @@ impl<'a> HydraSpanSink<'a> {
             msg_hash: 0,
             hash: 0,
             done: false,
+            pass_id: self.pass_counter + 1,
         };
+        self.pass_counter += 1;
         self.pass_head = (self.pass_head + 1) % PASS_RING;
         self.pass_open = true;
         // R16b: open the rxdesc submission window EAGERLY — the window's
@@ -3835,6 +5152,20 @@ impl<'a> HydraSpanSink<'a> {
         // — no begin_pass — opens lazily at the first submit.)
         if self.rx.is_some() && !self.rx_win_open {
             self.rx_open_window();
+        }
+        // R40: THE NON-SS POISON — the dual split's submit path is the
+        // SS window's cursor arithmetic; a classic window's ring writes
+        // have no P1 twin (the workers would starve on lane 1). A
+        // non-SS open while armed poisons the engine BEFORE the pass's
+        // first submit: the pass runs fully mono (the permanent
+        // fallback's law — the steady SS regime makes this a cold-start
+        // flake's rare event, never the fleet's steady state).
+        if self.dual_armed && !self.rx_win_ss && self.rx.is_some() {
+            if let Some(gate) = &self.dual {
+                let pid = self.pass_counter;
+                gate.set_poison(pid, 0);
+            }
+            self.dual_disarm_poison();
         }
     }
 
@@ -3912,17 +5243,169 @@ impl<'a> HydraSpanSink<'a> {
         self.complete_boundaries();
     }
 
+    /// R39: the oldest pending pass's completion frontier — the composite
+    /// drain's boundary-hoist operand. `u64::MAX` when no completion can
+    /// fire at the current position (no pending pass, the head record is
+    /// already done, or the end is unstamped) — the hoisted compare then
+    /// never fires and the full `complete_boundaries()` runs at the
+    /// loop-top / break / park sites exactly as before (the pop-and-
+    /// advance shapes it owns stay there).
+    #[inline]
+    fn pending_boundary_end(&self) -> u64 {
+        if self.pass_tail != self.pass_head {
+            let rec = &self.passes[self.pass_tail];
+            if !rec.done && rec.end_span != u64::MAX {
+                return rec.end_span;
+            }
+        }
+        u64::MAX
+    }
+
     /// Snapshot + reset at every pass boundary the fold has crossed.
     /// The chain value at the crossing IS the completed pass's hash (the
     /// fold applies values in strict global span order, and the boundary
     /// sits exactly at the pass's final span + 1).
+    ///
+    /// R37: the snapshot reads the chain THROUGH the journal — the
+    /// flush composes the pass's journaled leaves (up to exactly this
+    /// boundary; records never straddle) by the ⌈log₂ K⌉ up-sweep and
+    /// applies the composite in ONE `fold_compose_apply` hop before
+    /// the snapshot. The serial chain's 322-dependent-apply barrier
+    /// (the 2.08 µs/pass cross-pass dependency — the 61B wall) becomes
+    /// a ~194-leaf tree ≈ 8 levels + one hop; the next pass's leaves
+    /// (already drained past this boundary, if any) stay journaled —
+    /// their composite is h-independent (the V-coordinate never sees
+    /// the entry hash), so the SPAN_SEED reseed below re-bases them
+    /// exactly.
     fn complete_boundaries(&mut self) {
         while self.pass_tail != self.pass_head {
             let rec = &self.passes[self.pass_tail];
             if rec.done || rec.end_span == u64::MAX {
                 break;
             }
-            if rec.end_span <= self.fold_pos {
+            let end_span = rec.end_span;
+            let pass_id = rec.pass_id;
+            // ── R40: THE DUAL-BOUNDARY DISPATCH ──────────────────────
+            // Three families share this loop: the ACTIVE split (the
+            // lane cursors + P1's arrival), the POST-POISON drain (the
+            // recomposed global cursor + the merge of j1's residue),
+            // and the MONO path (verbatim). The merge is
+            // provenance-agnostic (position-keyed), so pre-arm
+            // deferred records complete through the SAME merge with a
+            // zero count contribution (P1 dispatched nothing for
+            // them — its pre-arm lane-1 tail rides j1 to the boundary).
+            if let Some(gate) = self.dual.clone() {
+                let armed = gate.armed_pass();
+                if armed > 0 {
+                    let poison = gate.poison_at();
+                    if self.dual_armed {
+                        // THE ACTIVE SPLIT: lane 0's cursor crossed …
+                        if self.fold_pos < crate::dual::lane_end_at(end_span, 0) {
+                            break;
+                        }
+                        if pass_id >= armed {
+                            // … and P1's arrival for THIS pass (the lazy
+                            // law: a lagging P1 defers the completion;
+                            // P0 never blocks — the tail folds during
+                            // the next pass exactly as the mono's does).
+                            // R40d: the FULL arrival — the count AND the
+                            // pre-staged j1 run window (P1's boundary
+                            // step; the compacted run-drain's operands).
+                            match gate.arrival_full(pass_id) {
+                                Some((c1, run_start, run_len)) => self.dual_complete_one(
+                                    &gate,
+                                    end_span,
+                                    Some(c1),
+                                    0,
+                                    false,
+                                    Some((run_start, run_len)),
+                                ),
+                                None => {
+                                    gate.arrival_defers.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                        } else {
+                            // A pre-arm deferred record: P1's CURSOR
+                            // crossing (not the arrival — P1 never
+                            // arrives for a pre-arm pass; its drain
+                            // naturally sweeps the pre-arm tail).
+                            if gate.p1_fold() < crate::dual::lane_end_at(end_span, 1) {
+                                break;
+                            }
+                            self.dual_complete_one(&gate, end_span, None, 0, false, None);
+                        }
+                        continue;
+                    } else {
+                        // POST-POISON (THE ZOMBIE): the lane-split drain
+                        // continues (P0 runs BOTH lanes — the mono
+                        // interleave can never resume); the completion's
+                        // condition is the two lane cursors. The count:
+                        // the POISON pass carries P1's contribution
+                        // (the arrival if it completed the pass, else the
+                        // final partial publication) minus the overlap —
+                        // the formula `count_1 −
+                        // odd_totals_before(poison_batch)` (saturating)
+                        // is exact for ANY P1 progress; later passes
+                        // carry zero (P1 contributed nothing).
+                        if self.fold_pos < crate::dual::lane_end_at(end_span, 0)
+                            || self.z1_fold_pos < crate::dual::lane_end_at(end_span, 1)
+                        {
+                            break;
+                        }
+                        let (c1, ov) = match poison {
+                            Some((pp, pb)) => {
+                                if pp == pass_id {
+                                    // R40c: THE SCRIPT-DIRECT COUNT — the
+                                    // poison pass's P1 contribution is
+                                    // exactly the suppressed odd batches
+                                    // [0, pb): P0's live re-drive counts
+                                    // [pb, ∞) wholly (its own rec.count),
+                                    // and the pre-pb odd batches carried
+                                    // the suppress bit (P0's count EXCLUDES
+                                    // them) — the SCRIPT's recorded totals
+                                    // are their exact sum (the frozen
+                                    // schedule), INDEPENDENT of P1's racing
+                                    // progress. The old formula
+                                    // (`count_1 − odd_totals_before(pb)`)
+                                    // INVERTED the overlap: it discarded
+                                    // P1's pre-poison dispatch (the
+                                    // undercount) and added the post-poison
+                                    // race window (the double count) — the
+                                    // poison cell's catch.
+                                    let add = gate.script().odd_totals_before(pb as usize);
+                                    (Some(add), 0)
+                                } else if pass_id >= armed && pass_id < pp {
+                                    // R40c: THE ARMED PRE-POISON WINDOW —
+                                    // the suppression was active for these
+                                    // passes (P0's count excludes EVERY odd
+                                    // batch of the pass); the script's FULL
+                                    // odd total is the exact contribution,
+                                    // arrived or not (a deferred completion
+                                    // meeting the zombie: P1's arrival
+                                    // carries the same sum — the script is
+                                    // the ground truth for the suppressed
+                                    // surface, whatever P1's dispatch
+                                    // progress when the poison froze it).
+                                    let s = gate.script();
+                                    let add = s.odd_totals_before(s.n);
+                                    (Some(add), 0)
+                                } else {
+                                    // Pre-arm passes and post-poison passes:
+                                    // P0 counted everything (no suppression).
+                                    (None, 0)
+                                }
+                            }
+                            None => (None, 0),
+                        };
+                        self.dual_complete_one(&gate, end_span, c1, ov, true, None);
+                        continue;
+                    }
+                }
+            }
+            // ── THE MONO PATH (verbatim) ─────────────────────────────
+            if end_span <= self.fold_pos {
+                self.journal.flush_upto(&mut self.hash, end_span);
                 let h = self.hash;
                 let rec = &mut self.passes[self.pass_tail];
                 rec.hash = h;
@@ -3930,10 +5413,336 @@ impl<'a> HydraSpanSink<'a> {
                 // The next pass's chain starts from a fresh seed.
                 self.hash = Self::SPAN_SEED;
                 self.pass_tail = (self.pass_tail + 1) % PASS_RING;
+                self.sheaf_check_and_roll();
             } else {
                 break;
             }
         }
+    }
+
+    /// R38/L2: THE ASYNCHRONOUS SHEAF MERGE (Theorem 25 + Theorem
+    /// 26(b)) — the multi-boundary collector's boundary check. The
+    /// workers published their lane composites `X_ℓ^(e) = (K, B)` for
+    /// every closed pass (the epoch slots, release-stored at THEIR
+    /// crossings); the fold's own account of the lanes' emission (the
+    /// drained composite records' k sum — accumulated in the drain
+    /// loop / the dual merge, the independent path) must agree with
+    /// the published degrees. THE DEGREE LAW: the lanes' common epoch
+    /// identifies the pass (c = this completion, or c−1 — the
+    /// one-behind staleness the protocol licenses); the publication is
+    /// NEVER waited on (a miss is counted, never spun — no serial
+    /// gating). The B-coordinate's full composite law (the lane
+    /// sub-sequence compose == the published B) is pinned by the
+    /// dedicated cells (t_r38c).
+    fn sheaf_check_and_roll(&mut self) {
+        if let Some(f) = self.fabric {
+            let c = self.sheaf_completed;
+            let mut sum = 0u64;
+            let mut epoch_common: Option<u64> = None;
+            let mut ok = true;
+            for lane in &f.lanes {
+                let (e, k, _b) = lane.read_bc();
+                match epoch_common {
+                    None if e == c || e + 1 == c => {
+                        epoch_common = Some(e);
+                        sum += k;
+                    }
+                    Some(e0) if e0 == e => sum += k,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some(e) = epoch_common {
+                    let want = if e == c {
+                        self.sheaf_lane_k
+                    } else {
+                        self.sheaf_prev_lane_k
+                    };
+                    if sum == want {
+                        self.sheaf_checked += 1;
+                    } else {
+                        self.sheaf_missed += 1;
+                    }
+                } else {
+                    // Nothing published yet (the first passes of a
+                    // fresh sink — the slots still unset).
+                    self.sheaf_missed += 1;
+                }
+            } else {
+                // The lanes straddle epochs (one crossed, the other
+                // not) — the jump-episode face; counted, never spun.
+                self.sheaf_missed += 1;
+            }
+        }
+        // The accumulation rolls: this pass's account becomes the
+        // one-behind operand; the next pass starts fresh.
+        self.sheaf_prev_lane_k = self.sheaf_lane_k;
+        self.sheaf_lane_k = 0;
+        self.sheaf_completed += 1;
+    }
+
+    /// R40: THE DUAL BOUNDARY COMPLETION — the position-keyed merge of
+    /// the two journals (Theorem 23(b)'s static order made explicit:
+    /// journal_0's lane-0 leaves + j1's lane-1 leaves, two-finger
+    /// merged BY GLOBAL END — exactly the mono drain's leaf sequence,
+    /// provenance-agnostic), the tree compose over the merged staging,
+    /// the additive count merge, the snapshot + reseed, and the sheaf
+    /// check (j1's k sum joins the lane-0 drain's accumulation).
+    ///
+    /// The POST-POISON path (`unsorted=true`) takes the
+    /// insertion-sort variant: the disarm's mono drain concatenates
+    /// both-lane leaves onto journal_0 AFTER the pre-poison lane-0
+    /// subsequence — the concatenation is not end-sorted, so the
+    /// two-finger precondition fails; the sort restores the global
+    /// position order (the poison fires at most once per run — the
+    /// O(n²) pass is cold by construction).
+    fn dual_complete_one(
+        &mut self,
+        gate: &std::sync::Arc<crate::dual::DualGate>,
+        end_span: u64,
+        count_1: Option<u64>,
+        overlap: u64,
+        unsorted: bool,
+        j1_run: Option<(u64, u64)>,
+    ) {
+        // R40d: THE ARRIVING-LAST ELECTION — the atomic swap. P1's
+        // boundary step was its ARRIVAL (the run publication — it
+        // proceeded into its next pass immediately, never waiting on
+        // P0); THIS completion is the arriving-last finalize (both
+        // lanes' cursors crossed + the arrival landed — the second
+        // event observed). `fetch_max` is the swap: a boundary already
+        // finalized (the deferred / recomposed edge) makes this
+        // attempt the loser — the merge runs EXACTLY ONCE per
+        // boundary, fail-loud on any protocol break that would run it
+        // twice.
+        if !gate.boundary_elect(end_span) {
+            debug_assert!(
+                false,
+                "R40d: boundary {end_span} finalized twice (the election's loser must not reach here)"
+            );
+            return;
+        }
+        // The partitions: journal_0's leading leaves ≤ end_span …
+        let p0 = self.journal.partition_len(end_span);
+        // … and j1's window — R40d: THE COMPACTED RUN-DRAIN. The
+        // arrival's PRE-STAGED run bounds ARE the partition (P1's
+        // frontier cap parks any record ending beyond its pass target,
+        // so every leaf of the run [run_start, run_start+run_len) ends
+        // ≤ the lane projection ≤ end_span — the window IS the scan's
+        // result, computed on P1's clock instead of P0's per-record
+        // ring walk). The consistency law pins the protocol: the run's
+        // start must equal j1's retire cursor (the previous boundary's
+        // partition — P1's per-record run-start advance and the
+        // territory-gap law guarantee it; a divergence means the
+        // rendezvous broke and MUST fail loud). The fallback paths
+        // (pre-arm / zombie — no arrival) keep the record-by-record
+        // scan (cold by construction).
+        let j1c = gate.j1.consumed();
+        let j1s = gate.j1.snapshot();
+        let j1p = match j1_run {
+            Some((run_start, run_len)) => {
+                assert_eq!(
+                    run_start, j1c,
+                    "R40d: the arrival's run start {} != j1's retire cursor {} \
+                     (the boundary protocol broke — the run window is not the partition)",
+                    run_start, j1c
+                );
+                let jp = run_start + run_len;
+                assert!(
+                    jp <= j1s,
+                    "R40d: the arrival's run end {} > j1's published length {} \
+                     (the arrival lied — P1's sweep discipline broke)",
+                    jp, j1s
+                );
+                jp
+            }
+            None => {
+                let mut j1p = j1c;
+                while j1p < j1s && gate.j1.leaf(j1p).2 <= end_span {
+                    j1p += 1;
+                }
+                j1p
+            }
+        };
+        debug_assert!(j1p - j1c <= crate::dual::J1_CAP as u64);
+        // THE MERGE into the staging (k, b, end) — R40d: the COMPACTED
+        // RUN-DRAIN. The two-finger is RUN-BASED over a GLOBAL j1
+        // cursor (the window's two wrap segments are addressed through
+        // one `j1_head(g)` view — segment 1 then segment 2, ring order
+        // = the monotone end order, so the merge law is exactly the
+        // classic two-finger's): both sides are end-sorted, so the
+        // merge takes whole RUNS from each side (the LANE-INTERLEAVE
+        // law makes the runs chunk-groups — journal_0's lane-0 chunks
+        // alternate with j1's lane-1 chunks); each run is one (or two,
+        // at the wrap split) `copy_from_slice` per column — the
+        // vectorized block consume. The old per-record `leaf()` reads
+        // (three masked UnsafeCell derefs per leaf) are gone. Tie law:
+        // journal_0's leaf wins an end-position tie (the classic's
+        // `journal.end[i] <= j1_end` — bit-exactness with the mono
+        // drain's sequence).
+        let mut m = 0usize;
+        let mut sheaf_j1 = 0u64;
+        if !unsorted {
+            let [(k1, b1, e1), (k2, b2, e2)] = gate.j1.run_segments(j1c, j1p);
+            let seg1_len = k1.len();
+            let total = (j1p - j1c) as usize;
+            // The next unread j1 leaf's end at window position `g`
+            // (u64::MAX past the window — the sentinel that lets the
+            // journal run extend freely ONLY at the true end).
+            let j1_head = |g: usize| -> u64 {
+                if g < seg1_len {
+                    e1[g]
+                } else if g < total {
+                    e2[g - seg1_len]
+                } else {
+                    u64::MAX
+                }
+            };
+            let mut i = 0usize; // journal_0's cursor
+            let mut g = 0usize; // the j1 window's global cursor
+            while i < p0 || g < total {
+                if i < p0 && self.journal.end[i] <= j1_head(g) {
+                    // journal_0's run: extend while its next end stays
+                    // at or below the j1 head.
+                    let start = i;
+                    while i < p0 && self.journal.end[i] <= j1_head(g) {
+                        i += 1;
+                    }
+                    let r = i - start;
+                    self.dual_staging_k[m..m + r].copy_from_slice(&self.journal.k[start..i]);
+                    self.dual_staging_b[m..m + r].copy_from_slice(&self.journal.b[start..i]);
+                    self.dual_staging_e[m..m + r].copy_from_slice(&self.journal.end[start..i]);
+                    m += r;
+                } else {
+                    // j1's run: extend while its next end stays
+                    // strictly below the journal head (the tie goes to
+                    // journal_0 — the loop's next iteration takes it).
+                    let jhead = if i < p0 {
+                        self.journal.end[i]
+                    } else {
+                        u64::MAX
+                    };
+                    let start = g;
+                    while g < total && j1_head(g) < jhead {
+                        g += 1;
+                    }
+                    // The run [start, g) — at most two segments (the
+                    // wrap split); the per-column block copies.
+                    let mid = g.min(seg1_len);
+                    if start < mid {
+                        let r = mid - start;
+                        self.dual_staging_k[m..m + r].copy_from_slice(&k1[start..mid]);
+                        self.dual_staging_b[m..m + r].copy_from_slice(&b1[start..mid]);
+                        self.dual_staging_e[m..m + r].copy_from_slice(&e1[start..mid]);
+                        sheaf_j1 += k1[start..mid].iter().map(|&k| k as u64).sum::<u64>();
+                        m += r;
+                    }
+                    if g > seg1_len {
+                        let s2 = start.max(seg1_len) - seg1_len;
+                        let e2i = g - seg1_len;
+                        let r = e2i - s2;
+                        if r > 0 {
+                            self.dual_staging_k[m..m + r].copy_from_slice(&k2[s2..e2i]);
+                            self.dual_staging_b[m..m + r].copy_from_slice(&b2[s2..e2i]);
+                            self.dual_staging_e[m..m + r].copy_from_slice(&e2[s2..e2i]);
+                            sheaf_j1 += k2[s2..e2i].iter().map(|&k| k as u64).sum::<u64>();
+                            m += r;
+                        }
+                    }
+                }
+            }
+        } else {
+            // The sort path: copy both partitions, insertion-sort by
+            // end (the once-per-run poison drain).
+            for i in 0..p0 {
+                self.dual_staging_k[m] = self.journal.k[i];
+                self.dual_staging_b[m] = self.journal.b[i];
+                self.dual_staging_e[m] = self.journal.end[i];
+                m += 1;
+            }
+            let mut j = j1c;
+            while j < j1p {
+                let (k, b, e) = gate.j1.leaf(j);
+                self.dual_staging_k[m] = k;
+                self.dual_staging_b[m] = b;
+                self.dual_staging_e[m] = e;
+                sheaf_j1 += k as u64;
+                m += 1;
+                j += 1;
+            }
+            for a in 1..m {
+                let (kk, bb, ee) = (
+                    self.dual_staging_k[a],
+                    self.dual_staging_b[a],
+                    self.dual_staging_e[a],
+                );
+                let mut b = a;
+                while b > 0 && self.dual_staging_e[b - 1] > ee {
+                    self.dual_staging_k[b] = self.dual_staging_k[b - 1];
+                    self.dual_staging_b[b] = self.dual_staging_b[b - 1];
+                    self.dual_staging_e[b] = self.dual_staging_e[b - 1];
+                    b -= 1;
+                }
+                self.dual_staging_k[b] = kk;
+                self.dual_staging_b[b] = bb;
+                self.dual_staging_e[b] = ee;
+            }
+        }
+        debug_assert!(m <= self.dual_staging_k.len(), "R40 merge staging overflow");
+        // THE COMPOSE: the merged leaf sequence's tree + one hop
+        // (bit-identical to the mono's flush by the re-bracketing
+        // law — Theorem 22).
+        if m > 0 {
+            let (kk, bb) = crate::sink::tree_fold_segments(
+                &mut self.dual_staging_k[..m],
+                &mut self.dual_staging_b[..m],
+            );
+            self.hash = crate::sink::fold_compose_apply(self.hash, kk, bb);
+        }
+        // THE RETIRE: journal_0's prefix shifts compose-free (the
+        // merged staging already carried it); j1's consumed cursor
+        // publishes past the partition.
+        self.journal.retire_upto(end_span);
+        gate.j1.retire(j1p);
+        // R40c-IV: THE FLUSH ACCOUNTING — the dual completion composes
+        // the merged leaf sequence through the SAME tree law as the
+        // mono's flush_upto (tree_fold_segments + the single apply),
+        // but retire_upto never counted it: the engagement law's
+        // `flushes >= passes` read 13 flushes against 506K passes on
+        // every armed dual run since ce82a06 — a REAL law violation
+        // the CI's tee-masking turned into false greens (run 526's
+        // 11r40k arm exposed the class by dying mid-run BEFORE the
+        // verdict prints). The merge IS a flush; count it.
+        self.journal.note_flush();
+        // THE SNAPSHOT + RESEED (the mono completion's body).
+        let h = self.hash;
+        {
+            let rec = &mut self.passes[self.pass_tail];
+            rec.hash = h;
+            rec.done = true;
+            if let Some(c1) = count_1 {
+                rec.count += c1.saturating_sub(overlap);
+            }
+        }
+        self.hash = Self::SPAN_SEED;
+        self.pass_tail = (self.pass_tail + 1) % PASS_RING;
+        // THE SHEAF: j1's k sum joins the lane-0 drain's accumulation
+        // (the accounts are disjoint by construction — the mono drain
+        // accumulated only its own consumed records).
+        self.sheaf_lane_k += sheaf_j1;
+        self.sheaf_check_and_roll();
+        if std::env::var("R40_CELL_TRACE").is_ok() {
+            eprintln!(
+                "R40MERGE end={end_span} p0={p0} j1p={} m={m} c1={count_1:?} ov={overlap} fold_pos={} next_span={}",
+                j1p - j1c,
+                self.fold_pos,
+                self.next_span
+            );
+        }
+        self.dual_merges += 1;
     }
 
     /// Harvest completed passes in order (oldest first). Returns the
@@ -3957,9 +5766,19 @@ impl<'a> HydraSpanSink<'a> {
     /// from the R23 `h ← (rotl(h,13) ^ v)·P` so that chunk segments
     /// compose — see `sink::fold_compose_b`/`fold_compose_apply`; the
     /// per-span form stays the reference and the rollback path).
+    ///
+    /// R37: under the tree the span journals as a `(k=1, B=v·P)` leaf
+    /// (the segment monoid's per-span generator); `end` is the fold
+    /// position after this span — every caller knows it (the loop
+    /// counters run ahead of the committed `fold_pos` cursor).
     #[inline(always)]
-    fn fold_value(&mut self, v: u64) {
-        self.hash = crate::sink::fold_step(self.hash, v);
+    fn fold_value(&mut self, v: u64, end: u64) {
+        if self.journal.tree {
+            self.journal
+                .push(&mut self.hash, 1, crate::sink::fold_term(v), end);
+        } else {
+            self.hash = crate::sink::fold_step(self.hash, v);
+        }
     }
 
     /// R16b: publish the span-count cursor — the ONE Release store that
@@ -4060,7 +5879,8 @@ impl<'a> HydraSpanSink<'a> {
             let end = self.rx_slot_end[arr_slot as usize];
             if end != u64::MAX {
                 let mut sb = 0u32;
-                while self.fold_pos < end {
+                // R40: the dual/zombie lanes-past law (both cursors).
+                while !self.dual_lanes_past(end) {
                     self.fold_available();
                     crate::affinity::polite_spin(&mut sb);
                 }
@@ -4122,7 +5942,8 @@ impl<'a> HydraSpanSink<'a> {
         let rend = self.rx_rec_end[rec_slot as usize];
         if rend != u64::MAX {
             let mut sb = 0u32;
-            while self.fold_pos < rend {
+            // R40: the dual/zombie lanes-past law (both cursors).
+            while !self.dual_lanes_past(rend) {
                 self.fold_available();
                 crate::affinity::polite_spin(&mut sb);
             }
@@ -4223,9 +6044,9 @@ impl<'a> HydraSpanSink<'a> {
             .wrapping_sub(self.rx_win_count0)
             .wrapping_add(idx as u64)
             + 1;
-        if self.fold_pos < need {
+        if !self.dual_lanes_past(need) {
             let mut sb = 0u32;
-            while self.fold_pos < need {
+            while !self.dual_lanes_past(need) {
                 self.fold_available();
                 crate::affinity::polite_spin(&mut sb);
             }
@@ -4392,10 +6213,11 @@ impl<'a> HydraSpanSink<'a> {
     /// leave the submitting core entirely.
     #[inline]
     fn submit_span_rx(&mut self, body: &[u8]) {
-        let st = self
-            .rx
-            .clone()
-            .expect("submit_span_rx without rxdesc state");
+        // R39: the cached borrow — the per-span `Arc::clone` + drop (two
+        // locked RMWs on the shared refcount line) leaves the submit path.
+        let Some(st) = self.rx_ref else {
+            unreachable!("submit_span_rx without rxdesc state")
+        };
         // (The blob base was captured by submit_span's preamble — the
         // single write-once point, shared with the RX's capture.)
         // Lazy window open (the burst shape has no begin_pass; begin_pass
@@ -4587,7 +6409,9 @@ impl<'a> HydraSpanSink<'a> {
         if recs.is_empty() {
             return;
         }
-        let Some(st) = self.rx.clone() else {
+        // R39: the cached borrow — the per-batch `Arc::clone` + drop
+        // leaves the submit path (the same law as submit_span_rx's).
+        let Some(st) = self.rx_ref else {
             unreachable!("submit_span_batch_rx without rxdesc state")
         };
         // The blob base — submit_span's preamble, verbatim (write-once
@@ -4652,7 +6476,19 @@ impl<'a> HydraSpanSink<'a> {
                     }
                     true
                 } else {
-                    self.rx_assist_wm > 0
+                    // R37b: THE SELF-SERVE GUARD, TWINNED — the per-span
+                    // path (`submit_span_rx`) has carried `!rx_win_ss`
+                    // since R29; the batched twins dropped it (the
+                    // no-drift law violation). In an SS window the whole
+                    // span range is pre-published at the open, so a
+                    // mid-scan claim's mark lands AFTER the workers
+                    // (running the replay ~a window ahead of the scan
+                    // cursor) entered the chunk: both sides evaluate it
+                    // and the lane ring carries a duplicate the fold's
+                    // order law rejects. The workers own the ingest;
+                    // the pace gate stays the flow control.
+                    !self.rx_win_ss
+                        && self.rx_assist_wm > 0
                         && self.pending() > self.rx_assist_wm
                         && self.try_claim_inline()
                 };
@@ -4948,7 +6784,11 @@ impl<'a> HydraSpanSink<'a> {
         if words.is_empty() {
             return;
         }
-        let Some(st) = self.rx.clone() else {
+        // R39: the cached borrow — the per-packed-call `Arc::clone` + drop
+        // (two locked RMWs on the shared refcount line, paid by every
+        // fused Packed call of the elision champion's cadence) leaves the
+        // submission path; the lifetime rides the fabric's 'a.
+        let Some(st) = self.rx_ref else {
             unreachable!("submit_packed_batch_rx without rxdesc state");
         };
         // The blob base — the packed batch's first body pointer (write-once
@@ -5019,7 +6859,15 @@ impl<'a> HydraSpanSink<'a> {
                     }
                     true
                 } else {
-                    self.rx_assist_wm > 0
+                    // R37b: THE SELF-SERVE GUARD, TWINNED — the packed
+                    // batched twin (see `submit_span_rx`'s R29 block and
+                    // `submit_span_batch_rx`'s R37b fix): an SS window
+                    // never takes mid-scan inline claims — the exposure
+                    // is up-front, the mark cannot precede it, and the
+                    // duplicate lands in the lane ring (the fold's
+                    // order law).
+                    !self.rx_win_ss
+                        && self.rx_assist_wm > 0
                         && self.pending() > self.rx_assist_wm
                         && self.try_claim_inline()
                 };
@@ -5344,6 +7192,230 @@ impl<'a> HydraSpanSink<'a> {
         }
     }
 
+    /// R40-extracted: the fabric/inline dispatch of a packed call (the
+    /// count bookkeeping lives at the call site — the suppressed twin
+    /// reaches this with the bookkeeping elided).
+    fn dispatch_packed_fabric(&mut self, base_ptr: usize, words: &[u64]) {
+        match self.fabric {
+            None => {
+                // Inline mode: evaluate + fold NOW — sequential-equivalent
+                // (the body reconstructed from the packed word).
+                for &w in words {
+                    let body = self.packed_body(base_ptr, w);
+                    let v = span_crc32c_8lane(body);
+                    // R37: fold_pos is this span's start (the +1 below) —
+                    // the leaf's end.
+                    self.fold_value(v, self.fold_pos + 1);
+                    self.next_span += 1;
+                    self.fold_pos += 1;
+                }
+            }
+            Some(_) => {
+                if self.rx.is_some() && self.batch_submit && self.packed_emission {
+                    // R28: the FUSED commit — the steady scan's words flow
+                    // straight into the vector check (HFT_BATCH_SUBMIT=0 /
+                    // HFT_PACKED_EMISSION=0 roll back to the SpanRec
+                    // emission upstream).
+                    self.submit_packed_batch_rx(base_ptr, words);
+                } else {
+                    for &w in words {
+                        let body = self.packed_body(base_ptr, w);
+                        self.submit_span(body);
+                        self.next_span += 1;
+                    }
+                }
+                // R16b: NO publish here — the chunk-completion boundary
+                // inside the submit paths owns the cadence.
+            }
+        }
+    }
+
+    /// R40: THE LANE-0 DRAIN — the dual split's P0 side of the composite
+    /// drain. Consumes LANE 0's res ring into the sink's own journal,
+    /// asserting the per-lane contiguity law (`span_id == fold_pos`) and
+    /// the chunk cap (`k ≤ fold_rem`); the LANE SKIP (a chunk-end record
+    /// advances the cursor across the sibling lane's interposed chunk)
+    /// keeps the cursor on lane-0 territory — the twin of P1's
+    /// `drain_lane1`. The wrap-aware frontier cap parks records that end
+    /// beyond the submission frontier (the R29 law, verbatim), and the
+    /// hoisted boundary compare fires the dual completion (the arrival
+    /// gate lives inside `complete_boundaries` — the lazy law).
+    fn fold_available_lane0(&mut self, fabric: &HydraFabric) {
+        self.complete_boundaries();
+        if self.fold_pos >= crate::dual::lane_end_at(self.next_span, 0) {
+            return;
+        }
+        // The defensive inline-marks check (the SS regime never marks;
+        // a stale mark parks, never misorders — the mono's law).
+        if let Some(st) = &self.rx {
+            if st.is_inline(self.fold_pos / CHUNK) {
+                return;
+            }
+        }
+        let lane = &fabric.lanes[0];
+        let head = lane.res_head.load(Ordering::Acquire);
+        let tail = lane.res_tail.load(Ordering::Relaxed); // P0-owned cursor
+        if tail == head {
+            return;
+        }
+        let slots = lane.res_slots_read();
+        let mut consumed: u64 = 0;
+        let mut next_end = self.dual_hoist_end(self.pending_boundary_end());
+        while tail + consumed < head {
+            let r = &slots[((tail + consumed) & RES_MASK) as usize];
+            let k = r.aux as u64;
+            // R29's wrap-aware frontier cap (the serial-number compare —
+            // records ending beyond the submission frontier stay
+            // buffered until the scan advances).
+            let end32 = r.span_id.wrapping_add(k as u32);
+            let next32 = self.next_span as u32;
+            let dcap = end32.wrapping_sub(next32);
+            if dcap != 0 && dcap < 0x8000_0000 {
+                break;
+            }
+            assert!(
+                k >= 1 && k <= self.fold_rem,
+                "R40 lane-0 record k={k} exceeds fold_rem={} at span {}",
+                self.fold_rem,
+                r.span_id
+            );
+            assert_eq!(
+                r.span_id, self.fold_pos as u32,
+                "R40 lane-0 drain: fold-order violation (got span {}, cursor {}, k {})",
+                r.span_id, self.fold_pos, r.aux
+            );
+            if self.pass_tail != self.pass_head {
+                let rec = &self.passes[self.pass_tail];
+                // THE LAZY LAW (the dual's own relaxation of the mono
+                // invariant): a lagging P1 defers this boundary's
+                // completion at the arrival gate while P0 NEVER blocks —
+                // the next pass's leaves legitimately fold into
+                // journal_0 while the cursor stands AT or PAST the
+                // deferred boundary (`fold_pos >= end_span`: the record
+                // belongs to a LATER pass). The merge is position-keyed
+                // (`partition_len`/`retire_upto` cut journal_0 exactly at
+                // the boundary), so the early leaves ride the next
+                // flush — h-independent + SPAN_SEED-rebased (the R37
+                // deferred-tail law, the design's own comment at the
+                // arrival gate). A TRUE straddle (`fold_pos <
+                // end_span < fold_pos + k`) remains a panic — the
+                // worker's break discipline.
+                debug_assert!(
+                    rec.done
+                        || rec.end_span == u64::MAX
+                        || self.fold_pos >= rec.end_span
+                        || self.fold_pos + k <= rec.end_span,
+                    "R40 composite record straddled a pass boundary ({}+{} > {})",
+                    self.fold_pos,
+                    k,
+                    rec.end_span
+                );
+            }
+            self.journal
+                .push(&mut self.hash, k as u32, r.value, self.fold_pos + k);
+            self.fold_pos += k;
+            self.fold_rem -= k;
+            // The sheaf's lane-0 share (j1's joins at the merge).
+            self.sheaf_lane_k += k;
+            consumed += 1;
+            if self.fold_rem == 0 {
+                // THE LANE SKIP: the record ended at a chunk end — the
+                // next lane-0 record starts past lane-1's interposed
+                // chunk (the per-lane contiguity law's gap).
+                self.fold_pos += CHUNK;
+                self.fold_rem = CHUNK;
+            }
+            if self.fold_pos >= next_end {
+                self.complete_boundaries();
+                next_end = self.dual_hoist_end(self.pending_boundary_end());
+            }
+        }
+        lane.res_tail.store(tail + consumed, Ordering::Release);
+        self.complete_boundaries();
+    }
+
+    /// R40: the boundary-hoist end under the dual split — the lane-0
+    /// projection of the pending boundary (the completion's own
+    /// condition is lane-based; the hoist must not over-defer).
+    #[inline]
+    fn dual_hoist_end(&self, end: u64) -> u64 {
+        if self.dual_armed && end != u64::MAX {
+            crate::dual::lane_end_at(end, 0)
+        } else {
+            end
+        }
+    }
+
+    /// R40: THE ZOMBIE LANE-1 DRAIN — P1's drain code, P0-owned after
+    /// the poison (the ownership transferred by P1's terminal
+    /// publication: the cursor, the res-ring tail, and j1's length are
+    /// all stable). Pushes lane 1's records into j1 (the boundary
+    /// merge's second journal — THE SAME merge, so the poison's fold
+    /// order stays exact); the journal backpressure calls the
+    /// completion inline (P0 retires its own leaves — no spin needed,
+    /// unlike P1's park).
+    fn fold_available_lane1_zombie(&mut self, fabric: &HydraFabric) {
+        let Some(gate) = self.dual.clone() else {
+            return;
+        };
+        if self.z1_fold_pos >= crate::dual::lane_end_at(self.next_span, 1) {
+            return;
+        }
+        let lane = fabric.lane(1);
+        let head = lane.r40_res_head();
+        let tail = self.z1_res_tail;
+        if tail == head {
+            return;
+        }
+        let slots = lane.r40_res_slots();
+        let mask = RES_MASK;
+        let target32 = self.next_span as u32;
+        let mut consumed: u64 = 0;
+        while tail + consumed < head {
+            let r = &slots[((tail + consumed) & mask) as usize];
+            let k = r.aux as u64;
+            // R29's wrap-aware frontier cap (the zombie's target: the
+            // submission frontier — the whole remaining stream).
+            let end32 = r.span_id.wrapping_add(k as u32);
+            let dcap = end32.wrapping_sub(target32);
+            if dcap != 0 && dcap < 0x8000_0000 {
+                break;
+            }
+            assert!(
+                k >= 1 && k <= self.z1_fold_rem,
+                "R40 zombie record k={k} exceeds rem {}",
+                self.z1_fold_rem
+            );
+            assert_eq!(
+                r.span_id, self.z1_fold_pos as u32,
+                "R40 zombie lane-1 drain: fold-order violation (got {}, cursor {})",
+                r.span_id, self.z1_fold_pos
+            );
+            // The journal backpressure: P0's own completion retires —
+            // call it (never spin; the same thread).
+            if self.z1_j1_len - gate.j1.consumed()
+                > (crate::dual::J1_CAP as u64) - crate::dual::J1_HEADROOM
+            {
+                self.complete_boundaries();
+            }
+            gate.j1
+                .push(&mut self.z1_j1_len, k as u32, r.value, self.z1_fold_pos + k);
+            self.z1_fold_pos += k;
+            self.z1_fold_rem -= k;
+            if self.z1_fold_rem == 0 {
+                self.z1_fold_pos += CHUNK;
+                self.z1_fold_rem = CHUNK;
+            }
+            consumed += 1;
+        }
+        self.z1_res_tail += consumed;
+        lane.r40_res_tail_store(self.z1_res_tail);
+        // Keep the watermark operand current (the zombie's own cursor).
+        if let Some(g) = &self.dual {
+            g.p1_fold_store(self.z1_fold_pos);
+        }
+    }
+
     /// Fold every completed-but-unfolded result batch (non-blocking, in
     /// emission order). One cursor advance per batch.
     ///
@@ -5357,6 +7429,23 @@ impl<'a> HydraSpanSink<'a> {
             Some(f) => f,
             None => return,
         };
+        // R40: THE DUAL SPLIT — P0 drains LANE 0 ONLY (P1's engine owns
+        // lane 1's res ring into the shared journal; the boundary merge
+        // joins them by position). The ZOMBIE (post-poison) keeps the
+        // lane-split shape with P0 running BOTH drains — the mono
+        // interleave can never resume (lane 1's early records live in
+        // j1).
+        if self.dual_armed {
+            self.fold_available_lane0(fabric);
+            self.complete_boundaries();
+            return;
+        }
+        if self.dual_poisoned {
+            self.fold_available_lane0(fabric);
+            self.fold_available_lane1_zombie(fabric);
+            self.complete_boundaries();
+            return;
+        }
         self.complete_boundaries();
         while self.fold_pos < self.next_span {
             // R10 — WORK-ASSIST fold, O(1): inline chunks are claimed in
@@ -5378,7 +7467,9 @@ impl<'a> HydraSpanSink<'a> {
                     // exact-match above is its guard.
                     for i in 0..n as usize {
                         let v = self.inline_ring[slot].vals[i];
-                        self.fold_value(v);
+                        // R37: fold_pos is the chunk start here (the exact
+                        // match above) — leaf end = start + i + 1.
+                        self.fold_value(v, self.fold_pos + i as u64 + 1);
                     }
                     self.inline_fold_seq += 1;
                     self.fold_pos += n;
@@ -5421,7 +7512,11 @@ impl<'a> HydraSpanSink<'a> {
             // (the 512-span drift class). Deriving from the position
             // makes the class structurally impossible; one shift + one
             // mod at the consumer's loop edge.
-            self.fold_lane = ((self.fold_pos / CHUNK) % self.n_lanes as u64) as usize;
+            // R39: the derived grid's lane re-derivation — the runtime DIV
+            // (`% n_lanes`) becomes the exact AND/magic modulus (LaneMod);
+            // the derivation LAW is unchanged (drift-immune re-derive at
+            // every loop top).
+            self.fold_lane = self.lane_mod.rem(self.fold_pos / CHUNK) as usize;
             self.fold_rem = CHUNK - (self.fold_pos % CHUNK);
             // H6: `fold_lane` tracks the chunk containing `fold_pos` — no
             // division in the hot path (advance after chunk completion).
@@ -5450,6 +7545,21 @@ impl<'a> HydraSpanSink<'a> {
                 // store below. Per-slot masking handles the ring wrap.
                 let slots = lane.res_slots_read();
                 let mut consumed: u64 = 0;
+                // R39: THE BOUNDARY HOIST — the oldest pending pass's
+                // completion frontier, read ONCE per record-loop entry
+                // (the per-record `complete_boundaries()` call was
+                // ~12-18 cycles of loads + branch for a condition that
+                // fires once per ~178 records on the champion's shape —
+                // 103M calls for 578,887 true boundaries). The local
+                // compare below replaces the call; the `>=` + the refresh
+                // after each true firing keep consecutive boundaries (the
+                // parked-then-resumed multi-cross shapes) exact, and the
+                // loop-top / break / park calls still run the full
+                // function (the hoist only skips calls that CANNOT fire:
+                // records never straddle a pending boundary — the
+                // worker's break discipline, pinned by the debug assert
+                // below).
+                let mut next_end = self.pending_boundary_end();
                 while tail + consumed < head {
                     let r = &slots[((tail + consumed) & RES_MASK) as usize];
                     let k = r.aux as u64;
@@ -5522,11 +7632,28 @@ impl<'a> HydraSpanSink<'a> {
                             rec.end_span
                         );
                     }
-                    // THE APPLICATION: h ← rotl(h, 13k) ^ B.
-                    self.hash =
-                        crate::sink::fold_compose_apply(self.hash, k as u32, r.value);
+                    // R37 — THE JOURNALING: the record becomes a leaf
+                    // `(k, B)` of the current pass's tree (applied at
+                    // the boundary flush by the ⌈log₂ K⌉ up-sweep + ONE
+                    // `fold_compose_apply` hop — the serial chain's
+                    // dependent-apply loop-carried dependency leaves
+                    // the drain; the load/assert/store pipeline).
+                    // Rollback (`HFT_TREE_FOLD=0`): the serial apply
+                    // verbatim. Leaf end = fold_pos + k (the record's
+                    // exact end — records never straddle boundaries).
+                    self.journal.push(
+                        &mut self.hash,
+                        k as u32,
+                        r.value,
+                        self.fold_pos + k as u64,
+                    );
                     self.fold_pos += k;
                     self.fold_rem -= k;
+                    // R38/L2: the lane-drain account (the sheaf degree
+                    // law's fold-side operand — accumulated BEFORE the
+                    // boundary completion below so the closed pass's
+                    // account is complete at the check).
+                    self.sheaf_lane_k += k;
                     consumed += 1;
                     if self.fold_rem == 0 {
                         self.fold_rem = CHUNK;
@@ -5539,8 +7666,15 @@ impl<'a> HydraSpanSink<'a> {
                         // of them) wait their grid turn — the ORDER LAW.
                         break;
                     }
-                    // A record ending exactly at a boundary snapshots now.
-                    self.complete_boundaries();
+                    // A record ending exactly at a boundary snapshots now
+                    // (R39: the hoisted local compare replaces the
+                    // per-record call; the refresh re-reads the next
+                    // pending frontier so the following records of a
+                    // multi-cross resume stay exact).
+                    if self.fold_pos >= next_end {
+                        self.complete_boundaries();
+                        next_end = self.pending_boundary_end();
+                    }
                 }
                 lane.res_tail.store(tail + consumed, Ordering::Release);
                 self.complete_boundaries();
@@ -5584,7 +7718,9 @@ impl<'a> HydraSpanSink<'a> {
                     n
                 );
                 let v = r.value;
-                self.fold_value(v);
+                // R37: fold_pos advances after the batch (n-capped) — the
+                // i-th leaf's end is start + i + 1.
+                self.fold_value(v, self.fold_pos + i as u64 + 1);
             }
             lane.res_tail.store(tail + n, Ordering::Release);
             self.fold_pos += n;
@@ -5660,20 +7796,57 @@ impl<'a> HydraSpanSink<'a> {
             // finish — same reconcile-then-retire law as end_pass).
             self.rx_win_ss = false;
             self.rx_win_pre = 0;
-            let mut fb = 0u32;
-            while self.fold_pos < self.next_span {
-                if self.fold_available_once_or_spin() {
-                    continue;
+            if self.dual_armed || self.dual_poisoned {
+                // R40c: THE DUAL/ZOMBIE FINISH — drain both lanes to
+                // their projections, then (armed only) wait for P1's
+                // terminal state. The harness posted
+                // `initiate_shutdown(next_span)` BEFORE this call: P1's
+                // exit path is the SHUTDOWN SWEEP (it drains its
+                // remaining lane-1 territory pass-by-pass to the
+                // frontier, publishing each pass's arrival from the
+                // script's totals) and only then posts p1_done — so
+                // this wait terminates with every boundary complete
+                // and every tuple harvestable. The loop itself retires
+                // j1 in lockstep (each arrival-gated completion fires
+                // inside fold_available/complete_boundaries), which
+                // keeps P1's push gate open through the sweep. The
+                // zombie has no P1 to wait for (the state was captured
+                // at the disarm). The completions then merge everything
+                // (the lazy law's final flush).
+                let mut fb = 0u32;
+                loop {
+                    self.fold_available();
+                    if self.dual_lanes_past(self.next_span)
+                        && (!self.dual_armed
+                            || self.dual.as_ref().is_some_and(|g| g.p1_done()))
+                    {
+                        break;
+                    }
+                    crate::affinity::polite_spin(&mut fb);
                 }
-                // R8: SMT-polite final drain.
-                crate::affinity::polite_spin(&mut fb);
+                self.complete_boundaries();
+            } else {
+                let mut fb = 0u32;
+                while self.fold_pos < self.next_span {
+                    if self.fold_available_once_or_spin() {
+                        continue;
+                    }
+                    // R8: SMT-polite final drain.
+                    crate::affinity::polite_spin(&mut fb);
+                }
+                self.complete_boundaries();
             }
-            self.complete_boundaries();
         } else {
             // Inline mode folds eagerly; nothing to drain.
             debug_assert_eq!(self.fold_pos, self.next_span);
             self.complete_boundaries();
         }
+        // R37: the final flush — the burst shape reads `hash` directly
+        // after finish (no pass boundaries ever fire there), and the pass
+        // shape's tail past the last completed boundary needs its leaves
+        // applied. No-op when the boundary loop already drained the
+        // journal (the steady law).
+        self.journal.flush_all(&mut self.hash);
     }
 
     /// One non-blocking fold attempt for `finish`'s spin loop (returns true
@@ -5692,13 +7865,41 @@ impl<'a> HydraSpanSink<'a> {
         // the scan (it consumes the workers' pre-published results while
         // the sequencer ladder still walks); a raw subtract would wrap to
         // ~u64::MAX in release and livelock the pace gate.
-        self.next_span.saturating_sub(self.fold_pos)
+        // R40: under the dual split the sink's cursor is LANE-0's — the
+        // merged frontier (the lagging lane gates the pace; a raw lane-0
+        // read would let P0 outrun the res rings).
+        self.next_span
+            .saturating_sub(self.dual_merged_fold())
     }
 
     /// R8 phase-5 telemetry: chunks taken through the assist path.
     #[inline]
     pub fn assist_chunks(&self) -> u64 {
         self.assist_chunks
+    }
+
+    /// R37 telemetry: the fold journal's engagement contract —
+    /// `(tree, flushes, overflows, records, compose_max, live_len)`
+    /// (the FOLDTREE_DIAGNOSTIC line's source). Engagement law: on a
+    /// pass-shaped run, `flushes` ≈ completed boundaries (+ the rare
+    /// capacity flushes), `records` = the drained composite records,
+    /// and `live_len` = 0 at rest (every leaf flushed at its
+    /// boundary / the finish).
+    #[inline]
+    pub fn fold_tree_stats(&self) -> (bool, u64, u64, u64, u64, u64) {
+        self.journal.stats()
+    }
+
+    /// R38/L2: the multi-boundary collector's telemetry —
+    /// `(checked, missed)`: the boundaries whose lane composites were
+    /// verified under the degree law vs the ones skipped (the slots
+    /// stale/straddling — the jump episodes and the first passes of a
+    /// fresh sink). The SHEAFDIAGNOSTIC line's source; the engagement
+    /// law (the cells): on a steady two-lane run the checked count
+    /// dominates (the misses are the first pass + the assist episodes).
+    #[inline]
+    pub fn sheaf_stats(&self) -> (u64, u64) {
+        (self.sheaf_checked, self.sheaf_missed)
     }
 
     /// R16b telemetry: check-and-fix corrections applied (0 on a clean
@@ -5738,7 +7939,13 @@ impl<'a> Sink for HydraSpanSink<'a> {
             proof.gen(),
             self.last_gen
         );
-        if self.last_seq != 0 {
+        if self.last_seq != 0 && !self.dual_armed {
+            // R40: under the dual split P0's re-issue is a subsequence
+            // (P1's odd batches interpose) — the seq continuity assert
+            // is the mono law; the batch identity (try_replay's bounds
+            // guard) and the boundary tuple assert carry the dual's
+            // soundness. The msg-hash chain below stays EXACT (P0 owns
+            // every Msg call, in ledger order).
             assert_eq!(
                 seq,
                 self.last_seq + 1,
@@ -5842,7 +8049,9 @@ impl<'a> Sink for HydraSpanSink<'a> {
             None => {
                 // Inline mode: evaluate + fold NOW — sequential-equivalent.
                 let v = span_crc32c_8lane(body);
-                self.fold_value(v);
+                // R37: fold_pos is this span's start (the +1 below) — the
+                // leaf's end.
+                self.fold_value(v, self.fold_pos + 1);
                 self.next_span += 1;
                 self.fold_pos += 1;
             }
@@ -5889,7 +8098,9 @@ impl<'a> Sink for HydraSpanSink<'a> {
                 // Inline mode: evaluate + fold NOW — sequential-equivalent.
                 for r in recs {
                     let v = span_crc32c_8lane(r.body);
-                    self.fold_value(v);
+                    // R37: fold_pos is this span's start (the +1 below) —
+                    // the leaf's end.
+                    self.fold_value(v, self.fold_pos + 1);
                     self.next_span += 1;
                     self.fold_pos += 1;
                 }
@@ -5944,6 +8155,18 @@ impl<'a> Sink for HydraSpanSink<'a> {
         base_ptr: usize,
         words: &[u64],
     ) {
+        // R40: the suppressed dispatch — P1 owns this batch's count /
+        // last-seq / G-INV (the script's recorded totals); P0 still
+        // runs the fabric branch (the SS cursor advance keeps the
+        // GLOBAL next_span — the window machine and the boundary
+        // stamps depend on it).
+        if self.dual_armed && self.p1_suppress {
+            if total == 0 {
+                return;
+            }
+            self.dispatch_packed_fabric(base_ptr, words);
+            return;
+        }
         assert!(
             proof.gen() >= self.last_gen,
             "G-INV violation: proof gen {} is older than sink last_gen {}",
@@ -5954,49 +8177,31 @@ impl<'a> Sink for HydraSpanSink<'a> {
             return;
         }
         if self.last_seq != 0 {
-            assert_eq!(
-                first_seq,
-                self.last_seq + 1,
-                "Non-monotonic packed span batch: expected {}, got {} (total={})",
-                self.last_seq + 1,
-                first_seq,
-                total
-            );
+            // R40: the continuity assert is the MONO law — under the
+            // dual split P0's re-issue is a subsequence (P1's odd
+            // batches interpose); the batch identity is P0's
+            // try_replay bounds guard (verbatim, every batch) and the
+            // merged tuple assert at the boundary. The mono's own
+            // recording pass ran this assert at record time.
+            if !self.dual_armed {
+                assert_eq!(
+                    first_seq,
+                    self.last_seq + 1,
+                    "Non-monotonic packed span batch: expected {}, got {} (total={})",
+                    self.last_seq + 1,
+                    first_seq,
+                    total
+                );
+            }
         }
         self.last_seq = first_seq + total - 1;
         self.count += total;
-        match self.fabric {
-            None => {
-                // Inline mode: evaluate + fold NOW — sequential-equivalent
-                // (the body reconstructed from the packed word).
-                for &w in words {
-                    let body = self.packed_body(base_ptr, w);
-                    let v = span_crc32c_8lane(body);
-                    self.fold_value(v);
-                    self.next_span += 1;
-                    self.fold_pos += 1;
-                }
-            }
-            Some(_) => {
-                if self.rx.is_some() && self.batch_submit && self.packed_emission {
-                    // R28: the FUSED commit — the steady scan's words flow
-                    // straight into the vector check (HFT_BATCH_SUBMIT=0 /
-                    // HFT_PACKED_EMISSION=0 roll back to the SpanRec
-                    // emission upstream).
-                    self.submit_packed_batch_rx(base_ptr, words);
-                } else {
-                    for &w in words {
-                        let body = self.packed_body(base_ptr, w);
-                        self.submit_span(body);
-                        self.next_span += 1;
-                    }
-                }
-                // R16b: NO publish here — the chunk-completion boundary
-                // inside the submit paths owns the cadence.
-            }
-        }
+        self.dispatch_packed_fabric(base_ptr, words);
     }
+
+
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6150,6 +8355,146 @@ mod tests {
         let b = fold_compose_b(&terms);
         let h0 = next();
         assert_eq!(fold_compose_apply(h0, 64, b), h0 ^ b);
+    }
+
+    /// R37 cell A (sink law): the segment-monoid tree — `seg_compose`'s
+    /// 3-factor associativity + the up-sweep vs the iterated serial
+    /// applies on random `(k, B)` leaf streams (K ∈ {2..600}, odd
+    /// tails included), the closed form == the step chain, and the
+    /// `(0, 0)` identity apply. Theorem 19/22 on the rotation ring —
+    /// the engine journal's own law.
+    #[test]
+    fn t_r37_segment_tree_law() {
+        use crate::sink::{fold_compose_apply, seg_compose, tree_fold_segments};
+        let mut rng = 0x0DDB_1A5C_0FF5_0371u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        // (a) the 3-factor law on random triples.
+        for _ in 0..20_000 {
+            let a = (1 + (next() % 512) as u32, next());
+            let b = (1 + (next() % 512) as u32, next());
+            let c = (1 + (next() % 512) as u32, next());
+            assert_eq!(
+                seg_compose(seg_compose(a, b), c),
+                seg_compose(a, seg_compose(b, c)),
+                "segment 3-factor law"
+            );
+        }
+        // (b) the tree vs the iterated serial applies.
+        for &k in &[
+            2usize, 3, 4, 5, 7, 8, 9, 16, 17, 63, 100, 128, 194, 200,
+            255, 321, 322, 512, 513, 600,
+        ] {
+            for _ in 0..200 {
+                let leaves: Vec<(u32, u64)> =
+                    (0..k).map(|_| (1 + (next() % 64) as u32, next())).collect();
+                let h0 = next();
+                // The serial chain (the R36 fold's bracketing).
+                let mut h_serial = h0;
+                let mut kk = 0u32;
+                for &(k_i, b_i) in &leaves {
+                    h_serial = fold_compose_apply(h_serial, k_i, b_i);
+                    kk = kk.wrapping_add(k_i);
+                }
+                // The tree (SoA columns).
+                let mut kc: Vec<u32> = leaves.iter().map(|&x| x.0).collect();
+                let mut bc: Vec<u64> = leaves.iter().map(|&x| x.1).collect();
+                let (kt, bt) = tree_fold_segments(&mut kc, &mut bc);
+                assert_eq!(kt, kk, "tree k total (K={k})");
+                let h_tree = fold_compose_apply(h0, kt, bt);
+                assert_eq!(h_tree, h_serial, "segment tree != serial (K={k})");
+            }
+        }
+        // (c) the identity: (0, 0) applies as a no-op.
+        let h = next();
+        assert_eq!(fold_compose_apply(h, 0, 0), h);
+    }
+
+    /// R37 cell B (the journal): FoldJournal's own laws — random leaf
+    /// streams with random boundary splits (flush_upto mid-journal,
+    /// including splits that leave remainders — the mixed-pass shape),
+    /// forced capacity overflows, and the tree-vs-serial differential
+    /// through the journal's full push/flush protocol. The small
+    /// capacity forces the overflow arm; boundaries at every offset
+    /// pin the partition law.
+    #[test]
+    fn t_r37_journal_flush_laws() {
+        let mut rng = 0x0DDB_1A5C_0FF5_0372u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        // The oracle: the serial apply chain over the full stream.
+        for trial in 0..400 {
+            // Small caps force overflows: 1, 2, 3, 8, 16, 64.
+            let cap = 1 << (next() % 7);
+            let n = 1 + (next() % 400) as usize;
+            let seed = 0x5FAD_EED5_0372_0000u64.wrapping_add(next() & 0xFF);
+            let leaves: Vec<(u32, u64)> = (0..n)
+                .map(|_| (1 + (next() % 64) as u32, next() | 1))
+                .collect();
+            // ends: cumulative (the journal's monotone law).
+            let ends: Vec<u64> = {
+                let mut acc = 0u64;
+                leaves
+                    .iter()
+                    .map(|&(k, _)| {
+                        acc += k as u64;
+                        acc
+                    })
+                    .collect()
+            };
+            // The serial oracle (R36's law).
+            let mut h_serial = seed;
+            for &(k, b) in &leaves {
+                h_serial = crate::sink::fold_compose_apply(h_serial, k, b);
+            }
+            // The journal run: push all leaves; flush at random
+            // boundaries (including interior points and the final
+            // end); the hash must match the serial oracle EXACTLY.
+            let mut j = FoldJournal::with_capacity(true, cap.max(1));
+            let mut h = seed;
+            // Random flush schedule: pick ~n/8 random boundary points
+            // (subsets of the ends, in order) + the final flush_all.
+            let mut flush_pts: Vec<u64> = (0..n / 8 + 2)
+                .map(|_| ends[next() as usize % n])
+                .collect();
+            flush_pts.push(u64::MAX); // the final flush
+            let mut fi = 0usize;
+            for (i, &(k, b)) in leaves.iter().enumerate() {
+                j.push(&mut h, k, b, ends[i]);
+                while fi < flush_pts.len() && flush_pts[fi] <= ends[i] {
+                    // Flush at this boundary point.
+                    let bnd = if flush_pts[fi] == u64::MAX {
+                        u64::MAX
+                    } else {
+                        flush_pts[fi]
+                    };
+                    j.flush_upto(&mut h, bnd);
+                    fi += 1;
+                }
+            }
+            j.flush_all(&mut h);
+            assert_eq!(h, h_serial, "journal tree != serial (trial {trial}, cap {cap}, n {n})");
+            assert_eq!(j.len, 0, "journal not empty at rest");
+            assert!(j.flushes > 0);
+            assert_eq!(j.records, n as u64, "record count law");
+            // The rollback twin: push serially through the journal's
+            // serial mode — verbatim equality with the oracle.
+            let mut j2 = FoldJournal::with_capacity(false, cap.max(1));
+            let mut h2 = seed;
+            for (i, &(k, b)) in leaves.iter().enumerate() {
+                j2.push(&mut h2, k, b, ends[i]);
+            }
+            j2.flush_all(&mut h2); // no-op (serial mode)
+            assert_eq!(h2, h_serial, "journal serial rollback (trial {trial})");
+        }
     }
 
     /// R23c: the affine-tag protocol's end-to-end bit-parity — the rxdesc
@@ -8075,6 +10420,7 @@ mod tests {
             true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
                   // identity guard is the replay's oracle (the champion shape).
             true, // R35-A: prearm mirrors the sched-replay arm (the champion shape)
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -8227,6 +10573,7 @@ mod tests {
             true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
                   // identity guard is the replay's oracle (the champion shape).
             true, // R35-A: prearm mirrors the sched-replay arm (the champion shape)
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -8456,11 +10803,32 @@ mod tests {
         (u64, u64, u64, u64),
         u64,
     ) {
+        r36e_drive_n(gt, sched, passes, 1)
+    }
+
+    /// R38/L2: the drive's N-WORKER form — the per-lane phase scripts'
+    /// engine cell. At 2 workers the grid period doubles (128) and the
+    /// mini's orbit doubles with it (7,903 mod 128 = 125,
+    /// gcd(125,128)=1 — the full 128); the caller sizes `passes` past
+    /// the orbit so the replays engage. The harvested tuples must
+    /// match the sequential references BIT-EXACTLY (the two-lane
+    /// elision's parity law — the fold consumes both lanes' replayed
+    /// records in the static grid order).
+    fn r36e_drive_n(
+        gt: &[u8],
+        sched: &nf_transport::sched_types::ReplaySchedule,
+        passes: u64,
+        workers: usize,
+    ) -> (
+        Vec<(u64, u64, u64)>,
+        (u64, u64, u64, u64),
+        u64,
+    ) {
         let construction = r32_prog(0);
         // R36-E: the elision is FORCED through the spawn override (the
         // env races the parallel tests' worker spawns).
         let fabric =
-            HydraFabric::spawn_pinned_full_opts(1, &[], true, true, true, true, true, Some(true));
+            HydraFabric::spawn_pinned_full_opts(workers, &[], true, true, true, true, true, Some(true));
         let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             gt,
             sched.clone(),
@@ -8474,6 +10842,7 @@ mod tests {
             true,
             true,
             true,
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -8591,6 +10960,883 @@ mod tests {
         );
     }
 
+    // ─── R38/L2: THE TWO-LANE ELISION cells (docs/50 §5 item 3) ────────
+
+    /// R38/L2: THE PER-LANE TILING LAW, unit level — the coverage law
+    /// on the two-lane round-robin sub-grid (the phase machine's
+    /// bracket discipline at n_lanes = 2). THE LAWS:
+    ///   * the SUB-GRID TILING: a lane's script seals when it tiles
+    ///     the lane's own positions in the pass (the head at the
+    ///     sub-grid entry, the body gaps in {0, (n−1)·CHUNK}, the
+    ///     tail at the sub-grid exit);
+    ///   * the HEAD PARTIAL: a boundary landing mid-own-chunk splits
+    ///     the in-flight segment at the boundary (rel_0 = 0, the
+    ///     partial head chunk);
+    ///   * the TAIL PARTIAL: a boundary landing mid-own-chunk ends the
+    ///     script AT the boundary (the partial tail segment);
+    ///   * THE HOLE FACES: the head hole (a late resume), the skipped
+    ///     own chunk (the inline assist — the gap n_lanes·CHUNK), and
+    ///     the tail hole each discard;
+    ///   * THE ARMING: after the orbit (the phase repeats at the
+    ///     length-aligned offset) the per-lane script ARMS — the
+    ///     two-lane elision's unlock;
+    ///   * THE NO-DRIFT DEGENERATION: at n_lanes = 1 the entry/exit
+    ///     helpers degenerate to the R37c operands verbatim.
+    #[test]
+    fn t_r38c_per_lane_tiling_laws() {
+        const T: u64 = 7_903; // the mini tape's span count
+        const GAP: u64 = CHUNK; // (n_lanes − 1) · CHUNK at n = 2
+        // The lane-0 tiling of [0, T): own chunks 0, 2, …, 122 (the
+        // boundary 7,903 lands in the FOREIGN chunk [7872, 7936) — the
+        // walk's crossing fires at the next own start 7936; the script
+        // ends at the last own-chunk end 7872).
+        let lane0_tile = |log: &mut ResLog, rb: u64| {
+            let mut first = rb; // lane_span_entry(0) == 0
+            while first + CHUNK <= lane_span_exit(rb + T, 0, 2) {
+                log.push_seg(first, CHUNK as u32, 0xA1A1);
+                first += CHUNK + GAP;
+            }
+        };
+        {
+            let mut log = ResLog::new(true, false, 2);
+            log.set_lane(0);
+            log.on_boundary(0);
+            assert!(log.recording, "the base-0 boundary opens the bracket");
+            lane0_tile(&mut log, 0);
+            let n0 = log.segs.len();
+            assert_eq!(n0, 62, "lane 0: 62 own chunks in the pass (0,2,…,122)");
+            log.on_boundary(T);
+            assert_eq!(
+                log.phase_n[0], n0 as u32,
+                "lane 0: the sub-grid tiling SEALS (head 0, gaps 64, tail 7872)"
+            );
+            // The lane-1 tiling of the SAME pass: entry 64 (the foreign
+            // head gap), the tail partial [7872, 7903) — the boundary
+            // lands INSIDE lane 1's own chunk 123.
+            let mut l1 = ResLog::new(true, false, 2);
+            l1.set_lane(1);
+            l1.on_boundary(0);
+            let mut first = 64u64; // lane_span_entry(0, 1, 2)
+            while first + CHUNK <= 7872 {
+                l1.push_seg(first, CHUNK as u32, 0xB2B2);
+                first += CHUNK + GAP;
+            }
+            l1.push_seg(7872, (T - 7872) as u32, 0xB3B3); // the tail partial
+            let n1 = l1.segs.len();
+            assert_eq!(n1, 62, "lane 1: 61 full own chunks + the tail partial");
+            l1.on_boundary(T);
+            assert_eq!(
+                l1.phase_n[0],
+                n1 as u32,
+                "lane 1: the sub-grid tiling SEALS (head 64, gaps 64, tail 7903 — mid-own-chunk)"
+            );
+        }
+        // THE HEAD PARTIAL: the boundary at 5 (inside lane 0's chunk
+        // [0, 64)) — the in-flight segment splits at 5; the script
+        // starts at rel 0 with the partial [5, 64), then the own
+        // chunks from 128 (the partial end 64 + the foreign gap).
+        {
+            let mut log = ResLog::new(true, false, 2);
+            log.set_lane(0);
+            log.on_boundary(5);
+            assert_eq!(log.segs.len(), 0);
+            log.push_seg(5, (CHUNK - 5) as u32, 0xC4C4); // the partial head
+            let mut first = CHUNK + GAP; // own chunk 2's start (64 + 64)
+            while first + CHUNK <= lane_span_exit(5 + T, 0, 2) {
+                log.push_seg(first, CHUNK as u32, 0xA1A1);
+                first += CHUNK + GAP;
+            }
+            log.on_boundary(5 + T);
+            assert_eq!(
+                log.phase_n[(5 % 128) as usize],
+                log.segs.len() as u32,
+                "the head-partial pass seals (rel_0 == 0 — the mid-own-chunk split)"
+            );
+        }
+        // THE HOLE FACES — each discards (phase_n = 0; the next orbit
+        // re-records).
+        {
+            // The head hole: the resume PAST the boundary (the inline
+            // episode's chunk-skips): the first rel beyond the entry.
+            let mut lh = ResLog::new(true, false, 2);
+            lh.set_lane(0);
+            lh.on_boundary(0);
+            lh.push_seg(CHUNK + GAP, CHUNK as u32, 0xEEEE); // rel 128 ≠ entry 0
+            lh.on_boundary(T);
+            assert_eq!(lh.phase_n[0], 0, "the head-holed script is discarded");
+        }
+        {
+            // The skipped own chunk (the mid-pass inline claim): the
+            // gap n_lanes · CHUNK = 128 between consecutive segments.
+            let mut lg = ResLog::new(true, false, 2);
+            lg.set_lane(0);
+            lg.on_boundary(0);
+            lg.push_seg(0, CHUNK as u32, 0x1234); // own chunk 0 [0, 64)
+            // own chunk 2 [128, 192) SKIPPED (the inline claim) — the
+            // continuation starts at own chunk 4 (256).
+            let mut first = 4 * CHUNK;
+            while first + CHUNK <= lane_span_exit(T, 0, 2) {
+                lg.push_seg(first, CHUNK as u32, 0x5678);
+                first += CHUNK + GAP;
+            }
+            lg.on_boundary(T);
+            assert_eq!(lg.phase_n[0], 0, "the skipped-own-chunk script is discarded");
+        }
+        {
+            // The tail hole: the tiling ends short of the sub-grid exit.
+            let mut lt = ResLog::new(true, false, 2);
+            lt.set_lane(0);
+            lt.on_boundary(0);
+            let mut first = 0u64;
+            while first + CHUNK <= 7872 - (CHUNK + GAP) {
+                lt.push_seg(first, CHUNK as u32, 0x9ABC);
+                first += CHUNK + GAP;
+            }
+            lt.on_boundary(T);
+            assert_eq!(lt.phase_n[0], 0, "the tail-holed script is discarded");
+        }
+        // THE ARMING: the orbit (the phase repeats at the length-aligned
+        // offset) arms the per-lane script — THE TWO-LANE UNLOCK.
+        {
+            let mut log = ResLog::new(true, false, 2);
+            log.set_lane(1);
+            // The orbit under the 2-lane grid: the phase modulus is 128
+            // and 7,903 mod 128 = 125 (gcd(125, 128) = 1) — the full
+            // 128-phase orbit. Drive one full orbit + one repeat.
+            let grid = 128u64;
+            for k in 0..=grid {
+                let rb = k * T;
+                log.on_boundary(rb);
+                if log.replaying {
+                    break;
+                }
+                // lane 1's own tiling of [rb, rb + T): the head partial
+                // (a mid-own-chunk boundary), the full own chunks (the
+                // CHUNK + GAP stride), the tail partial (a mid-own-chunk
+                // next boundary).
+                let entry = lane_span_entry(rb, 1, 2);
+                let exit = lane_span_exit(rb + T, 1, 2);
+                let mut first = entry;
+                let chunk_end = (entry / CHUNK + 1) * CHUNK;
+                if entry % CHUNK != 0 && chunk_end <= exit {
+                    log.push_seg(first, (chunk_end - first) as u32, 0xD4D4);
+                    first = chunk_end + GAP;
+                }
+                while first + CHUNK <= exit {
+                    log.push_seg(first, CHUNK as u32, 0xD5D5);
+                    first += CHUNK + GAP;
+                }
+                if first < exit {
+                    log.push_seg(first, (exit - first) as u32, 0xD6D6);
+                }
+            }
+            assert!(
+                log.replaying,
+                "the two-lane orbit must ARM the per-lane script (replayed {})",
+                log.replayed_passes
+            );
+        }
+        // THE NO-DRIFT DEGENERATION: at n_lanes == 1 the helpers give
+        // the R37c operands verbatim — the one-lane scripts seal under
+        // the generalized law exactly as before.
+        for rb in [0u64, 5, 64, 100, T] {
+            assert_eq!(
+                lane_span_entry(rb, 0, 1),
+                rb,
+                "n=1 entry: the identity (rb {rb})"
+            );
+            assert_eq!(
+                lane_span_exit(rb, 0, 1),
+                rb,
+                "n=1 exit: the R37c operand (rb {rb})"
+            );
+        }
+    }
+
+    /// R38/L2: THE TWO-LANE ELISION'S ENGINE PARITY + ENGAGEMENT — the
+    /// champion shape (2 workers, the elision FORCED) on the mini tape:
+    /// the per-lane phase scripts arm after the 2-lane orbit (the grid
+    /// 128; 7,903 mod 128 = 125, gcd = 1 — the full 128), every later
+    /// pass replays on BOTH lanes, and the harvested tuples are
+    /// BIT-EXACT against the sequential references (the fold consumes
+    /// both lanes' replayed records interleaved in the static chunk
+    /// grid — Theorem 23(b)'s merge). The multi-boundary collector
+    /// keeps the machines' bracket sequence aligned with the pass
+    /// sequence; the fallbacks stay at the steady shape's zero.
+    #[test]
+    fn t_r38c_replay_parity_two_lane() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        // The 2-lane orbit is 128 (the grid period doubles): 136
+        // measured passes = the recording orbit (128) + 8 replayed.
+        const PASSES: u64 = 136;
+        let (got, (replayed, live, fb, recs), fused) = r36e_drive_n(&gt, &sched, PASSES, 2);
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R38/L2: the two-lane replayed tuples diverged from the sequential references"
+        );
+        // THE ENGAGEMENT LAWS (doubled — each lane's machine steps at
+        // every boundary): the workers crossed every boundary on BOTH
+        // lanes, the live passes are the two lanes' recording orbits,
+        // and the replays dominate after the orbit.
+        let crossed = replayed + live;
+        assert!(
+            crossed >= 2 * PASSES && crossed <= 2 * (PASSES + 4),
+            "R38/L2 boundary count: crossed {crossed}, 2x{PASSES} \
+             (replayed {replayed}, live {live})"
+        );
+        assert!(
+            replayed >= 8,
+            "R38/L2 engagement: only {replayed} replayed passes on the two lanes \
+             (the orbit 128 needs 136 passes)"
+        );
+        assert!(recs > 0, "R38/L2 no records emitted");
+        assert!(
+            fused > 0,
+            "R38/L2 the call fusion never engaged (fused {fused})"
+        );
+        // The fallbacks: the steady shape carries none (the cells' mini
+        // drive has no assist episodes; the coverage law's discard faces
+        // are the unit cell's).
+        assert_eq!(fb, 0, "R38/L2 fallbacks on the steady two-lane shape (fb {fb})");
+    }
+
+    /// R40: THE DUAL-PRODUCER PARITY DRIVER — the r36e shape (the
+    /// pipelined transport + the forced rxdesc/res-replay fabric + the
+    /// R32 ledger) with the dual split armed at the SS regime's proof:
+    /// P1's engine on a scoped thread, the odd batches' dispatch
+    /// suppressed to P1's script, P0's lane-0 drain, and the
+    /// position-keyed boundary merge. Returns the per-pass tuples and
+    /// the engagement telemetry.
+    ///
+    /// R40c: `inject` — THE ADAPTIVE POISON LEVER (the poison cell's
+    /// deterministic trigger): `Some(k)` poisons at the k-TH pass after
+    /// the arm (the arm's driven pass + k), at batch 5 — MID-PASS. The
+    /// injection advances the transport's master write barrier once at
+    /// that pass's batch: the ledger's Guard 2 truncates the template,
+    /// the try_replay falls to the live scan, the harness's poison hook
+    /// fires (guaranteed ARMED — the target is arm-relative, closing
+    /// the late-arm race the absolute-pass form hung on), and the run
+    /// continues through the zombie lane-split (the permanent
+    /// fallback's law). `None` = the clean run. The arm gate also
+    /// carries the script-clean clause (`dual_script_clean` — never
+    /// arm on a truncated/partial template).
+    fn r40_drive_n(
+        gt: &[u8],
+        sched: &nf_transport::sched_types::ReplaySchedule,
+        passes: u64,
+        inject: Option<u64>,
+    ) -> (Vec<(u64, u64, u64)>, (u64, u64, u64, u64, Option<(u64, u64)>)) {
+        let construction = r32_prog(0);
+        let fabric =
+            HydraFabric::spawn_pinned_full_opts(2, &[], true, true, true, true, true, Some(true));
+        let mut t = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+            gt,
+            sched.clone(),
+            construction,
+            128,
+            None,
+            Some(r32_prog),
+            false,
+            true,
+            16,
+            true,
+            true,
+            true,
+            // R40d: ss=false — THE DUAL CELLS' TIMING LAW. The SS-window
+            // proof (`dual_arm_ready_ss`) needs the mailbox path's natural
+            // publication pacing (the ring's flow control bounds the main's
+            // sprint); the self-serve transport removes it and the main
+            // outruns the workers on loaded runners — the arm misses its
+            // 40-pass window (the fleet's shard-17 flake, run 39371901625
+            // attempt 3). The transport self-serve carries its own cells
+            // (t_r40d_*) and the non-dual integration cells below.
+            false,
+        );
+        if let Some(st) = fabric.rxdesc_state() {
+            assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
+        }
+        let gate = crate::dual::DualGate::new();
+        let mut seq = Sequencer::new();
+        let mut sink = HydraSpanSink::new(&fabric);
+        let ladder = crate::soa::ladder8_best();
+        let mut replay = crate::passreplay::PassReplay::new_forced(true);
+        // The ref pass (pass 1) runs live with a separate sink — the
+        // sustained bench's shape (also the generation boundary).
+        t.reset_pass(1, r32_prog(1));
+        {
+            let mut rseq = Sequencer::new_unboxed();
+            let mut ref_sink = HydraSpanSink::new(&fabric);
+            while t.next_batch() {
+                rseq.ingest_entries_ladder(t.entries(), t.now_ns(), &mut ref_sink, ladder);
+                ref_sink.drain_ready();
+            }
+            ref_sink.finish();
+        }
+        let got = std::thread::scope(|scope| {
+            let g = std::sync::Arc::clone(&gate);
+            let fref: &HydraFabric = &fabric;
+            scope.spawn(move || crate::dual::lane1_run(&g, fref, None));
+            let mut harvested = [(0u64, 0u64, 0u64); PASS_RING];
+            let mut got = Vec::new();
+            let mut armed = false;
+            // R40c: the arm-relative poison target (the driven pass id;
+            // the arm's pass + k — the late-arm race structurally closed).
+            let mut poison_target: Option<u64> = None;
+            for pass in 2..=passes + 1 {
+                // THE ARM (the harness's law verbatim: P1's inits from
+                // the MONO cursor, BEFORE dual_arm's reprojection). The
+                // R40c script-clean clause: never arm on a truncated
+                // template (a mid-pass master bump's partial re-record —
+                // the phantom-grid drift).
+                if !armed
+                    && sink.dual_arm_ready_ss(3)
+                    && replay.dual_batch_count() > 0
+                    && replay.dual_script_clean()
+                {
+                    let n = replay.dual_batch_count();
+                    let f1 = sink.dual_fold_pos_1_init();
+                    let rt1 = sink.dual_res_tail_1_init(&fabric);
+                    let pbase = sink.dual_pass_base_at_arm();
+                    gate.fill_script(n, |i| replay.dual_batch_summary(i));
+                    sink.dual_arm(std::sync::Arc::clone(&gate));
+                    gate.arm(sink.dual_first_pass(), f1, rt1, pbase);
+                    armed = true;
+                    if let Some(k) = inject {
+                        poison_target = Some(pass + k);
+                    }
+                    if std::env::var("R40_CELL_TRACE").is_ok() {
+                        eprintln!(
+                            "R40ARM first={} base={} pass_spans={} pass_msgs={}",
+                            gate.armed_from(), pbase,
+                            gate.script().pass_spans, gate.script().pass_msgs
+                        );
+                    }
+                }
+                if std::env::var("R40_CELL_TRACE").is_ok() {
+                    eprintln!("R40CELL pass={pass} next_span={} armed={} ss_wins={} batches={}",
+                        sink.dual_pass_base_at_arm(), sink.dual_is_armed(), sink.selfserve_wins(), replay.dual_batch_count());
+                }
+                t.reset_pass(pass, r32_prog(pass));
+                *seq = Sequencer::new_unboxed();
+                sink.begin_pass();
+                replay.begin_pass();
+                let mut bip = 0usize;
+                while t.next_batch() {
+                    // R40c: the poison lever — the foreign master write
+                    // at the arm-relative target's batch 5: the ledger's
+                    // Guard 2 fires on the very next try_replay (the
+                    // harness is GUARANTEED armed — the target is past
+                    // the arm).
+                    if poison_target == Some(pass) && bip == 5 {
+                        t.r32_debug_bump_master_version();
+                    }
+                    if sink.dual_is_armed() {
+                        sink.set_p1_suppress(bip & 1 == 1);
+                    }
+                    if !replay.try_replay(&t, &mut seq, &mut sink) {
+                        if sink.dual_is_armed() {
+                            gate.set_poison(sink.dual_current_pass(), bip as u64);
+                            sink.dual_disarm_poison();
+                            // R40c: the ledger's permanent live mode — the
+                            // truncated template is structurally partial
+                            // (the re-record starts at the failing batch);
+                            // a later pass's replay would hit Guard 3's
+                            // bounds assert. The live scan is the
+                            // permanent path.
+                            replay.poison_permanent();
+                            armed = false;
+                        }
+                        replay.begin_record(&t, &seq);
+                        {
+                            let mut rec_sink = replay.recorder(&mut sink);
+                            seq.ingest_entries_ladder(
+                                t.entries(),
+                                t.now_ns(),
+                                &mut rec_sink,
+                                ladder,
+                            );
+                        }
+                        replay.seal_batch(&seq);
+                    }
+                    bip += 1;
+                    sink.drain_ready();
+                }
+                replay.note_pass_end();
+                sink.end_pass();
+                let n = sink.harvest_completed(&mut harvested);
+                got.extend_from_slice(&harvested[..n]);
+            }
+            // R40c: the clean shutdown — the frontier FIRST (P1's exit
+            // sweep drains its remaining lane-1 territory to this end,
+            // publishing each pass's arrival, then posts p1_done —
+            // the finish's dual branch waits for exactly that).
+            gate.initiate_shutdown(sink.submission_frontier());
+            sink.finish();
+            let n = sink.harvest_completed(&mut harvested);
+            got.extend_from_slice(&harvested[..n]);
+            got
+        });
+        let (.., merges) = sink.dual_stats();
+        let eng = (
+            gate.armed_from(),
+            gate.p1_batches.load(std::sync::atomic::Ordering::Relaxed),
+            gate.j1.records.load(std::sync::atomic::Ordering::Relaxed),
+            merges,
+            gate.poison_at(),
+        );
+        (got, eng)
+    }
+
+    /// R40: THE DUAL-PRODUCER PARITY — the split engine vs the
+    /// sequential references, per-pass BIT-EXACT. The merged composite
+    /// (the position-keyed two-finger merge of the two journals), the
+    /// additive count (the suppressed odd-batch dispatch + P1's script
+    /// totals), and P0's msg-hash chain must reproduce the mono
+    /// tuples for EVERY pass — the same oracle the sustained harness
+    /// asserts, carried through the split.
+    #[test]
+    fn t_r40_parity_dual_vs_refs() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        // Enough passes to arm (the SS regime proves itself ~pass 5)
+        // and run ~35 dual passes.
+        const PASSES: u64 = 40;
+        let (got, (armed_from, p1_batches, p1_records, merges, poison)) =
+            r40_drive_n(&gt, &sched, PASSES, None);
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R40: the dual split's tuples diverged from the sequential references"
+        );
+        // THE ENGAGEMENT LAWS: the split armed, P1's engine ran (the
+        // drain journaled), the boundary merge fired for every dual
+        // pass, and the steady regime never poisoned.
+        assert!(armed_from > 0, "R40: the dual never armed (SS regime?)");
+        assert!(
+            p1_records > 0,
+            "R40: P1's lane-1 drain never journaled (p1_records 0)"
+        );
+        assert!(merges > 0, "R40: no boundary merges fired");
+        assert!(poison.is_none(), "R40: the steady regime poisoned (unexpected)");
+        eprintln!(
+            "R40_PARITY_DIAGNOSTIC armed_from={armed_from} p1_batches={p1_batches} p1_records={p1_records} merges={merges} poison={poison:?}"
+        );
+    }
+
+    /// R40c: THE POISON-FALLBACK PARITY — the permanent fallback's
+    /// end-to-end law. A foreign master write injected MID-PASS at a
+    /// chosen (pass, batch) breaks the frozen-master determinism
+    /// contract; the ledger's Guard 2 truncates the template, the
+    /// harness's poison hook fires (the gate poisoned at the exact
+    /// cursor, the disarm, P1's terminal publication), and the rest of
+    /// the run continues through THE ZOMBIE lane-split (P0 owns both
+    /// lanes' drains — the mono interleave can never resume) with the
+    /// post-poison passes re-recorded then REPLAYED mono. EVERY pass's
+    /// tuple must still be BIT-EXACT against the sequential references
+    /// — the poison is a scheduling event, never a value event — and
+    /// the completion's overlap formula (`count_1 −
+    /// odd_totals_before(poison_batch)`, saturating) must price P1's
+    /// mid-pass contribution exactly (the mid-pass injection, batch 5
+    /// of 22: P1 dispatched ~2-3 odd batches of the poison pass).
+    #[test]
+    fn t_r40_poison_fallback_parity() {
+        let gt = load_mini();
+        let cfg = ReplayConfig {
+            msgs_per_packet: Packetize::MtuBound(1400),
+            guarantee_coverage: true,
+            ..Default::default()
+        };
+        let sched = build_schedule(&gt, &cfg);
+        let mut want = Vec::new();
+        for k in 0..4u64 {
+            let mut t = ReplayTransport::new(&gt, sched.clone(), r32_prog(k));
+            want.push(seq_pass(&mut t, r32_prog(k)));
+        }
+        // 24 passes: the arm (~pass 6-8; the script-clean + claim-free
+        // gates may defer it a pass or two), 4 armed passes, the poison
+        // at the ARM+4 pass's batch 5 (MID-PASS — P1 has dispatched ~2-3
+        // of its odd batches, the racing-overlap face), then the zombie
+        // passes to the end.
+        const PASSES: u64 = 24;
+        const POISON_AFTER_ARM: u64 = 4;
+        let (got, (armed_from, p1_batches, p1_records, merges, poison)) =
+            r40_drive_n(&gt, &sched, PASSES, Some(POISON_AFTER_ARM));
+        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+            .map(|p| want[((p - 1) % 4) as usize])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "R40c: the poison fallback's tuples diverged (the zombie lane-split \
+             or the count formula broke)"
+        );
+        // THE POISON LAWS: the arm preceded the poison, the gate
+        // poisoned at the EXACT cursor (the ring id = armed_from + 4;
+        // the batch verbatim), and the engagement ran before it.
+        assert!(
+            armed_from > 0,
+            "R40c: the dual never armed (the poison never became reachable)"
+        );
+        assert_eq!(
+            poison,
+            Some((armed_from + POISON_AFTER_ARM, 5)),
+            "R40c: the poison cursor must be the exact (ring pass, batch)"
+        );
+        assert!(
+            p1_records > 0,
+            "R40c: P1 never journaled before the poison (the arm was dead)"
+        );
+        assert!(
+            merges > 0,
+            "R40c: no boundary merges fired (the zombie completions are dead)"
+        );
+        let _ = p1_batches;
+        eprintln!(
+            "R40_POISON_DIAGNOSTIC armed_from={armed_from} p1_batches={p1_batches} \
+             p1_records={p1_records} merges={merges} poison={poison:?}"
+        );
+    }
+
+    /// R38/L2: THE SHEAF'S ALGEBRA (Theorem 25 on the rotation ring) —
+    /// the per-lane composites and the m-way merge law, pinned at the
+    /// unit level:
+    ///   * THE DEGREE LAW: `K_first + K_second == the pass's spans`
+    ///     (the lanes' sub-grids PARTITION the pass — the fold's
+    ///     drained record sum equals the published degrees' sum; the
+    ///     engine-side collector asserts this at every boundary);
+    ///   * THE LANE COMPOSITE: `X_ℓ` == the serial compose of the
+    ///     lane's records in the lane's own (tape) order — the
+    ///     publication's semantics;
+    ///   * THE M-WAY LAW: under the round-robin grid the pass's
+    ///     composite is the INTERLEAVED tape-order product — NOT the
+    ///     2-factor `X_first ⨂ X_second` (the semidirect rotation ring
+    ///     is order-carrying; the 2-factor closed form is the
+    ///     BLOCK-SPLIT instantiation — Theorem 25's "2m under m-way
+    ///     interleaving" — and the engine's fold's static-order drain
+    ///     IS that merge); under block-split the 2-factor form IS
+    ///     exact (the theorem's own instantiation, pinned here as the
+    ///     boundary of the law).
+    #[test]
+    fn t_r38c_sheaf_degree_law() {
+        // THE ENGINE'S PATTERN: one record per own chunk, the strict
+        // a,b,a,b chunk alternation (the composite records end at chunk
+        // ends — the fold's lane grid switches there), with the pass's
+        // real degree mix (the full-64 interiors + the boundary
+        // partials). The uniform-degree trap (every k equal, and
+        // especially all-64 where 13·64 ≡ 0 mod 64 makes every compose
+        // a pure XOR) hides the order — the partials carry it.
+        const KS: [u32; 8] = [64, 64, 47, 31, 31, 31, 64, 33];
+        const TOTAL: u64 = 365; // Σ KS
+        let mut recs_lane0 = Vec::new();
+        let mut recs_lane1 = Vec::new();
+        let mut tape_order = Vec::new();
+        for c in 0..8u64 {
+            let rec = (KS[c as usize], 0x1000_0000u64 + c * 0x0101_0203_0405_0607);
+            tape_order.push(rec);
+            // record c is chunk c's composite — the owner is c % 2.
+            if c % 2 == 0 {
+                recs_lane0.push(rec);
+            } else {
+                recs_lane1.push(rec);
+            }
+        }
+        // THE LANE COMPOSITES (the publication's semantics).
+        let x0 = recs_lane0
+            .iter()
+            .fold((0u32, 0u64), |a, &b| crate::sink::seg_compose(a, b));
+        let x1 = recs_lane1
+            .iter()
+            .fold((0u32, 0u64), |a, &b| crate::sink::seg_compose(a, b));
+        // THE DEGREE LAW: the sub-grids partition the pass.
+        assert_eq!(
+            x0.0 as u64 + x1.0 as u64,
+            TOTAL,
+            "the degree law: the lanes' sub-grids partition the pass"
+        );
+        // THE M-WAY LAW: the tape-order product (the fold's merge) vs
+        // the 2-factor form — NOT equal under interleaving (distinct
+        // Bs, non-commutative semidirect compose).
+        let p_tape = tape_order
+            .iter()
+            .fold((0u32, 0u64), |a, &b| crate::sink::seg_compose(a, b));
+        let p_2factor = crate::sink::seg_compose(x0, x1);
+        assert_ne!(
+            p_tape, p_2factor,
+            "the m-way law: the interleaved product is NOT the 2-factor form (the \
+             rotation ring is order-carrying — the engine's static-order drain IS \
+             the m-way Theorem-25 merge)"
+        );
+        // …and the tape-order product's DEGREE still equals the total
+        // (the merge's degree coordinate is commutative).
+        assert_eq!(p_tape.0 as u64, TOTAL);
+        // THE BLOCK-SPLIT INSTANTIATION (the 2-factor closed form's own
+        // domain): two CONTIGUOUS blocks — the 2-factor form IS exact.
+        {
+            let blocks: [Vec<(u32, u64)>; 2] =
+                [tape_order[..4].to_vec(), tape_order[4..].to_vec()];
+            let b0 = blocks[0]
+                .iter()
+                .fold((0u32, 0u64), |a, &b| crate::sink::seg_compose(a, b));
+            let b1 = blocks[1]
+                .iter()
+                .fold((0u32, 0u64), |a, &b| crate::sink::seg_compose(a, b));
+            let p = tape_order
+                .iter()
+                .fold((0u32, 0u64), |a, &b| crate::sink::seg_compose(a, b));
+            assert_eq!(
+                crate::sink::seg_compose(b0, b1),
+                p,
+                "block-split: the 2-factor closed form IS exact (Theorem 25's own \
+                 instantiation — S ⨂ X_first ⨂ X_second)"
+            );
+        }
+    }
+
+    /// R37b: THE FALLBACK GRID LAW — the re-derivation's pure
+    /// arithmetic (the extracted `fallback_grid`), adversarial: every
+    /// eval position class (the own-chunk start, the mid-own-chunk
+    /// resume, the own-chunk END — the foreign-chunk START coincidence,
+    /// the exact geometry of the CI 13-shard failure: lane 0 holding
+    /// span 98880's record) × the lane counts 1/2/3/4 × every lane
+    /// index. THE LAW: the walk's start is never below the lane's own
+    /// grid — `walk_start >= chunk_lo` and `walk_start < chunk_lo +
+    /// CHUNK` (the walk stays inside its own chunk) — and at n_lanes ==
+    /// 1 the clamp is the identity (no foreign chunks: the R36-E scope
+    /// gate's mask). The pre-clamp arithmetic (the naive `gid = eval`)
+    /// violates the law exactly at the coincidence — the unit pin of
+    /// the two-lane unlock's exposed class.
+    #[test]
+    fn t_r37_fallback_grid_law() {
+        for n_lanes in [1u64, 2, 3, 4] {
+            for lane_idx in 0..n_lanes {
+                // The eval cursor is an OWN-chunk position by
+                // construction (segments never cross chunk ends): every
+                // own chunk c of this lane, at every offset within it.
+                let first_own = lane_idx; // the gen re-anchor's start
+                for c in first_own..first_own + 9 * n_lanes {
+                    if c % n_lanes != lane_idx {
+                        continue;
+                    }
+                    let base = c * CHUNK;
+                    for off in 0..=CHUNK {
+                        let eval = base + off;
+                        let (chunk_lo, walk_start) = fallback_grid(eval, lane_idx, n_lanes);
+                        // THE LAW: the walk never starts below the lane's
+                        // own grid, and stays within its own chunk.
+                        assert!(
+                            walk_start >= chunk_lo,
+                            "walk below the lane grid: eval {eval} lane {lane_idx}/{n_lanes} \
+                             -> lo {chunk_lo} start {walk_start}"
+                        );
+                        assert!(
+                            walk_start < chunk_lo + CHUNK,
+                            "walk past the lane chunk: eval {eval} lane {lane_idx}/{n_lanes} \
+                             -> lo {chunk_lo} start {walk_start}"
+                        );
+                        assert!(
+                            chunk_lo % (n_lanes * CHUNK) / CHUNK % n_lanes == lane_idx,
+                            "chunk_lo left the lane grid: lo {chunk_lo} lane {lane_idx}/{n_lanes}"
+                        );
+                        // The own-chunk interior: the identity (eval stays).
+                        // The own-chunk END (the coincidence): the clamp.
+                        if off < CHUNK {
+                            assert_eq!(
+                                walk_start, eval,
+                                "interior eval must be preserved (the mid-chunk resume)"
+                            );
+                        } else {
+                            // THE COINCIDENCE: eval at the own chunk's end
+                            // == the next (foreign) chunk's start — the
+                            // clamp jumps to the lane's next own chunk.
+                            if n_lanes == 1 {
+                                // The next chunk is ALSO this lane's: the
+                                // re-derivation lands on eval itself.
+                                assert_eq!(chunk_lo, eval);
+                                assert_eq!(walk_start, eval);
+                            } else {
+                                assert!(
+                                    walk_start > eval,
+                                    "the coincidence must clamp (eval {eval} lane \
+                                     {lane_idx}/{n_lanes} start {walk_start})"
+                                );
+                                assert_eq!(
+                                    walk_start % CHUNK,
+                                    0,
+                                    "the clamp lands on a chunk boundary"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// R39a: THE SEGMENT CAPACITY LAW'S COMPOSITION EXACTNESS — the
+    /// Shard-28 SegAcc::push8 overflow's guard (the len-0-index-0 panic
+    /// face) works by flushing the in-flight segment BEFORE a push that
+    /// would cross the 64-span law. The flush is legal IFF an extra
+    /// segment boundary is composition-exact: the split chain's
+    /// concatenated application must equal the unsplit application for
+    /// every split point. This cell pins that law directly on SegAcc
+    /// through the public flush surface (the walk's own emission path).
+    #[test]
+    fn t_r39a_segacc_capacity_composition_law() {
+        // Deterministic value stream (the spans' raw values).
+        let vals: Vec<u64> = (0..131u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+        // The consumer's application of a composite record (k, B) —
+        // the REAL surface (`sink::fold_compose_apply`), not a local
+        // re-implementation: the split chain must compose against the
+        // consumer the walk actually feeds.
+        use crate::sink::{fold_compose_apply as apply, fold_compose_b, fold_term};
+        let mut slots = [Res {
+            span_id: 0,
+            aux: 0,
+            value: 0,
+        }; RES_CAP];
+        // THE UNSPLIT REFERENCE: the whole stream as ONE 131-span
+        // composite. A 131-span segment is structurally beyond SegAcc's
+        // 64-slot buffer (the 64-span law) — so the reference is the
+        // ALGEBRA's own closed form, `fold_compose_b` over the full
+        // premultiplied term stream (the same compose `flush` runs, on
+        // an unbounded slice): the composition law the guard relies on
+        // is exact for EVERY k, not just k ≤ 64, and this is the k=131
+        // witness.
+        let terms: Vec<u64> = vals.iter().map(|&v| fold_term(v)).collect();
+        let k_w: u32 = 131;
+        let b_w = fold_compose_b(&terms);
+        // THE GUARD'S SPLIT CHAIN: the walk's capacity law — a full
+        // buffer flushes FIRST (the extra boundary), the push lands in
+        // the fresh segment.
+        let mut recs: Vec<(u32, u64)> = Vec::new();
+        let mut acc = SegAcc::new();
+        for (i, v) in vals.iter().enumerate() {
+            if acc.len == 64 {
+                if let Some((_, k, b)) = acc.flush(&mut slots, 0, &mut 0) {
+                    recs.push((k, b));
+                }
+            }
+            acc.push(i as u64, *v);
+            assert!(acc.len <= 64, "the raw push crossed the 64-span law");
+        }
+        if let Some((_, k, b)) = acc.flush(&mut slots, 0, &mut 0) {
+            recs.push((k, b));
+        }
+        // THE LAW: the split chain composes to the unsplit application.
+        let h_split = recs.iter().fold(0u64, |h, (k, b)| apply(h, *k, *b));
+        let h_whole = apply(0, k_w, b_w);
+        assert_eq!(h_split, h_whole, "the capacity split broke composition");
+        // The splits tile exactly, each within the 64-span law.
+        let mut seen = 0u32;
+        for (k, _) in &recs {
+            assert!(*k <= 64, "a segment exceeded the 64-span law: k={k}");
+            seen += k;
+        }
+        assert_eq!(seen, 131, "the splits must tile the stream exactly");
+        // The push8 face: a full buffer + a group push must flush first
+        // (the Shard-28 geometry: 64 buffered, the group arrives).
+        let mut acc8 = SegAcc::new();
+        for i in 0usize..8 {
+            acc8.push8((i as u64) * 8, &[vals[i * 8]; 8]);
+        }
+        assert_eq!(acc8.len, 64, "eight groups must fill the buffer exactly");
+        if acc8.len + 8 > 64 {
+            if let Some((_, k, b)) = acc8.flush(&mut slots, 0, &mut 0) {
+                recs.push((k, b));
+            }
+        }
+        acc8.push8(512, &[7u64; 8]);
+        assert_eq!(acc8.len, 8, "the guarded group push lands post-flush");
+    }
+
+    /// R39a: THE WALK-ENTRY GUARD LAWS — the containment predicate and
+    /// the record-window snap, unit-level. LAYER 2: the eval cursor must
+    /// sit in [chunk_lo, chunk_lo+CHUNK] at every walk entry (the closed
+    /// end is the chunk-end flush's legal state); a violation resyncs
+    /// positionally via fallback_grid — the resync output must (a) satisfy
+    /// the containment predicate, (b) never move backward, (c) land on
+    /// the lane's own grid. LAYER 3: eval below the adopted record's base
+    /// snaps forward to it (the mid-chunk publish-split hole's spans are
+    /// not this lane's to evaluate).
+    #[test]
+    fn t_r39a_walk_entry_guard_laws() {
+        // LAYER 2 — the containment + resync law across lane shapes.
+        for n_lanes in [1u64, 2, 3, 4] {
+            for lane_idx in 0..n_lanes {
+                let own0 = lane_idx * CHUNK;
+                // The desync faces: eval far AHEAD of a stale chunk_lo
+                // (the emission advanced by several own chunks), and a
+                // mid-chunk ahead position.
+                for eval in [
+                    own0 + 5 * n_lanes * CHUNK,
+                    own0,
+                    own0 + 3 * n_lanes * CHUNK + 17,
+                ] {
+                    let chunk_lo = own0; // the stale cursor
+                    let contained = eval >= chunk_lo && eval <= chunk_lo + CHUNK;
+                    if !contained {
+                        let (lo, ws) = fallback_grid(eval, lane_idx, n_lanes);
+                        // (a) the output is contained.
+                        assert!(
+                            ws >= lo && ws <= lo + CHUNK,
+                            "resync output not contained: eval {eval} -> lo {lo} ws {ws}"
+                        );
+                        // (b) never backward.
+                        assert!(ws >= eval, "resync moved backward: {eval} -> {ws}");
+                        // (c) the lane's own grid.
+                        assert_eq!(
+                            (lo / CHUNK) % n_lanes,
+                            lane_idx,
+                            "resync left the lane grid: lo {lo} lane {lane_idx}/{n_lanes}"
+                        );
+                    }
+                }
+                // The legal boundary state (eval == chunk_lo + CHUNK) is
+                // CONTAINED — the chunk-end flush owns it, never resync.
+                let lo = lane_idx * CHUNK;
+                let eval = lo + CHUNK;
+                assert!(eval >= lo && eval <= lo + CHUNK);
+            }
+        }
+        // LAYER 3 — the record snap: eval below the record's base snaps
+        // forward; eval at-or-above never moves (the predicate the walk
+        // applies verbatim).
+        for (eval, rec_base) in [(0u64, 0u64), (5, 5), (5, 21), (64, 128), (100, 64)] {
+            let snapped = eval.max(rec_base);
+            assert!(snapped >= rec_base, "the snap must clear the record base");
+            assert!(snapped >= eval, "the snap must never move backward");
+            assert!(
+                snapped == eval || eval < rec_base,
+                "a snap may only fire when eval < rec_base"
+            );
+        }
+    }
+
     /// R36-E: THE PHASE MACHINE'S LAWS, unit-level — the orbit fill (one
     /// phase slot per distinct boundary offset), the arming exactly when
     /// a phase repeats at a length-aligned offset, the LENGTH LAW's trip
@@ -8602,13 +11848,23 @@ mod tests {
     #[test]
     fn t_r36e_phase_machine_laws() {
         const T: u64 = 7_903; // the mini tape's span count (T mod 64 = 47)
+        // The tiled recording: segments of CHUNK (the chunk-grid break
+        // discipline) with the pass-tail partial, covering [rb, rb+T).
+        let tile = |log: &mut ResLog, rb: u64| {
+            let mut first = rb;
+            while first < rb + T {
+                let k = (rb + T - first).min(CHUNK) as u32;
+                log.push_seg(first, k, 0x1111);
+                first += k as u64;
+            }
+        };
+        let n_tile = ((T + CHUNK - 1) / CHUNK) as u32;
         let mut log = ResLog::new(true, false, 1);
         // Pass 1: the base-0 boundary opens the phase-0 recording.
         log.on_boundary(0);
         assert!(log.recording, "the first boundary must open the recording");
-        log.push_seg(0, 64, 0x1111);
-        log.push_seg(64, 64, 0x2222);
-        // Pass 2: the phase-0 log SEALS (2 segments) + the length is
+        tile(&mut log, 0);
+        // Pass 2: the phase-0 log SEALS (the tiling) + the length is
         // learned + the phase-47 recording opens immediately (the
         // machine always leaves the walk in the recording state for a
         // fresh phase).
@@ -8616,8 +11872,8 @@ mod tests {
         assert!(log.recording, "the fresh phase re-opens the recording");
         assert_eq!(log.pass_len, T, "the length law learns the pass length");
         assert_eq!(log.phase, (T % 64) as usize);
-        assert_eq!(log.phase_n[0], 2, "the phase-0 log holds 2 segments");
-        log.push_seg(0, 32, 0x3333);
+        assert_eq!(log.phase_n[0], n_tile, "the phase-0 log holds the tiling");
+        tile(&mut log, T);
         // The orbit: drive boundaries 3..=64 (each a fresh phase — the
         // mini's orbit is the full 64) — no arming until a repeat.
         for k in 2..64u64 {
@@ -8628,14 +11884,14 @@ mod tests {
                 k + 1
             );
             assert!(log.recording, "each fresh phase records (pass {})", k + 1);
-            log.push_seg(0, 48, 0x4444);
+            tile(&mut log, k * T);
         }
         // Pass 65: the phase 0 repeats at a length-aligned offset (64*T)
-        // — ARMED. The script is the pass-1 recording (2 segments).
+        // — ARMED. The script is the pass-1 recording (the tiling).
         log.on_boundary(64 * T);
         assert!(log.replaying, "the phase-0 repeat must arm the replay");
         assert_eq!(log.rp_next, 0);
-        assert_eq!(log.rp_end, 2);
+        assert_eq!(log.rp_end, n_tile);
         assert_eq!(log.replayed_passes, 1);
         // THE LENGTH LAW'S TRIP: the next boundary advances a DIFFERENT
         // delta — the whole log resets and the phase re-records.
@@ -8647,23 +11903,72 @@ mod tests {
             "the reset truncated the whole store (the fresh bracket is empty)"
         );
         assert_eq!(log.pass_len, 0, "the length is unlearned after the reset");
+        // R37c: THE COVERAGE LAW — a HEAD-HOLED recording (the walk
+        // resuming past the boundary: the inline episode's chunk skips
+        // carry the eval cursor across without a crossing, the head
+        // spans come from the inline ring and never enter the script)
+        // is discarded at the close; the phase re-records at its next
+        // boundary.
+        {
+            let mut lh = ResLog::new(true, false, 1);
+            lh.on_boundary(0);
+            lh.push_seg(3_744, 64, 0xEEEE);
+            lh.push_seg(3_744 + 64, 64, 0xEFEF);
+            lh.on_boundary(T);
+            assert_eq!(lh.phase_n[0], 0, "the head-holed script is discarded");
+            lh.on_boundary(64 * T);
+            assert!(
+                lh.recording,
+                "the head-holed phase re-records on its next boundary"
+            );
+        }
+        // R37c: the MIDDLE GAP (a mid-pass inline interlude) — same law.
+        {
+            let mut lg = ResLog::new(true, false, 1);
+            lg.on_boundary(0);
+            lg.push_seg(0, 64, 0x1234);
+            lg.push_seg(128, 64, 0x5678); // the gap [64, 128)
+            lg.on_boundary(T);
+            assert_eq!(lg.phase_n[0], 0, "the gapped script is discarded");
+        }
+        // R37c: the TAIL HOLE (a tail assist cuts the recording short) —
+        // the tiling must end exactly at the pass length.
+        {
+            let mut lt = ResLog::new(true, false, 1);
+            lt.on_boundary(0);
+            let mut first = 0u64;
+            while first < T - 64 {
+                lt.push_seg(first, 64, 0x9ABC);
+                first += 64;
+            }
+            lt.on_boundary(T);
+            assert_eq!(lt.phase_n[0], 0, "the tail-holed script is discarded");
+        }
         // A grid-aligned length regime (T2 = 8,192 = 64*128: the orbit is
         // exactly 1 — every boundary repeats the phase) — the arming law
         // and the alignment trip on a fresh machine.
         const T2: u64 = 8_192;
         let mut log2 = ResLog::new(true, false, 1);
         log2.on_boundary(0);
-        log2.push_seg(0, 64, 0xAAAA);
+        for first in (0..T2).step_by(CHUNK as usize) {
+            log2.push_seg(first, CHUNK as u32, 0xAAAA);
+        }
         log2.on_boundary(T2);
         assert_eq!(log2.pass_len, T2);
         assert_eq!(log2.phase, 0, "T2 mod 64 == 0: the same phase");
-        log2.push_seg(0, 64, 0xBBBB);
+        for first in (T2..2 * T2).step_by(CHUNK as usize) {
+            log2.push_seg(first, CHUNK as u32, 0xBBBB);
+        }
         log2.on_boundary(2 * T2);
         assert!(
             log2.replaying,
             "the grid-aligned length arms on the first repeat"
         );
-        assert_eq!(log2.rp_end, 1, "the phase-0 script is the one segment");
+        assert_eq!(
+            log2.rp_end,
+            (T2 / CHUNK) as u32,
+            "the phase-0 script is the full tiling"
+        );
         // THE ALIGNMENT LAW'S TRIP: a rotated offset (the phase matches,
         // the offset is not a multiple of the length) resets.
         log2.on_boundary(2 * T2 + T2 / 2);
@@ -8751,3 +12056,33 @@ mod tests {
     }
 
 }
+
+    /// R39: the exact lane modulus's oracle — `LaneMod::rem(u)` must equal
+    /// `u % n` for every fleet lane count (the powers of two AND-path, the
+    /// odd/prime magic path) over the G–M domain's whole relevant range
+    /// (the dense low grid + the 2^32 boundary's neighborhood).
+    #[test]
+    fn t_r39_lane_mod_exactness() {
+        let lanes: [u64; 9] = [2, 3, 4, 5, 7, 8, 9, 16, 32];
+        for &n in &lanes {
+            let m = LaneMod::new(n);
+            for u in 0u64..200_000 {
+                assert_eq!(m.rem(u), u % n, "n={n} u={u}");
+            }
+            // The domain's upper neighborhood (grid positions at the
+            // 200B target's scale and the 2^32 boundary).
+            for &u in &[
+                1u64 << 28,
+                (1 << 28) + 12_345,
+                (1 << 31) - 1,
+                (1 << 32) - 1,
+                (1 << 32) - 2,
+                (1 << 31) + 987_654,
+            ] {
+                assert_eq!(m.rem(u), u % n, "n={n} u={u} (boundary)");
+            }
+        }
+        // The degenerate shapes: 0/1 lanes map everything to 0.
+        assert_eq!(LaneMod::new(0).rem(12345), 0);
+        assert_eq!(LaneMod::new(1).rem(12345), 0);
+    }

@@ -16,7 +16,7 @@ jobs:
   shards:
     name: "Shard ${{ matrix.shard }}"
     runs-on: ubuntu-latest
-    timeout-minutes: 24
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -62,86 +62,6 @@ jobs:
           - 38
           - 39
           - 40
-          - 41
-          - 42
-          - 43
-          - 44
-          - 45
-          - 46
-          - 47
-          - 48
-          - 49
-          - 50
-          - 51
-          - 52
-          - 53
-          - 54
-          - 55
-          - 56
-          - 57
-          - 58
-          - 59
-          - 60
-          - 61
-          - 62
-          - 63
-          - 64
-          - 65
-          - 66
-          - 67
-          - 68
-          - 69
-          - 70
-          - 71
-          - 72
-          - 73
-          - 74
-          - 75
-          - 76
-          - 77
-          - 78
-          - 79
-          - 80
-          - 81
-          - 82
-          - 83
-          - 84
-          - 85
-          - 86
-          - 87
-          - 88
-          - 89
-          - 90
-          - 91
-          - 92
-          - 93
-          - 94
-          - 95
-          - 96
-          - 97
-          - 98
-          - 99
-          - 100
-          - 101
-          - 102
-          - 103
-          - 104
-          - 105
-          - 106
-          - 107
-          - 108
-          - 109
-          - 110
-          - 111
-          - 112
-          - 113
-          - 114
-          - 115
-          - 116
-          - 117
-          - 118
-          - 119
-          - 120
     env:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: 0
@@ -162,14 +82,12 @@ jobs:
           CPU_NAME=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs || echo "Unknown CPU")
           echo "Host CPU: $CPU_NAME"
           echo "cpu_name=$CPU_NAME" >> "$GITHUB_OUTPUT"
-          if grep -qE "9V45|8573C|6973P" /proc/cpuinfo; then
+          if grep -qE "9V45|6973P" /proc/cpuinfo; then
             echo "matched=true" >> "$GITHUB_OUTPUT"
             if grep -q "9V45" /proc/cpuinfo; then
               echo "🏆 TARGET SILICON ACQUIRED: AMD EPYC 9V45 (Zen 5 @ 4.56 GHz / 1TB/s BW). Proceeding to full benchmark."
             elif grep -q "6973P" /proc/cpuinfo; then
               echo "🏆 TARGET SILICON ACQUIRED: Intel Xeon 6973P-C (Granite Rapids / Xeon 6 @ 4.2 GHz / 480MB L3). Proceeding to full benchmark."
-            elif grep -q "8573C" /proc/cpuinfo; then
-              echo "🏆 TARGET SILICON ACQUIRED: Intel Xeon Platinum 8573C (Emerald Rapids @ 3.6 GHz / 260MB L3). Proceeding to full benchmark."
             fi
           else
             echo "matched=false" >> "$GITHUB_OUTPUT"

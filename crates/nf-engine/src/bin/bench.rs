@@ -213,7 +213,27 @@ fn run_sustained_loop_5s(gt: &[u8], cal: &nf_engine::clock::ClockCalibration) ->
     let mut sink = SpanConformanceSink::new();
     let mut batch = FrameBatch::new();
 
+    // R40c-IV: THE ALLOC BISECT PROBE (HFT_DUAL_ALLOC_BISECT=1 — the
+    // 11r40 arm sets it): the dual arms carry exactly 2 in-window
+    // counter deltas (one transient allocation + its free — the
+    // counter sums both) that the mono arms do not; the probe prints
+    // the counter at every phase boundary so the fleet's log pinpoints
+    // the phase the pair lands in. Zero cost when disarmed.
+    let alloc_probe = std::env::var("HFT_DUAL_ALLOC_BISECT").as_deref() == Ok("1");
+    let probe = |tag: &str, base: (u64, u64)| {
+        if alloc_probe {
+            let (x, y) = GLOBAL.snapshot();
+            eprintln!(
+                "R40_ALLOC_BISECT {} delta={} (allocs {} deallocs {})",
+                tag,
+                (x - base.0) + (y - base.1),
+                x - base.0,
+                y - base.1
+            );
+        }
+    };
     let (a1, d1) = GLOBAL.snapshot();
+    let probe_base = (a1, d1);
     let start = Instant::now();
     let t_start_mono = read_monotonic_raw_ns();
 
@@ -508,11 +528,45 @@ fn run_hydra_sustained_5s(
             workers = n.max(1);
         }
     }
-    let (main_cpu, rx_cpu, worker_cpus) = nf_testkit::affinity::fabric_placement(workers);
+    // R40: THE DUAL-PRODUCER SPLIT (docs/52 — Champion-4T). The env
+    // gate is read BEFORE the window (the discipline); the placement
+    // inverts the ownership — P0 and P1 take the two physical cores'
+    // representatives, the workers their SMT siblings, the RX shares
+    // W0's cpu (the coherence dividend: every ring handoff becomes
+    // same-physical-core). HFT_DUAL_PRODUCER=0 (the default) keeps the
+    // proven distinct placement and never spawns P1 — the mono loop
+    // verbatim. The split also REQUIRES the tree journal (the merged
+    // two-lane flush is the only sound compose; HFT_TREE_FOLD=0 is the
+    // serial rollback — its call-order compose cannot take the merge).
+    let dual_env = std::env::var("HFT_DUAL_PRODUCER").as_deref() == Ok("1")
+        && workers == 2
+        && std::env::var("HFT_TREE_FOLD").as_deref() != Ok("0");
+    // R40c-II: the RX's pin law — the default keeps the FLEET-PROVEN
+    // W0-share shape (the RX on W0's logical cpu; run 39327552826's
+    // 11r40x arm: 53.6-63.8B). The complementary-sharing counterfactual
+    // (the RX on P0's own cpu) was REFUTED at -80% (12.5B — the
+    // park/publish cadence is a context-switch generator; see
+    // affinity::fabric_placement_dual's doc). HFT_DUAL_RX_P0=1 arms the
+    // refuted shape as the documented counterfactual. Read BEFORE the
+    // window (env::var allocates).
+    let dual_rx_p0 = std::env::var("HFT_DUAL_RX_P0").as_deref() == Ok("1");
+    let (main_cpu, rx_cpu, worker_cpus, p1_cpu) = if dual_env {
+        nf_testkit::affinity::fabric_placement_dual(workers, dual_rx_p0)
+    } else {
+        let (m, r, w) = nf_testkit::affinity::fabric_placement(workers);
+        (m, r, w, None)
+    };
+    // The dual arms only where the topology gave P1 a core.
+    let dual_env = dual_env && p1_cpu.is_some();
     if let Some(c) = main_cpu {
         let _ = nf_testkit::affinity::pin_current_to(c);
     }
     let fabric = nf_testkit::hydra::HydraFabric::spawn_pinned(workers, &worker_cpus);
+    // R40: P1 borrows the fabric for the run's life — the sustained
+    // arm is a one-shot per process (the verdicts print, main
+    // returns, the exit reaps the threads), so the box LEAKS and the
+    // fabric's own post-verdict Drop-join is subsumed by the exit.
+    let fabric: &'static nf_testkit::hydra::HydraFabric = Box::leak(fabric);
     let mut total_msgs = 0u64;
     let mut session_counter = 1000u64;
     // R23c: the affine-arm attach — same law as the burst arm (the
@@ -552,7 +606,7 @@ fn run_hydra_sustained_5s(
         transport.set_rxdesc(st);
     }
     let mut seq = Sequencer::new();
-    let mut sink = nf_testkit::hydra::HydraSpanSink::new(&fabric);
+    let mut sink = nf_testkit::hydra::HydraSpanSink::new(fabric);
 
     // R12: the vectorized watermark ladder (startup detection — outside
     // every measurement window; HFT_VEC_LADDER=0 is the rollback).
@@ -564,6 +618,25 @@ fn run_hydra_sustained_5s(
     // only under the frozen-master regime (rxbuild + session elision).
     // HFT_PASS_REPLAY=0 is the rollback (the live scan verbatim).
     let mut pass_replay = nf_testkit::passreplay::PassReplay::new();
+
+    // R40: THE DUAL-PRODUCER GATE + P1. The gate is built OUTSIDE the
+    // window (the allocs=0 law); P1 idles on the armed word (its own
+    // core — the pre-arm spin is PAUSE-hinted and bounded by the SS
+    // regime's ~4-pass proof) until the harness arms at a pass top.
+    // The engine, the arrival protocol, and the poison law live in
+    // nf_testkit::dual (docs/52's structural split; the cells:
+    // t_r40_*).
+    let gate: Option<std::sync::Arc<nf_testkit::dual::DualGate>> = if dual_env {
+        Some(nf_testkit::dual::DualGate::new())
+    } else {
+        None
+    };
+    let mut dual_armed = false;
+    if let Some(g) = &gate {
+        let gg = std::sync::Arc::clone(g);
+        let cpu = p1_cpu;
+        std::thread::spawn(move || nf_testkit::dual::lane1_run(&gg, fabric, cpu));
+    }
 
     // Untimed reference pass pins the per-pass tuple (identical bytes every
     // pass; only the session id changes, which cannot affect the tuple).
@@ -583,7 +656,7 @@ fn run_hydra_sustained_5s(
     let ref_tuple = {
         transport.reset_pass(1, initial_sess);
         *seq = Sequencer::new_unboxed();
-        let mut ref_sink = nf_testkit::hydra::HydraSpanSink::new(&fabric);
+        let mut ref_sink = nf_testkit::hydra::HydraSpanSink::new(fabric);
         ref_sink.begin_pass();
         while transport.next_batch() {
             seq.ingest_entries_ladder(transport.entries(), transport.now_ns(), &mut ref_sink, ladder);
@@ -612,6 +685,18 @@ fn run_hydra_sustained_5s(
     // the per-pass hash assert is disabled (count/msg_hash still asserted).
     // (Read BEFORE the allocation window — env::var allocates.)
     let null_diag = std::env::var("HFT_HYDRA_NULL").as_deref() == Ok("1");
+    // R39: THE GROUPED CONSUME's arm — the main-core submission sweep's
+    // coarse granularity (the producer pivot, Option A: the per-batch
+    // next_batch/wait/free/wake cycle amortizes over a group of k
+    // already-published batches; ONE wait + ONE free-cluster + ONE
+    // drain + ONE tsc-pair per group). Default 8 (the 4x-8x widening
+    // directive); 1 restores the verbatim per-batch cadence. Read BEFORE
+    // the window (env::var allocates).
+    let group_k: usize = std::env::var("HFT_BATCH_GROUP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|k| k.clamp(1, 32))
+        .unwrap_or(8);
     // R36-E: the eval-elision arm (HFT_RES_REPLAY — default ON; the
     // worker reads its own copy at spawn, this copy drives the verdict
     // line's engagement asserts). Read BEFORE the window (env::var
@@ -655,7 +740,27 @@ fn run_hydra_sustained_5s(
     // loop pass is pure replay, ALLOC_DELTA == 0 restored — the steady
     // state's own law. (env::var inside prebake allocates — pre-window.)
     let prebaked = fabric.prebake_sig_fabric();
+    // R40c-IV: THE ALLOC BISECT PROBE (HFT_DUAL_ALLOC_BISECT=1 — the
+    // 11r40 arm sets it): the dual arms carry exactly 2 in-window
+    // counter deltas (one transient allocation + its free — the
+    // counter sums both) that the mono arms do not; the probe prints
+    // the counter at every phase boundary so the fleet's log pinpoints
+    // the phase the pair lands in. Zero cost when disarmed.
+    let alloc_probe = std::env::var("HFT_DUAL_ALLOC_BISECT").as_deref() == Ok("1");
+    let probe = |tag: &str, base: (u64, u64)| {
+        if alloc_probe {
+            let (x, y) = GLOBAL.snapshot();
+            eprintln!(
+                "R40_ALLOC_BISECT {} delta={} (allocs {} deallocs {})",
+                tag,
+                (x - base.0) + (y - base.1),
+                x - base.0,
+                y - base.1
+            );
+        }
+    };
     let (a1, d1) = GLOBAL.snapshot();
+    let probe_base = (a1, d1);
     let start = Instant::now();
     let t_start_mono = read_monotonic_raw_ns();
 
@@ -679,6 +784,9 @@ fn run_hydra_sustained_5s(
     let mut d_work_ns: u64 = 0;
     let mut d_fold_ns: u64 = 0;
     let mut d_batches: u64 = 0;
+    // R39: the grouped consume's group count (the sweep's engagement —
+    // groups < batches/2 when k >= 2 is armed and the supply keeps up).
+    let mut d_groups: u64 = 0;
     let mut d_passes: u64 = 0;
     // R8 phase-2: exact emitted-body bytes from the golden tape (the CRC
     // demand denominator — computed once, outside every window).
@@ -702,6 +810,35 @@ fn run_hydra_sustained_5s(
         sess[7..10].copy_from_slice(&session_counter.to_be_bytes()[5..8]);
         session_counter += 1;
         pass += 1;
+
+        // R40: THE ARM — the SS regime's proof (≥3 self-serve windows,
+        // the toroidal steady epoch) + a complete ledger template arm
+        // the split at the pass top. The ORDER LAW: P1's cursors are
+        // computed from the MONO fold position BEFORE `dual_arm`
+        // reprojects the sink's own cursor onto lane 0.
+        if !dual_armed {
+            if let Some(g) = &gate {
+                // R40c: the script-clean clause — never arm on a
+                // truncated/partial template (a mid-pass master bump's
+                // re-record — the phantom-grid drift; the parity cell's
+                // catch).
+                if sink.dual_arm_ready_ss(3)
+                    && pass_replay.dual_batch_count() > 0
+                    && pass_replay.dual_script_clean()
+                {
+                    let n = pass_replay.dual_batch_count();
+                    let f1_init = sink.dual_fold_pos_1_init();
+                    let rt1 = sink.dual_res_tail_1_init(fabric);
+                    let pbase = sink.dual_pass_base_at_arm();
+                    g.fill_script(n, |i| pass_replay.dual_batch_summary(i));
+                    sink.dual_arm(std::sync::Arc::clone(g));
+                    let first = sink.dual_first_pass();
+                    g.arm(first, f1_init, rt1, pbase);
+                    dual_armed = true;
+                    probe("post-arm", probe_base);
+                }
+            }
+        }
 
         let t_r = tsc_now();
         transport.reset_pass(pass, sess);
@@ -734,40 +871,93 @@ fn run_hydra_sustained_5s(
         d_boundary_wait_ns += tsc_d(t_r, t_r1);
         d_boundary_open_ns += tsc_d(t_r1, t_r2);
 
-        // Fold drain every batch: keeps the result rings shallow and the
-        // ordered fold close behind submission (the overlap's slack is the
-        // in-flight ring capacity, not fold lag).
+        // Fold drain per GROUP (R39: the coarse-grained submission sweep —
+        // one next_group wait + one free-cluster + one drain + one tsc
+        // pair per group of up to `group_k` already-published batches;
+        // the ledger guards + the sink submit still run PER MEMBER
+        // verbatim, the order law is unchanged — only the batch-boundary
+        // ceremony amortizes). group_k == 1 degenerates to the verbatim
+        // per-batch cadence (the attribution arm's rollback).
+        // R40: the pass's batch counter (the dispatch parity's key —
+        // the LEDGER's batch sequence, not the group's local index).
+        let mut batch_in_pass = 0usize;
         loop {
             let t_w = tsc_now();
-            if !transport.next_batch() {
-                break;
+            let n = transport.next_group(group_k);
+            if n == 0 {
+                break; // EOS — the pass boundary
             }
             d_wait_ns += tsc_d(t_w, tsc_now());
             let t_b = tsc_now();
-            // R32: try the verdict replay first — a TRUE return means the
-            // frozen-master regime proved this batch is byte-identical to
-            // the recorded one and the recorded sink surface was re-issued
-            // (the workers still fold every message; only the redundant
-            // re-VALIDATION walk is elided). FALSE = record/live-scan the
-            // batch through the tee.
-            if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
-                pass_replay.begin_record(&transport, &seq);
-                {
-                    let mut rec_sink = pass_replay.recorder(&mut sink);
-                    seq.ingest_entries_ladder(
-                        transport.entries(),
-                        transport.now_ns(),
-                        &mut rec_sink,
-                        ladder,
-                    );
+            for j in 0..n {
+                transport.select_group_batch(j);
+                // R40: THE DISPATCH SPLIT — the odd batches' packed calls
+                // re-issue with the count/last-seq/G-INV SUPPRESSED (P1
+                // owns them from the script); the SS cursor arithmetic
+                // still runs (P0's next_span tracks the global frontier).
+                // The sink's own armed flag is the authority (it may
+                // have disarmed itself at begin_pass's non-SS poison —
+                // the local mirror lags that path).
+                if sink.dual_is_armed() {
+                    sink.set_p1_suppress(batch_in_pass & 1 == 1);
                 }
-                pass_replay.seal_batch(&seq);
+                // R32: try the verdict replay first — a TRUE return means
+                // the frozen-master regime proved this batch is
+                // byte-identical to the recorded one and the recorded
+                // sink surface was re-issued (the workers still fold every
+                // message; only the redundant re-VALIDATION walk is
+                // elided). FALSE = record/live-scan the batch through
+                // the tee.
+                if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
+                    // R40: THE POISON — the regime broke (a live re-scan):
+                    // publish the break point, disarm into the zombie
+                    // lane-split, and let the mono re-record proceed (the
+                    // script-direct count at the completion prices the
+                    // suppressed odd batches [0, pb) exactly).
+                    if sink.dual_is_armed() {
+                        if let Some(g) = &gate {
+                            g.set_poison(sink.dual_current_pass(), batch_in_pass as u64);
+                        }
+                        sink.dual_disarm_poison();
+                        // R40c: the ledger's permanent live mode — the
+                        // truncated template is structurally partial; a
+                        // later pass's replay would hit Guard 3's bounds
+                        // assert (fail-loud on a broken template).
+                        pass_replay.poison_permanent();
+                        dual_armed = false;
+                    }
+                    pass_replay.begin_record(&transport, &seq);
+                    {
+                        let mut rec_sink = pass_replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(
+                            transport.entries(),
+                            transport.now_ns(),
+                            &mut rec_sink,
+                            ladder,
+                        );
+                    }
+                    pass_replay.seal_batch(&seq);
+                }
+                batch_in_pass += 1;
             }
             let t_i = tsc_now();
             sink.drain_ready();
             d_work_ns += tsc_d(t_b, t_i);
             d_fold_ns += tsc_d(t_i, tsc_now());
-            d_batches += 1;
+            d_batches += n as u64;
+            d_groups += 1;
+        }
+        if alloc_probe && (pass == 2 || pass % 100_000 == 0) {
+            if alloc_probe {
+                let (x, y) = GLOBAL.snapshot();
+                eprintln!(
+                    "R40_ALLOC_BISECT loop-pass-{} delta={} (allocs {} deallocs {})",
+                    pass,
+                    (x - probe_base.0) + (y - probe_base.1),
+                    x - probe_base.0,
+                    y - probe_base.1
+                );
+            }
         }
         pass_replay.note_pass_end();
         let t_s = tsc_now();
@@ -789,7 +979,30 @@ fn run_hydra_sustained_5s(
     }
     // The single blocking drain of the whole run — INSIDE the window (the
     // last pass's verification is part of the measured work).
+    // R40c: the clean shutdown — the frontier FIRST (P1's exit SWEEP
+    // drains its remaining lane-1 territory to this end, publishing
+    // each pass's arrival from the script's totals, then posts
+    // p1_done — the finish's dual branch waits for exactly that; a
+    // bare shutdown word would freeze P1's cursor mid-stream and hang
+    // the finish on a lagging P1).
+    probe("pre-finish", probe_base);
+    // R40d: THE EXIT LATCH — armed BEFORE the shutdown word (P1's
+    // terminal park engages at its p1_done instead of tearing down:
+    // the thread's TWO heap frees — the spawn closure + the Thread
+    // inner — must land OUTSIDE the allocation counter's window; the
+    // harness releases AFTER the closing snapshot below. This is the
+    // "2 in-window counter deltas" fix — the allocs=0 law's last edge
+    // (HFT_DUAL_EXIT_HOLD=0 disarms; the 250ms bounded park makes a
+    // missing release a non-hang).
+    let exit_hold = std::env::var("HFT_DUAL_EXIT_HOLD").as_deref() != Ok("0");
+    if let Some(g) = &gate {
+        if exit_hold {
+            g.arm_exit_hold();
+        }
+        g.initiate_shutdown(sink.submission_frontier());
+    }
     sink.finish();
+    probe("post-finish", probe_base);
     let n = sink.harvest_completed(&mut harvested);
     for rec in &harvested[..n] {
         assert_sustained_pass(*rec, ref_tuple, null_diag);
@@ -800,6 +1013,11 @@ fn run_hydra_sustained_5s(
     let dt_ns = t_end_mono.saturating_sub(t_start_mono);
     let (a2, d2) = GLOBAL.snapshot();
     let alloc_delta = (a2 - a1) + (d2 - d1);
+    // R40d: THE EXIT LATCH's release — AFTER the closing snapshot: P1's
+    // teardown frees now land outside every measured window.
+    if let Some(g) = &gate {
+        g.release_exit();
+    }
 
     let sustained_rate = if dt_ns > 0 {
         ((total_msgs as f64) / (dt_ns as f64) * 1e9) as u64
@@ -810,13 +1028,15 @@ fn run_hydra_sustained_5s(
     if diag {
         let (rp_batches, rp_live, rp_passes, rp_rerecords) = pass_replay.stats();
         eprintln!(
-            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
+            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} groups={} group_k={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
             d_passes,
             d_reset_ns as f64 / 1e6,
             d_scan_ns as f64 / 1e6,
             d_end_ns as f64 / 1e6,
             d_pending_max,
             d_batches,
+            d_groups,
+            group_k,
             d_wait_ns as f64 / 1e6,
             d_work_ns as f64 / 1e6,
             d_fold_ns as f64 / 1e6,
@@ -829,6 +1049,17 @@ fn run_hydra_sustained_5s(
             rp_rerecords,
             body_bytes_per_msg,
             sustained_rate as f64 * body_bytes_per_msg / 1e9
+        );
+        // R37: the fold journal's engagement — the tree's flush count
+        // (≈ the completed boundaries + the rare capacity flushes),
+        // the journaled record count, and the max leaves per flush (the
+        // compose_max dial). live_len must be 0 at rest (the finish
+        // flushed the tail).
+        let (tree_on, flushes, overflows, records, compose_max, live_len) =
+            sink.fold_tree_stats();
+        eprintln!(
+            "FOLDTREE_DIAGNOSTIC sustained: tree={} flushes={} overflows={} records={} compose_max={} live_len={} (R37: the Blelloch-Galois tree fold — the 9-level up-sweep over the pass's journaled composite records, Theorems 19-22; HFT_TREE_FOLD=0 restores the serial chain)",
+            tree_on, flushes, overflows, records, compose_max, live_len
         );
         // R35: the boundary attribution — the transport re-arm wait vs
         // the sink pass-open work (the reset wall's split; the probe
@@ -937,6 +1168,67 @@ fn run_hydra_sustained_5s(
             pass_replay.enabled()
         );
     }
+    // R39: THE GROUPED CONSUME's verdict line — the producer pivot's
+    // Option A pricing row (the main-core submission sweep's coarse
+    // granularity). The engagement law: armed = group_k > 1, groups ==
+    // the next_group call count, batches/groups == the sweep's mean
+    // width (the R38L2 baseline at the per-batch cadence: 12.7M batches
+    // == 12.7M groups, wait_ms=1248 of the 4834ms scan on the 58.6B
+    // draw — the per-batch sync ceremony this lever amortizes).
+    println!(
+        "PR1_R39_GROUP_SWEEP_VERDICT rate={} groups={} batches={} mean_width={:.2} group_k={} armed={} (R39: the coarse-grained submission sweep — ONE wait + ONE free-cluster + ONE drain per group of already-published batches; the ledger guards + the sink submit stay per-member verbatim; HFT_BATCH_GROUP=1 restores the per-batch cadence)",
+        sustained_rate,
+        d_groups,
+        d_batches,
+        if d_groups > 0 {
+            d_batches as f64 / d_groups as f64
+        } else {
+            0.0
+        },
+        group_k,
+        group_k > 1
+    );
+    // R40: THE DUAL-PRODUCER SPLIT's verdict line — the structural
+    // split's pricing row (the engagement law: armed=true with
+    // armed_from > 0 and merges ≈ the dual passes; p1_batches ≈ half
+    // the ledger's batch count per dual pass; poison=false in the
+    // steady regime — any break falls to the zombie lane-split, the
+    // fail-safe that never silently corrupts). HFT_DUAL_PRODUCER=0 is
+    // the rollback (the mono loop verbatim, the proven placement).
+    if let Some(g) = &gate {
+        let (attached, _live, _passes, merges) = sink.dual_stats();
+        let poison = g.poison_at().is_some();
+        println!(
+            "PR1_R40_DUAL_PRODUCER_VERDICT rate={} attached={} armed_from={} merges={} p1_batches={} p1_records={} arrivals={} arrival_defers={} p1_parks={} poison={} (R40: the dual-producer split — P0's lane-0 drain + the suppressed odd-batch dispatch, P1's dedicated-core lane-1 engine, the position-keyed boundary merge of Theorem 23(b)'s static order; HFT_DUAL_PRODUCER=0 restores the mono loop verbatim)",
+            sustained_rate,
+            attached,
+            g.armed_from(),
+            merges,
+            g.p1_batches.load(std::sync::atomic::Ordering::Relaxed),
+            g.j1.records.load(std::sync::atomic::Ordering::Relaxed),
+            g.arrival_count(),
+            g.arrival_defers.load(std::sync::atomic::Ordering::Relaxed),
+            g.p1_parks.load(std::sync::atomic::Ordering::Relaxed),
+            poison
+        );
+    }
+    // R40d: THE ZERO-THREAD INGEST's verdict line — the self-serve
+    // transport's engagement row (armed=true on every frozen-regime
+    // run — construction-determined, never contention-dependent; the
+    // RX's own counters FREEZE at its retirement: rx_retired=true is
+    // the fifth-thread-gone signature; the folded sched law keeps its
+    // shape). HFT_SS_TRANSPORT=0 is the rollback (the mailbox path).
+    {
+        let (ss_armed, ss_passes, ss_rows) = transport.self_serve_stats();
+        println!(
+            "PR1_R40D_SELF_SERVE_VERDICT rate={} armed={} passes={} rows={} rx_retired={} (R40d: the zero-thread ingest — the frozen schedule walked by the consumer, the RX retired at the takeover: 4 threads on 4 vCPUs, no mailbox waits/frees/wakes on the steady path; HFT_SS_TRANSPORT=0 restores the mailbox)",
+            sustained_rate,
+            ss_armed,
+            ss_passes,
+            ss_rows,
+            transport.rx_retired()
+        );
+    }
     // R33: the producer-side elision's verdict line — the publication-
     // schedule replay + the parked-flag wake-skip's pricing row. The
     // engagement law: sched_replays ~= publications - the recording
@@ -1036,12 +1328,19 @@ fn run_hydra_sustained_5s(
             let n_workers = fabric.workers as u64;
             // THE ENGAGEMENT LAWS (the exit-0 discipline — the bench
             // asserts what the CI greps): on an armed run every loop
-            // pass replays (the per-worker boundary count == the pass
-            // count + the two gen re-anchors; the recording orbit and
-            // the fallbacks are the only live passes), the fallbacks
-            // stay at the assist's noise floor, and the fusion absorbs
-            // the emitter's per-32-span flush granularity.
-            if res_replay_on {
+            // pass replays on EVERY LANE (the per-worker boundary count
+            // == the pass count + the gen re-anchors; the recording
+            // orbit and the fallbacks are the only live passes), the
+            // fallbacks stay at the assist's noise floor, and the
+            // fusion absorbs the emitter's per-32-span flush
+            // granularity.
+            // R38/L2: the engagement law now covers the TWO-LANE shape —
+            // the per-lane phase scripts (the coverage law's sub-grid
+            // tiling) arm the elision on BOTH lanes: each lane's
+            // machine steps at every boundary (the multi-boundary
+            // collector's bracket discipline), so the counts scale by
+            // the worker count verbatim.
+            if res_replay_on && n_workers >= 1 {
                 let crossed = replayed + live;
                 assert!(
                     crossed >= n_workers * d_passes,
@@ -1059,6 +1358,17 @@ fn run_hydra_sustained_5s(
                     "R36-E engagement: zero replayed passes on an armed run"
                 );
             }
+            // R38/L2: the multi-boundary collector's sheaf telemetry —
+            // the boundary degree checks that matched vs missed (the
+            // jump episodes + the fresh-sink head; the steady regime
+            // dominates).
+            let (sheaf_checked, sheaf_missed) = sink.sheaf_stats();
+            eprintln!(
+                "SHEAFDIAGNOSTIC sustained: checked={} missed={} (R38/L2: Theorem 25's \
+                 asynchronous sheaf merge — the lanes' published epoch composites, the \
+                 boundary degree law; never waited on, never spun)",
+                sheaf_checked, sheaf_missed
+            );
             println!(
                 "PR1_R36_EVAL_ELISION_VERDICT rate={} elision={} replayed_passes={} live_passes={} fallbacks={} res_records={} fused_calls={} (R36-E: the worker eval elision — the res-record replay over the phase-segment logs + the main-side call fusion; the per-pass worker cost collapses from the span walk to the record emission; the guards: the frozen-master regime, the length law, the phase alignment, the inline guard, the per-pass tuple assert — docs/48)",
                 sustained_rate,
@@ -1068,6 +1378,40 @@ fn run_hydra_sustained_5s(
                 fb,
                 recs,
                 fused,
+            );
+        }
+        // R37: THE TREE-FOLD VERDICT — the journal's engagement on the
+        // engine surface (the drain's per-record h-dependency is gone;
+        // the boundary flush is the ⌈log₂ K⌉ up-sweep + one apply).
+        // Engagement laws (the exit-0 discipline): the tree armed,
+        // every completed boundary flushed (flushes >= passes — the
+        // boundary flushes + the rare capacity flushes), the journal
+        // EMPTY at rest (the finish flushed the tail), and the
+        // journaled records > 0 (the drain actually drained).
+        {
+            let (tree_on, flushes, overflows, records, compose_max, live_len) =
+                sink.fold_tree_stats();
+            if tree_on {
+                assert!(
+                    live_len == 0,
+                    "R37 engagement: the journal holds {live_len} leaves at rest \
+                     (the finish must flush the tail)"
+                );
+                assert!(
+                    flushes >= d_passes,
+                    "R37 engagement: {flushes} flushes < {d_passes} passes \
+                     (every completed boundary must flush)"
+                );
+                assert!(
+                    records > 0,
+                    "R37 engagement: zero journaled records on a fabric run"
+                );
+            }
+            let fold_ms = d_fold_ns as f64 / 1e6;
+            println!(
+                "PR1_R37_TREE_FOLD_VERDICT rate={} tree={} flushes={} overflows={} records={} compose_max={} fold_ms={:.1} workers={} (R37: the Blelloch-Galois tree fold — the pass fold's serial 2.08us chain replaced by the 9-level up-sweep over the journaled composite records at the boundary, Theorems 19-22; HFT_TREE_FOLD=0 restores the serial chain — docs/solution2.md)",
+                sustained_rate, tree_on, flushes, overflows, records, compose_max, fold_ms,
+                fabric.workers
             );
         }
     }

@@ -808,6 +808,7 @@ fn t_i7_prepatch_chaos_sustained_soak() {
         false,
         false, // R33-A: off — the patch-law soak is not the frozen-master regime
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
 
     // Deterministic LCG chaos — reproducible failure modes, no RNG dep.
@@ -944,6 +945,7 @@ fn t_f1_rxwarm_chaos_sustained_soak() {
         false,
         false, // R33-A: off — the patch-law soak is not the frozen-master regime
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).
@@ -1087,6 +1089,7 @@ fn t_f2_rxbuild_chaos_sustained_soak() {
         false,
         false, // R33-A: off — the patch-law soak is not the frozen-master regime
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
 
     // Deterministic LCG chaos (the I-7 soak's exact program).

@@ -836,6 +836,87 @@ fn fabric_placement_siblings(workers: usize) -> (Option<usize>, Option<usize>, V
     }
 }
 
+/// R40: THE CHAMPION-4T PLACEMENT — the dual-producer topology
+/// (docs/52 §1, the user's directive):
+///
+/// ```text
+/// physical core 0:  cpu0 = P0 (the sink's owner)   cpu1 = W0 + RX
+/// physical core 1:  cpu2 = P1 (the lane-1 engine)  cpu3 = W1
+/// ```
+///
+/// The coherence dividend: P0's ring traffic (the transport's
+/// filled[] from the RX, lane-0's res_head from W0) becomes
+/// SAME-PHYSICAL-CORE (SMT siblings share L1) — the drain's
+/// Acquire loads and the submission waits cheapen; the same holds
+/// for P1/W1 on core 1. The workers (~4% duty) and the RX (~28%)
+/// co-locate on cpu1 at ~32% combined demand — the R25b
+/// counterfactual already proved worker-sibling sharing is the
+/// cheap theft (the scalars_stacked failure was MAIN+RX stacked,
+/// never worker+RX).
+///
+/// Returns `(main, rx, worker_cpus, p1)`; `p1 = None` on hosts
+/// without the 2-core SMT shape (the dual never arms there — the
+/// callers gate on it).
+/// `rx_pin_p0`: the RX's cpu law (R40c-II). The fleet's first dual draw
+/// (run 39257999925, commit 599a0f7) priced the ORIGINAL shape — the RX
+/// sharing W0's logical cpu: W0's res-ring backpressure yield-storm
+/// (res_waits=1.3M laps, the polite_spin escalation churning cpu1's
+/// runqueue) stacked the RX's publication latency on top; P0's group
+/// sweep collapsed to mean_width 1.78, wait_ms ate 57% of the scan, and
+/// the completion-pace cascade throttled the whole rendezvous to the
+/// mono's own cadence (+3..+10% instead of the projected split).
+///
+/// THE COMPLEMENTARY-SHARING LAW: the one sharing that CANNOT degrade
+/// into contention is RX-on-P0's-cpu — P0's transport waits are genuine
+/// FUTEX PARKS (wait_filled_turn parks after 512 spins), exactly the
+/// gaps the RX's publication bursts fill; when P0 works, the RX has
+/// nothing to publish (SPSC flow control — the ring is full); when the
+/// RX publishes, P0 is parked waiting for exactly those publications.
+/// W0 and W1 each own their logical cpu outright — their backpressure
+/// yields churn nobody's runqueue. `HFT_DUAL_RX_SIB=1` (CI arm 11r40x)
+/// restores the original RX-on-W0 shape for the same-draw attribution.
+pub fn fabric_placement_dual(
+    workers: usize,
+    rx_pin_p0: bool,
+) -> (Option<usize>, Option<usize>, Vec<usize>, Option<usize>) {
+    let order = cpu_order(); // distinct-physical representatives first
+    if order.is_empty() || workers != 2 {
+        let (m, r, w) = fabric_placement_distinct(workers);
+        return (m, r, w, None);
+    }
+    // The two producers: the first two distinct physical cores.
+    let p0 = order[0];
+    let p1 = order.get(1).copied();
+    if p1.is_none() {
+        let (m, r, w) = fabric_placement_distinct(workers);
+        return (m, r, w, None);
+    }
+    let p1 = p1.unwrap();
+    // The workers: each producer's SMT sibling (the lane ring's
+    // coherence pair), preferring the sibling; the RX rides P0's cpu
+    // (the complementary-sharing law above) — W0/W1 own their logical
+    // cpus outright.
+    let sib0 = read_sibling_group(p0)
+        .unwrap_or_else(|| vec![p0])
+        .into_iter()
+        .find(|c| *c != p0);
+    let sib1 = read_sibling_group(p1)
+        .unwrap_or_else(|| vec![p1])
+        .into_iter()
+        .find(|c| *c != p1);
+    match (sib0, sib1) {
+        (Some(w0), Some(w1)) => {
+            let rx = if rx_pin_p0 { p0 } else { w0 };
+            (Some(p0), Some(rx), vec![w0, w1], Some(p1))
+        }
+        _ => {
+            let (m, r, w) = fabric_placement_distinct(workers);
+            (m, r, w, None)
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod fabric_placement_tests {
     use super::*;
