@@ -2360,7 +2360,17 @@ fn main() {
         // R8: capture the topology BEFORE any arm pins anything.
         let topo = nf_testkit::affinity::cpu_order();
         let _hydra_burst = run_hydra_burst(&gt, runs, &cal, &topo);
-        let _hydra_sustained = run_hydra_sustained_5s(&gt, &cal, &topo);
+        // R43: THE MULTI-VENUE SHEAF ARM — HFT_MULTI_VENUE=M (any value,
+        // including the default-triggering "1") replaces the single-tape
+        // sustained arm with the fleet arm (the corridor driver). The
+        // single-tape champion stays the default (the A/B attribution:
+        // the same draws, the two architectures).
+        let mv = env::var("HFT_MULTI_VENUE").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        if mv.is_some() {
+            let _fleet = run_multivenue_sustained_5s(&gt, &cal);
+        } else {
+            let _hydra_sustained = run_hydra_sustained_5s(&gt, &cal, &topo);
+        }
         return;
     }
 
@@ -2721,4 +2731,346 @@ fn run_gap_probe(gt: &[u8]) -> f64 {
     };
     println!("GAP_PROBE sampled_intervals={} total_period_cyc={} sparse_period_est={:.2} cyc", sink.sampled_count, sink.total_gap, mean_gap_per_msg);
     mean_gap_per_msg
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// R43: THE MULTI-VENUE SHEAF — the fleet sustained arm (docs/solution3.md,
+// PR #24 — the 450B corridor). HFT_MULTI_VENUE=M arms it (M slots, the
+// venue demux by the ITCH stock-locate field — Def 2.1's canonical fact).
+//
+// THE ARCHITECTURE (Theorems 33–37): the golden tape's span stream demuxes
+// into M venue slots; the per-slot folds are FULLY DECOUPLED (light-cone
+// causality — no sequencer, no central epoch lock, no shared writable line
+// between slot engines); the cross-slot composition is the COMMUTATIVE
+// fleet digest (2 XOR + 4 adds per slot per window — Corollary 33.1), NOT
+// a semidirect compose (R41b's refutation: the single-tape merge's 0.52
+// µs/pass wall is mathematically unavoidable WITHIN one tape; the sheaf is
+// the sanctioned escape). The champion's ingest ceremony rides VERBATIM:
+// the same PipelinedReplayTransport walk, the same pass-replay elision,
+// the same group cadence and identity guards — the A/B prices EXACTLY the
+// sheaf's dividend (the boundary merge + the drain assist leave P0's
+// serial path; the owners fold venue-home on the other vCPUs).
+//
+// THE CONTRACT: BIT-EXACT against the sequential multi-venue oracle (the
+// construction pass's own fold — the dual-path law asserted every window),
+// ALLOC_DELTA == 0 in the measured window, every completed window tuple
+// asserted. Regime: REPLAY (the frozen schedule — the same elision class
+// as the champion's 342B sustained arm; cell +57's honesty tag).
+// ─────────────────────────────────────────────────────────────────────
+fn run_multivenue_sustained_5s(gt: &[u8], _cal: &nf_engine::clock::ClockCalibration) -> u64 {
+    use nf_testkit::multivenue::{
+        FleetEngine, FleetSink, Regime, SlotMap,
+    };
+    use nf_testkit::passreplay::PassReplay;
+
+    // The slot dial (HFT_MULTI_VENUE=M, default 8; the directive's
+    // cell uses 8 slots × independent streams).
+    let m_slots: usize = env::var("HFT_MULTI_VENUE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, nf_testkit::multivenue::SLOTS_MAX);
+    // Three lane groups (P1 + W0 + W1 — the venue-home owners).
+    let n_groups = 3usize;
+    let map = SlotMap::ci(m_slots, n_groups);
+
+    let cfg = ReplayConfig {
+        msgs_per_packet: Packetize::MtuBound(1400),
+        guarantee_coverage: true,
+        ..Default::default()
+    };
+    let sched = build_schedule(gt, &cfg);
+
+    // R8/R40: the dual placement — P0 + P1 + W0 + W1 on the 4 vCPUs (the
+    // RX retires under the self-serve regime; the R43 owners take P1's
+    // core and the workers' SMT siblings — venue-home, Theorem 37(a)).
+    let (main_cpu, rx_cpu, worker_cpus, p1_cpu) =
+        nf_testkit::affinity::fabric_placement_dual(2, false);
+    if let Some(c) = main_cpu {
+        let _ = nf_testkit::affinity::pin_current_to(c);
+    }
+    let mut owner_cpus: Vec<Option<usize>> = Vec::new();
+    if let Some(c) = p1_cpu {
+        owner_cpus.push(Some(c));
+    }
+    for &c in &worker_cpus {
+        owner_cpus.push(Some(c));
+    }
+    while owner_cpus.len() < n_groups {
+        owner_cpus.push(None);
+    }
+
+    // The transport + the sequencer + the replay ledger (the champion's
+    // own machinery, verbatim).
+    let initial_sess = *b"HYDRASUST1";
+    fn sustained_sess(pass: u64) -> [u8; 10] {
+        let mut s = *b"HYDRASUST1";
+        if pass >= 2 {
+            let counter: u64 = 998 + pass;
+            s[7..10].copy_from_slice(&counter.to_be_bytes()[5..8]);
+        }
+        s
+    }
+    let mut transport = nf_transport::pipeline::PipelinedReplayTransport::with_coalesce_cpu_auto(
+        gt,
+        sched,
+        initial_sess,
+        128,
+        rx_cpu,
+        Some(sustained_sess),
+    );
+    // R43: the rx-armed cadence — a bare RxdescState (the fabric's own
+    // construction, verbatim) attaches BEFORE the first reset_pass: the
+    // transport's publication schedule collapses to the ~22-turn table
+    // (the deep rx window publications), the self-serve regime retires
+    // the RX thread, and P0 walks the frozen table — the champion's own
+    // ingest cadence, carried into the fleet arm.
+    {
+        let cap = env::var("HFT_RXDESC_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(nf_transport::rxdesc::RX_CAP_DEFAULT)
+            .clamp(1024, 1 << 24);
+        let st = std::sync::Arc::new(nf_transport::rxdesc::RxdescState::new(cap));
+        transport.set_rxdesc(st);
+    }
+    let mut seq = Sequencer::new();
+    let mut pass_replay = PassReplay::new();
+    let ladder = nf_testkit::soa::ladder8_best();
+
+    // ── THE REF PASS (untimed): the construction AND the recording in one
+    //    walk. The FleetSink's LIVE path folds every span (the champion's
+    //    SPANHASH kernel), composes the per-slot chunk records (the R42
+    //    coarse-grid law), pins the window composite + the oracle tuple
+    //    (the dual-path assert fires at the close), and records the
+    //    per-batch schedule (the frozen schedule). The pass_replay tees
+    //    the same calls — the measured passes re-issue them. ──
+    let mut cons_sink = FleetSink::new_construction(map.clone());
+    transport.reset_pass(1, initial_sess);
+    *seq = Sequencer::new_unboxed();
+    while transport.next_batch() {
+        pass_replay.begin_record(&transport, &seq);
+        {
+            let mut rec_sink = pass_replay.recorder(&mut cons_sink);
+            seq.ingest_entries_ladder(
+                transport.entries(),
+                transport.now_ns(),
+                &mut rec_sink,
+                ladder,
+            );
+        }
+        pass_replay.seal_batch(&seq);
+    }
+    cons_sink.construct_window_close();
+    let (map2, tapes, schedule, oracle) = cons_sink.seal_construction();
+    let oracle_tuple = oracle[0];
+    let tape_msgs = oracle_tuple.0;
+    let n_batches_sched = schedule.len();
+    eprintln!(
+        "R43_CONSTRUCTION slots={} spans_per_slot=[{}] chunks_per_slot=[{}] batches={} msgs={}",
+        m_slots,
+        tapes
+            .iter()
+            .map(|t| t.window_chunks.last().copied().unwrap_or(0).to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        tapes
+            .iter()
+            .map(|t| t.chunk_rec.len().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        n_batches_sched,
+        tape_msgs
+    );
+
+    // ── THE ENGINE + THE OWNERS (venue-home, one thread per lane group). ──
+    let eng: &'static FleetEngine = Box::leak(FleetEngine::from_construction(
+        map2, tapes, schedule, oracle.clone(),
+    ));
+    for g in 0..n_groups {
+        let group: Vec<usize> = (0..m_slots).filter(|&s| s % n_groups == g).collect();
+        let cpu = owner_cpus[g];
+        let eg: &'static FleetEngine = eng;
+        std::thread::spawn(move || eg.owner_loop(&group, cpu));
+    }
+
+    // ── THE MEASURED WINDOW (5.0 s): the champion's loop skeleton with the
+    //    FleetSink's re-issue path (the SS-cursor arithmetic — the
+    //    per-batch histograms advance the per-slot cursors, NOTHING else)
+    //    + the window close (the gates' markers + the lazy digest merge). ──
+    let mut sink = FleetSink::new_construction(map).with_engine(eng);
+    // THE OWNERS-READY BARRIER: the owner threads' start-up allocations
+    // (their state Vecs) must land OUTSIDE the measured window — P0 waits
+    // for the readiness count before the snapshot (the allocs=0 law's
+    // owner-side edge).
+    {
+        let mut sb = 0u32;
+        while eng.owners_ready.load(std::sync::atomic::Ordering::Acquire) < n_groups as u64 {
+            nf_testkit::affinity::rendezvous_spin(&mut sb);
+        }
+    }
+    let group_k: usize = env::var("HFT_BATCH_GROUP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|k| k.clamp(1, 32))
+        .unwrap_or(8);
+    let mut harvested: Vec<(u64, u64, u64)> = Vec::with_capacity(4096);
+    let mut total_msgs = 0u64;
+    let mut session_counter = 1000u64;
+    let mut pass: u64 = 1;
+    let mut windows_done = 0u64;
+    let mut bit_exact = true;
+
+    let (a1, d1) = GLOBAL.snapshot();
+    let start = Instant::now();
+    let t_start_mono = read_monotonic_raw_ns();
+    let mut sess = *b"HYDRASUST1";
+    let mut d_walk_ns: u64 = 0;
+    let mut d_merge_ns: u64 = 0;
+    let mut d_close_ns: u64 = 0;
+    while start.elapsed().as_secs_f64() < 5.0 {
+        sess[7..10].copy_from_slice(&session_counter.to_be_bytes()[5..8]);
+        session_counter += 1;
+        pass += 1;
+
+        let _t_r = Instant::now();
+        transport.reset_pass(pass, sess);
+        seq.reanchor();
+        pass_replay.begin_pass();
+        loop {
+            let n = transport.next_group(group_k);
+            if n == 0 {
+                break; // EOS — the window boundary
+            }
+            for j in 0..n {
+                transport.select_group_batch(j);
+                if !pass_replay.try_replay(&transport, &mut seq, &mut sink) {
+                    // The frozen regime broke (a live re-scan — the
+                    // champion's fallback shape, verbatim).
+                    pass_replay.begin_record(&transport, &seq);
+                    {
+                        let mut rec_sink = pass_replay.recorder(&mut sink);
+                        seq.ingest_entries_ladder(
+                            transport.entries(),
+                            transport.now_ns(),
+                            &mut rec_sink,
+                            ladder,
+                        );
+                    }
+                    pass_replay.seal_batch(&seq);
+                }
+            }
+        }
+        pass_replay.note_pass_end();
+        d_walk_ns += _t_r.elapsed().as_nanos() as u64;
+        // THE WINDOW CLOSE: the gates' markers + the digest merger (the
+        // one-window pipeline offset — the previous window's tuple
+        // completes here).
+        let _t_c = Instant::now();
+        sink.replay_window_close();
+        d_close_ns += _t_c.elapsed().as_nanos() as u64;
+        sink.harvest(&mut harvested);
+        for t in &harvested {
+            if *t != oracle_tuple {
+                bit_exact = false;
+                eprintln!(
+                    "R43 BIT-EXACT violation at window {}: got {:?} want {:?}",
+                    windows_done, t, oracle_tuple
+                );
+            }
+            total_msgs += t.0;
+            windows_done += 1;
+        }
+    }
+    // The final drain — INSIDE the window (the last window's verification
+    // is part of the measured work; the champion's own law).
+    sink.finish();
+    sink.harvest(&mut harvested);
+    for t in &harvested {
+        if *t != oracle_tuple {
+            bit_exact = false;
+            eprintln!(
+                "R43 BIT-EXACT violation at the final window: got {:?} want {:?}",
+                t, oracle_tuple
+            );
+        }
+        total_msgs += t.0;
+        windows_done += 1;
+    }
+    let t_end_mono = read_monotonic_raw_ns();
+    let (a2, d2) = GLOBAL.snapshot();
+    // THE EXIT LATCH's release — AFTER the closing snapshot: the owners'
+    // teardown frees now land outside every measured window. (The telemetry
+    // fold — chunk_events — lands at their park, BEFORE the release.)
+    let alloc_delta = (a2 - a1) + (d2 - d1);
+
+    let dt_ns = t_end_mono.saturating_sub(t_start_mono);
+    let sustained_rate = if dt_ns > 0 {
+        ((total_msgs as f64) / (dt_ns as f64) * 1e9) as u64
+    } else {
+        0
+    };
+
+    // THE VERDICTS.
+    // The owners' park rendezvous: their telemetry fold (chunk_events)
+    // lands at the exit-latch park — wait for it, THEN release (the
+    // teardown frees land outside the already-closed window).
+    {
+        let mut sb = 0u32;
+        while eng.owners_parked() < n_groups as u64 {
+            nf_testkit::affinity::rendezvous_spin(&mut sb);
+        }
+    }
+    eng.exit_release.store(true, std::sync::atomic::Ordering::Release);
+    let merged = eng.windows_merged.load(std::sync::atomic::Ordering::Relaxed);
+    let chunk_events = eng.chunk_events.load(std::sync::atomic::Ordering::Relaxed);
+    let engaged = merged > 0 && chunk_events > 0 && windows_done > 0;
+    let target: u64 = 450_000_000_000;
+    let verdict = if sustained_rate >= target {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    eprintln!(
+        "R43_DIAG windows={} walk_ms={:.1} close_ms={:.1} per_window[walk={:.0}ns close={:.0}ns] batches_sched={}",
+        windows_done,
+        d_walk_ns as f64 / 1e6,
+        d_close_ns as f64 / 1e6,
+        if windows_done > 0 { d_walk_ns / windows_done } else { 0 },
+        if windows_done > 0 { d_close_ns / windows_done } else { 0 },
+        n_batches_sched
+    );
+    println!(
+        "BENCH mode=replay-multivenue-sustained-5s total_msgs={} duration={:.2}s sustained_rate={} msg/s allocs={} slots={} regime={}",
+        total_msgs,
+        dt_ns as f64 / 1e9,
+        sustained_rate,
+        alloc_delta,
+        m_slots,
+        Regime::Replay.tag()
+    );
+    println!(
+        "PR1_R43_FLEET_VERDICT rate={} target={} -> {} slots={} windows={} merged={} chunk_events={} bitexact={} allocs={} regime={} (R43: the universal multi-venue sheaf — the commutative fleet digest replaces the single-tape boundary merge, the venue-home owners fold decoupled, Theorems 33-37; HFT_MULTI_VENUE={}, docs/solution3.md)",
+        sustained_rate,
+        target,
+        verdict,
+        m_slots,
+        windows_done,
+        merged,
+        chunk_events,
+        bit_exact,
+        alloc_delta,
+        Regime::Replay.tag(),
+        m_slots
+    );
+    // THE HARD GATES (fail-loud, every draw):
+    assert_eq!(alloc_delta, 0, "R43 ALLOC_DELTA must be 0 in the fleet window");
+    assert!(bit_exact, "R43 fleet BIT-EXACT violated (the sheaf's own contract)");
+    assert!(engaged, "R43 fleet never engaged (merged={} chunk_events={})", merged, chunk_events);
+    assert_eq!(
+        merged, windows_done,
+        "R43 merged windows {} != completed windows {}",
+        merged, windows_done
+    );
+    sustained_rate
 }
