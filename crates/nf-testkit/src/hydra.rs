@@ -11256,7 +11256,15 @@ mod tests {
             true,
             true,
             true,
-            true, // R40d: the self-serve transport's arm request
+            // R40d: ss=false — THE DUAL CELLS' TIMING LAW. The SS-window
+            // proof (`dual_arm_ready_ss`) needs the mailbox path's natural
+            // publication pacing (the ring's flow control bounds the main's
+            // sprint); the self-serve transport removes it and the main
+            // outruns the workers on loaded runners — the arm misses its
+            // 40-pass window (the fleet's shard-17 flake, run 39371901625
+            // attempt 3). The transport self-serve carries its own cells
+            // (t_r40d_*) and the non-dual integration cells below.
+            false,
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
