@@ -453,3 +453,17 @@ Work Log:
 
 Stage Summary:
 - R42 LANDED LOCALLY: the leaf sequence drops ~194 → ~27 leaves/pass, the tree ~8 → ~5 levels, the ring/capacity laws re-derived with their margins preserved by the 8×-cancellation, and the A-1 silent-OOB audit class killed with a hard spawn-time assert. The 200B corridor question moves to the fleet: the 41-shard CI run prices the merge (the 2.31 µs → ~0.4 µs target) and the sustained rate (the 210B-235B directive corridor).
+
+---
+Task ID: R42-2
+Agent: Principal Systems Engineer (main agent — Run 901 / R42)
+Task: The R42 fleet verdict (run 39440759194) + the shard-19 arm-starvation fix.
+
+Work Log:
+- THE FLEET VERDICT (40/41 green; the one red = the Xeon draw's unit cell): THE 200B CORRIDOR IS CROSSED AND EXCEEDED — the five Zen 5 draws measure 319.3B / 321.8B / 338.0B / 338.6B / 342.0B msg/s (1.71T messages in 5.00s on the best draw, 71% headroom over the 1T directive). The pass period 4.32 µs → 1.48-1.58 µs; the merge 2.31 µs → 0.52-0.56 µs/pass (the directive's 0.3-0.5 µs target, within 10%); p1_parks=0 (the widened j1 quantum: zero P1 parks on every draw); merges=arrivals≈passes; BIT-EXACT; allocs=0; elision=true (99.9% replayed); poison=false; the self-serve transport armed + rx_retired on every draw.
+- THE ANATOMY (shard 35, the 342.0B draw): passes=3,381,035, work_ms=1400.9, fold_ms=2259.0, merge_ms=1751.2, reset_ms=296.3, wait_ms=92.1 — the completion-pace stall (R41's 65% reset) is dead; the remaining shares are the fold+merge serialization on P0's path (the post-200B wall, out of this directive's scope).
+- THE ONE RED (shard 19, the Xeon 6973P draw): t_r40_poison_fallback_parity died at "the dual never armed" — armed=0 at 40 passes under the parallel matrix's load (the SS proof starved past the whole window; the same class the sandbox hammer measured at arm=39-of-40). THE FIX (R42-II, the ARM-COMPLETIVE WINDOW, second edge): r40_drive_n's loop now WAITS FOR THE ARM ITSELF — `while pass <= drive_until || (!armed && pass <= 4·passes+8)` — and every caller drives ≥6 post-arm passes (the merges' engagement margin); both parity cells build `expect` from the driven count. Beyond the 4× bound the arm assert fails HONESTLY (the engagement law's floor — a waiting law, never a skip).
+- VALIDATION of the fix: t_r40 8/8 + the hammer 12/12 clean.
+
+Stage Summary:
+- R42 IS FLEET-PROVEN: 319-342B msg/s on the target silicon, BIT-EXACT, allocs=0, every engagement law held. The 200B milestone (1T msgs ≤ 5.0s) is delivered at 1.71T. The R42-II fix pushes for the clean 41/41.

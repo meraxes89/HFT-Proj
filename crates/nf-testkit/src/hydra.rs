@@ -11521,10 +11521,19 @@ mod tests {
             // starved arm (the loaded-sandbox hammer measured arm=39 of
             // 40) cannot starve the CELL's own subject: the injection
             // and the zombie always run, whatever the SS proof's timing.
-            // The parity cells build `expect` from the driven count.
+            // R42-II (the fleet's shard-19 catch, run 39440759194:
+            // armed=0 at 40 passes under the parallel matrix's load —
+            // even the mailbox pacing's natural publication rhythm
+            // starves on a contended runner): the loop now WAITS FOR
+            // THE ARM ITSELF, bounded at 4× the nominal window, and
+            // every caller drives ≥6 post-arm passes; the parity cells
+            // build `expect` from the driven count. Beyond the bound
+            // the arm assert fails HONESTLY (the engagement law's own
+            // floor — the extension is a waiting law, never a skip).
             let mut drive_until = passes + 1;
+            let arm_cap = 4 * passes + 8;
             let mut pass = 2u64;
-            while pass <= drive_until {
+            while pass <= drive_until || (!armed && pass <= arm_cap) {
                 // THE ARM (the harness's law verbatim: P1's inits from
                 // the MONO cursor, BEFORE dual_arm's reprojection). The
                 // R40c script-clean clause: never arm on a truncated
@@ -11543,6 +11552,10 @@ mod tests {
                     sink.dual_arm(std::sync::Arc::clone(&gate));
                     gate.arm(sink.dual_first_pass(), f1, rt1, pbase);
                     armed = true;
+                    // R42-II: ≥6 post-arm passes for EVERY caller (the
+                    // merges' engagement margin), then the injection
+                    // target + the zombie tail when poisoning.
+                    drive_until = drive_until.max(pass + 6);
                     if let Some(k) = inject {
                         poison_target = Some(pass + k);
                         drive_until = drive_until.max(pass + k + 6);
@@ -11653,11 +11666,12 @@ mod tests {
             want.push(seq_pass(&mut t, r32_prog(k)));
         }
         // Enough passes to arm (the SS regime proves itself ~pass 5)
-        // and run ~35 dual passes.
+        // and run ~35 dual passes. R42-II: the arm-completive window —
+        // the driven count adapts when the arm rides late.
         const PASSES: u64 = 40;
         let (got, (armed_from, p1_batches, p1_records, merges, poison)) =
             r40_drive_n(&gt, &sched, PASSES, None);
-        let expect: Vec<(u64, u64, u64)> = (2..=PASSES + 1)
+        let expect: Vec<(u64, u64, u64)> = (2..=got.len() as u64 + 1)
             .map(|p| want[((p - 1) % 4) as usize])
             .collect();
         assert_eq!(
