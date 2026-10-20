@@ -1021,3 +1021,23 @@ pub fn polite_spin_deep(iters: &mut u32) {
     }
     *iters += 1;
 }
+
+/// R41: THE RENDEZVOUS SPIN — the completion path's bounded pause, never
+/// a yield. The old `polite_spin` escalation ended in `yield_now()` after
+/// six idle polls: on the 1:1-pinned Champion-4T topology (P0+W0 on one
+/// SMT pair, P1+W1 on the other — four threads, four vCPUs, NO other
+/// runnable thread exists) every yield was a full deschedule + wakeup
+/// (~µs of scheduler latency) landed directly ON the per-pass rendezvous
+/// path — the measured 65%-of-window completion-pace stall's core
+/// mechanism (1.16M passes × the round-trip). The fixed PAUSE burst is
+/// strictly better on this topology: the ~8-pause cadence (~100ns) keeps
+/// the poll's observation latency two orders under the pass period, and
+/// each PAUSE donates the sibling worker its SMT issue slots (the
+/// coherence dividend — the parked producer literally feeds the fold
+/// engine while it waits). Rollback: the R40 shape is `polite_spin` at
+/// the same call sites (HFT_R41_SPIN=0).
+pub fn rendezvous_spin(_iters: &mut u32) {
+    for _ in 0..8 {
+        std::hint::spin_loop();
+    }
+}

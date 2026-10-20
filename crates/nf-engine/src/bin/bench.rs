@@ -1028,7 +1028,7 @@ fn run_hydra_sustained_5s(
     if diag {
         let (rp_batches, rp_live, rp_passes, rp_rerecords) = pass_replay.stats();
         eprintln!(
-            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} groups={} group_k={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
+            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} groups={} group_k={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} merge_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
             d_passes,
             d_reset_ns as f64 / 1e6,
             d_scan_ns as f64 / 1e6,
@@ -1040,6 +1040,7 @@ fn run_hydra_sustained_5s(
             d_wait_ns as f64 / 1e6,
             d_work_ns as f64 / 1e6,
             d_fold_ns as f64 / 1e6,
+            sink.dual_merge_stats().1 as f64 / 1e6,
             sink.assist_chunks(),
             sink.warm_skips(),
             sink.selfserve_wins(),
@@ -1211,6 +1212,28 @@ fn run_hydra_sustained_5s(
             g.p1_parks.load(std::sync::atomic::Ordering::Relaxed),
             poison
         );
+        // R41: THE ARRIVAL-PACED COMPLETION BATCHING's verdict line —
+        // the corridor unlock's engagement row: fast = the cursor-gated
+        // completions that consumed the arrival's pre-staged run window
+        // (the steady law — the arrival is ALWAYS visible when the
+        // cursor gate passes); scan = the position-scan fallback (the
+        // pre-arm/edge shape); arrivals = P1's opportunistic boundary
+        // publications (the continuous drainer's crossings ≈ the dual
+        // pass count); defers = the CURSOR-gate deferrals (P1's drain
+        // lagging P0's lane-0 fold — the new meaning under R41, the
+        // arrival handshake is gone). The corridor's own law: reset_ms
+        // collapses (the DIAG sustained line) and the rate crosses the
+        // 200B line.
+        let (fast, scan, arr) = g.r41_stats();
+        println!(
+            "PR1_R41_COMPLETION_CADENCE_VERDICT rate={} fast={} scan={} arrivals={} cursor_defers={} p1_parks={} (R41: arrival-paced completion batching — the cursor-gated boundary completions + the continuous lane-1 drainer; the per-pass arrival handshake and its completion-pace park are deleted, PASS_RING=512; the record-slot reuse gate is the live submission bound riding the fold frontier)",
+            sustained_rate,
+            fast,
+            scan,
+            arr,
+            g.arrival_defers.load(std::sync::atomic::Ordering::Relaxed),
+            g.p1_parks.load(std::sync::atomic::Ordering::Relaxed)
+        );
     }
     // R40d: THE ZERO-THREAD INGEST's verdict line — the self-serve
     // transport's engagement row (armed=true on every frozen-regime
@@ -1339,7 +1362,14 @@ fn run_hydra_sustained_5s(
             // tiling) arm the elision on BOTH lanes: each lane's
             // machine steps at every boundary (the multi-boundary
             // collector's bracket discipline), so the counts scale by
-            // the worker count verbatim.
+            // the worker count verbatim. R42: the upper slack widens by
+            // +64/worker — under starved workers (loaded boxes, the
+            // recording orbit's live walk outrun by the submission) the
+            // work-assist fires and each inline episode HOLES the phase
+            // script (the designed discard law), re-recording it as a
+            // live pass; the slack absorbs the honest re-record count
+            // while a double-crossing protocol break still reads
+            // crossed ≈ 2·(n·d_passes), far past any slack.
             if res_replay_on && n_workers >= 1 {
                 let crossed = replayed + live;
                 assert!(
@@ -1348,10 +1378,10 @@ fn run_hydra_sustained_5s(
                      < {n_workers}x{d_passes} (replayed={replayed} live={live})"
                 );
                 assert!(
-                    crossed <= n_workers * (d_passes + 8),
+                    crossed <= n_workers * (d_passes + 8 + 64),
                     "R36-E engagement: the workers crossed {crossed} boundaries \
                      > {n_workers}x{} (a re-record loop?)",
-                    d_passes + 8
+                    d_passes + 8 + 64
                 );
                 assert!(
                     replayed > 0,

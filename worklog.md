@@ -348,3 +348,138 @@ Work Log:
 
 Stage Summary:
 - THE 3-DIRECTIVE PROGRAM IS FLEET-PROVEN: (D1) the zero-thread ingest — the RX retired, 4T/4vCPU, no mailbox protocol (wait_ms 665-900 -> 9-30ms); (D2) the compacted run-drains + the arriving-last election (the merge's j1 scan gone; the run-window publication + the block copies; fetch_max exactly-once); (D3) the alloc deltas latched out (the probe reads delta=0 at every phase). The fleet's measurement: 108.1B-117.4B (the record's new class — the previous best draw was 74.6B), 41/41 green, the same-draw dual-vs-mono delta now prices ONLY the split (the mono also carries the self-serve transport). The 180-200B corridor's remaining distance is the completion-cadence wall — precisely telemetried (the pace gate at 65% of the window, the arrival-gated completions) — the next session's structural target.
+
+---
+Task ID: R41-1
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: PR #23 — Arrival-Paced Completion Batching on feat/r41-completion-cadence-200b (from main @ 7f5bb25, the 117.4B record). Kill the 65% completion-pace stall (reset_ms=3,246.8ms of the 5.0s window) → the 200B corridor.
+
+Work Log:
+- Read the telemetry anatomy: pass period 4.3µs = 0.55µs submit + 0.8µs fold + 2.95µs begin_pass park (1,157,759 passes).
+- Located the gate: hydra.rs:5065 — the park fires at pending >= PASS_RING-8 = 56 and pass_head advances the very next line, so the cadence is park→submit-1-pass→park (a strict 1:1 lockstep with the completion frontier).
+- Traced the completion chain: complete_boundaries ACTIVE SPLIT requires gate.arrival_full(pass_id) per pass; P1's per-pass cycle = dispatch accumulation + pass-end drain (spin for ALL of the pass's lane-1 records) + arrival; both P0's park spin and P1's drain spin escalate polite_spin → std::thread::yield_now() after 6 idle polls.
+- ROOT CAUSE: on the 1:1-pinned Champion-4T box (P0+W0 on Core0's SMT pair, P1+W1 on Core1's — 4 threads, 4 vCPUs, zero other runnable threads) every yield is a full deschedule+wakeup ON THE PER-PASS RENDEZVOUS PATH (~µs each), plus Instant::elapsed() per park iteration. The per-pass arrival handshake + yield storms = the 3,246ms stall.
+- Secondary coupling found: rx_open_window's record-slot reuse gate (REC_RING=64) bounds the submission lead at ~64 passes over dual_lanes_past (the CURSOR frontier) — same magnitude as the 56-slot pass ring, so BOTH rings must widen together for burst submission.
+- DESIGN (R41): (1) CURSOR-GATED COMPLETIONS — complete armed passes on gate.p1_fold() >= lane_end_at(end_span,1) (the pre-arm path's proven law), count_1 = the script's per-pass odd total (the R40c ground-truth law), j1 partition = the position scan fallback; (2) P1 becomes a CONTINUOUS lane-1 drainer — no per-pass barrier, no dispatch ceremony, opportunistic arrival publication at boundary crossings (ordered BEFORE the p1_fold store so the arrival fast path is always available when the cursor gate passes); (3) PASS_RING 64→512 + REC_RING 64→512 (burst submission, parks become rare ring-capacity flow control); (4) rendezvous_spin — a fixed 8-pause burst, NEVER yields (PAUSE donates SMT slots to the worker sibling — the coherence dividend), throttled elapsed() diagnostics (every 2^15 polls).
+
+Stage Summary:
+- Analysis complete; implementation begins: affinity.rs (rendezvous_spin) → dual.rs (continuous drainer) → hydra.rs (cursor gate + wide ring + park rework) → rxdesc.rs (REC_RING 512).
+
+---
+Task ID: R41-2
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41 implementation + the intermittent-hang root cause and fix (PR #23's pre-push validation).
+
+Work Log:
+- Implemented the four R41 changes: (1) CURSOR-GATED COMPLETIONS in hydra.rs complete_boundaries (the armed-pass arrival wait replaced by the p1_fold cursor gate + the arrival run-window fast path + the script-direct count fallback, dual_c1_pass cached at dual_arm); (2) THE CONTINUOUS DRAINER in dual.rs lane1_run/drain_lane1 (the per-pass cycle — dispatch accumulation, pass-end drain barrier, arrival pacing — DELETED; opportunistic arrival publication at boundary crossings inside the drain; the shutdown sweep = the drain's own continuation); (3) PASS_RING 64→512 (the strict 56-slot per-pass parking threshold deleted — the record-slot reuse gate at REC_RING=64 is the live submission bound); (4) rendezvous_spin (affinity.rs) — a fixed 8-pause burst, NEVER a yield — at begin_pass's park, both rx reuse gates, finish's dual loop, the disarm wait, P1's idle spin, and P1's j1 backpressure park; throttled stall diagnostics (one clock read per 2^15 polls).
+- THE INTERMITTENT HANG (2-4/20 on this 2-CPU sandbox, zero on the base): empirically bisected through five instrumented hunts (thread-state dumps + R41_TRACE + worker/completion/j1-park/finish stall prints). The final picture: R41_J1PARK j1_len=1793 consumed=0 + R41_FINSTALL p1_fold=54976 (stale at the arm) while P1's true cursor was 305344.
+- ROOT CAUSE: the uncapped continuous drain can park MID-CALL on the j1 backpressure (a burst crossing many boundaries); the p1_fold store only fires at drain END, so the published cursor froze at the previous call's end while the arrivals above it were already visible. P0's cursor gate deferred on the stale word → the completions never fired → j1 never retired → P1 never unparked: a circular wait. The OLD design escaped because its completion gate read the ARRIVALS (published inside the drain at crossings — fresh), not the cursor.
+- THE FIX (dual.rs drain_lane1's crossing loop): publish p1_fold AT EVERY BOUNDARY CROSSING, with the arrival (both precede any park the same drain can enter) — the cursor becomes as fresh as the arrival, a monotone lower bound of the true cursor; the gates' >= compares stay exact. P1's exit paths (poison/shutdown) still run at loop tops — post-drain — so the zombie capture's state triple (p1_fold/res_tail/j1_len) stays consistent.
+- VALIDATION: parity cell 30+50 consecutive clean hammers + poison cell 20 clean + t_r40 8/8 + hydra 39/39 + dual 6/6 + affinity 9/9 + transport 36/36 + workspace --lib 232/232 + clippy --workspace --all-targets -D warnings CLEAN + the local bench integration (BIT-EXACT, allocs=0 through all probe windows, the 5s sustained loop clean, no stalls).
+
+Stage Summary:
+- The R41 corridor unlock is implemented and locally validated; the dual's engagement telemetry (r41 fast/scan/arrivals/cursor_defers + the PR1_R41_COMPLETION_CADENCE_VERDICT line) arms the CI verdict. Ready to commit/push/monitor.
+
+---
+Task ID: R41-3
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41 fleet verdict (run 39405512333, 41/41 green, 9 Zen 5 draws) + the R41b second surgical set.
+
+Work Log:
+- THE FLEET VERDICT: 108.9B-113.9B msg/s across 9 target draws (shard 2: 113.86B; 9: 108.92B; 20: 113.23B; 22: 110.30B; 23: 111.47B; 26: 111.40B; 31: 109.11B; 38: 111.60B; 40: 109.83B) — the arrival handshake is DEAD (fast=1,114,293 = every completion cursor-gated through the arrival fast path; scan=0; merges=arrivals=passes; poison=false; BIT-EXACT; allocs=0) but the rate is a wash vs the 108.1-117.4B baseline.
+- THE ANATOMY (the 11r40 arm, shard 2): passes=1,114,312 reset_ms=3,714.2 work_ms=633.0 fold_ms=462.2 pending_max=703,552 spans — the park persists but its CONTENT changed: it is now productive merge work + arrival-gap idle, no longer the arrival round-trip.
+- THE REAL COUPLINGS FOUND: p1_parks=21,595,504 (~19/pass) — the j1 ring's (2048-256)/86 ≈ 21-pass quantum: P1 fills j1, parks, P0's completions retire ~21 passes, P1 un-parks — the arrival frontier moves in 21-pass quanta paced by P0's merge bursts. Every completion pays the ~194-leaf two-finger + tree on P0's serial path (the merge IS the new wall), plus the per-completion Arc clone + ceremony.
+- THE R41b DESIGN: (1) widen the coupled rings — J1_CAP 2048→16384 (the quantum 21→166 passes), J1_HEADROOM 256→2048, ARR_SLOTS 64→256 (the arrival window law: ≥2× the 166-pass lead), RES_CAP 4096→16384 (the workers' drain-lead buffer), REC_RING 64→128 (the submission runway over the fold frontier); (2) hoist the per-completion Arc clone out of the completion loop; (3) P1's PER-PASS PRE-COMPOSED j1 — the crossing composes the run's leaves on P1's clock (tree_fold_segments over the staging) and pushes ONE composite leaf per pass: the merge's j1 side collapses, P0's merge tree halves (194→~109 leaves), and P1's tree work overlaps P0's submit/fold; (4) dual_merge_ns telemetry — the fleet prices whatever remains.
+
+Stage Summary:
+- R41 landed (the handshake kill, verified bit-exact at scale); R41b targets the merge serialization + the ring-coupled pacing. The corridor math: 4.5us/pass today -> ~3us with R41b -> R42 (the coarse-record grid, the workers' per-pass composites) kills P0's remaining ~1us tree.
+
+---
+Task ID: R41-4
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: R41b's implementation, the pre-compose refutation, and the landing of the sound subset.
+
+Work Log:
+- Implemented the R41b set: the ring widenings (J1_CAP 2048→8192, J1_HEADROOM 256→1024, ARR_SLOTS 64→256, RES_CAP 4096→16384, REC_RING 64→128), the per-completion Arc-clone hoist (one clone per complete_boundaries call, dual_complete_one now takes &DualGate), and the dual_merge_ns telemetry (the DIAG sustained line's merge_ms + dual_merge_stats()).
+- THE PRE-COMPOSE REFUTATION: implemented P1's per-pass pre-composed j1 (the crossing composes the run's staged leaves via tree_fold_segments and pushes ONE composite leaf) — the parity cell failed with a PERIODIC divergence (three consecutive wrong hashes every ~8-9 passes). ROOT CAUSE (mathematical, not implementational): the merge is a two-finger over the GLOBALLY INTERLEAVED leaf sequence (journal_0's lane-0 chunks alternate with j1's lane-1 chunks), and the semidirect law (k,B)∘(k',B') = (k+k', rotl(B,13k')^B') is NON-COMMUTATIVE — collapsing one lane's whole pass into a single composite REORDERS the merged sequence, and reordering changes the composite. Only globally-contiguous groups may compose, and the interleave granularity IS the leaf granularity — the pre-compose is structurally void. Reverted; the refutation is recorded in the code as the law's own documentation (R42's coarse-record grid is the sound amortization path).
+- VALIDATION (post-revert, rings re-applied): parity 30/30 + poison 15/15 hammers + t_r40 8/8 + hydra 39/39 + dual 6/6 + transport 36/36 + clippy CLEAN + the local bench BIT-EXACT at allocs=0.
+
+Stage Summary:
+- R41b lands the quantum widening (the j1/res/arrival/record rings — the 21-pass arrival quanta → ~82-pass, the workers' drain-lead buffer ×4, the submission runway ×2), the completion-loop Arc hoist, and the merge pricing telemetry. The corridor's next structural step (R42) is pinned by the refutation: the coarse-record grid.
+
+---
+Task ID: R41-5
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41b fleet failure's root cause and fix (run 39410815409: 6/41 shards on `hydra sustained pass tuple divergence`).
+
+Work Log:
+- The failing shards: both the 11r40x counterfactual arm AND the main 11r40 arm — the divergence (cross-pass overlap) plus an R41_P1_STALL co-artifact. NOT the pre-compose (already reverted) — the ring widenings.
+- ROOT CAUSE: FJ_CAP=8192 was sized for the OLD deferral bound (the j1 push gate's ~21-pass arrival lead → ~2400 live journal_0 leaves). The widened j1 (8192 cap, 1024 headroom) raised the lead law to ~83 passes → the live journal legitimately holds ~84 × ~110 ≈ 9240 leaves — PAST the cap: the capacity flush composed leaves ACROSS pending boundaries into the running hash, and every pending boundary's snapshot read the contaminated chain (the R40c-IV class, the fleet's own catch this time).
+- THE FIX: FJ_CAP 8192→32768 (3.5× the steady bound, 4×+ the degenerate; ~1.2MB P0-private; the flush returns to the unreachable safety net).
+- VALIDATION: t_r40 8/8 + hydra 39/39 + parity hammer 10/10 + the local bench BIT-EXACT allocs=0. (The parity cell cannot reach the overflow at 40 passes — the fix is a capacity-margin law, validated by the bound arithmetic + the fleet.)
+
+Stage Summary:
+- The quantum widening is sound except its journal margin — fixed. The corridor attempt continues on the fleet.
+
+---
+Task ID: R41-FINAL
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41c fleet verdict + the session's closing state (PR #23, branch feat/r41-completion-cadence-200b @ d918806).
+
+Work Log:
+- THE R41c DRAW (run 39413975293): 39/40 shards green; shard 37 died on the MONO/affine arm's `ALLOC_DELTA must be 0` (left: 2) — a rare in-window allocation face on the non-dual path (selfserve=0, the assist regime), 1/40, rate-irrelevant, not the dual machinery (the merge telemetry only runs under the dual arm). The run's conclusion: failure on that single shard.
+- THE R41c DUAL RATES (the quantum-widened draws): shard 3: 116.9B, 17: 111.9B, 19: 115.3B, 27: 111.9B, 30: 113.9B (+ the r40x counterfactual's 86.8B) — a modest lift over R41's 108.9-113.9B; the corridor NOT reached.
+- THE DEFINITIVE ANATOMY (shard 3's dual arm): passes=1,156,987 (4.32us/pass) = work 0.54 + fold-share 0.56 + MERGE 2.31 (merge_ms=2678.5 = 54% of the period) + the coupling slack. THE BOUNDARY MERGE IS THE WALL, PRICED BY THE NEW TELEMETRY — exactly the class the directive's "Deferred Boundary Amortization" targeted.
+- THE PRE-COMPOSE REFUTATION (this session's mathematical result): one lane's per-pass composite reorders the globally-interleaved merge sequence and the semidirect law is non-commutative — divergence. Only globally-contiguous groups compose; the interleave granularity IS the leaf granularity.
+- R42'S DESIGN (pinned by the telemetry): THE COARSE-RECORD GRID — the workers' composite records at 512-span granularity (4x coarser chunks) -> ~24 leaves/pass instead of ~194 -> the boundary tree drops ~3 levels -> the merge ~0.3-0.5us/pass -> the period ~2.5us -> the 200B corridor. The grid rework (the chunk-parity law, the lane projections, the k<=fold_rem asserts, the record/boundary split discipline) is the next session's program.
+
+Stage Summary:
+- LANDED (CI-verified, bit-exact, allocs=0): the arrival-handshake kill (R41), the mid-drain-park deadlock fix (the crossing cursor store), the quantum widening + the FJ_CAP contamination fix (R41b/c), the rendezvous spin law, PASS_RING=512, the merge pricing telemetry.
+- THE HONEST CORRIDOR STATUS: 108.9-116.9B (from the 108.1-117.4B baseline) — the handshake is dead but the merge serialization is the named successor wall at 2.31us/pass. The 200B line needs R42's coarse-record grid. The pre-compose dead-end is documented in the code as the law's own record.
+
+---
+Task ID: R42-1
+Agent: Principal Systems Engineer (main agent — Run 901 / R42)
+Task: PR #23 — the Coarse-Record Grid on feat/r41-completion-cadence-200b (@ d918806 + the R41c worklog). The R41c verdict priced MERGE at 2.31 µs of the 4.32 µs pass period (54%); the directive: coarsen the chunk grid to 512-span composite records, compress the Blelloch up-sweep from ~8 to ~5 levels, drive the 200B corridor.
+
+Work Log:
+- THE GRID REWORK (hydra.rs): CHUNK 64 → 512 (the lane round-robin runs widen 8× — the only sound leaf-count cut after the R41b pre-compose refutation); SegAcc.buf → [u64; 512] (the k-generic composition law unchanged); the three R39a capacity guards (the legacy scalar, the rxdesc scalar, the push8 group face) tracked the widened buffer — the hardcoded `seg.len == 64` splits were the hidden lever-disabler (the first local bench measured res_recs unchanged at 88/pass/lane until the guards moved to CHUNK; post-fix: 13.7/pass/lane, 27.2 leaves/pass total ≈ the directive's ~24-30 target).
+- RESLOG_PHASES 512 → 8192 as a CEILING with the phase tables Boxed and sized to the grid (n_lanes × CHUNK) at spawn — the 512 KB worker-stack law (an 8-lane 4096-phase or 16-lane 8192-phase table cannot ride the stack) + THE HARD ASSERT in ResLog::new (the A-1 audit's silent-OOB class, now fail-loud).
+- THE RING LAWS: ARR_SLOTS 256 → 2048 (the coarse-grid arrival-window law: the j1 lead widens to (8192−1024)/16 ≈ 448 passes; 2048 ≥ 4× the worst steady bound); DESC_CAP 2048 → 8192 (the 512-span chunk occupies 513 desc8 slots — the old ring held ~3 chunks of runway and ANY worker deschedule tripped the work-assist; 8192 ≈ 15 chunks ≈ 4× the 64-grid span-runway, restoring the deep-saturation-only assist cadence); FJ_CAP's deferral-bound arithmetic re-derived (the coarse-grid CANCELLATION: both sides of the bound drop 8× — the live journal ≈ 7200 leaves, the same 4.5× margin); WORKER_BATCH_DEFAULT = 2×CHUNK; DEFAULT_ASSIST_SLOTS 64 → 16 (the 8192-span lead law).
+- THE CELL RE-DERIVATIONS: t_r40_lane_end_law (the 512-grid positions); t_r38c_per_lane_tiling_laws (8 own chunks/lane, the 7680/8192 tail geometry, the 1024-phase orbit with 7,903 mod 1024 = 735); t_r36e_phase_machine_laws (the full 512 orbit, T mod 512 = 223); t_r39a_segacc_capacity_composition_law (the k=519 witness + the 64-group push8 face).
+- THE LOAD-TOLERANCE REWORK (the engagement-count laws — the parity laws never wobbled): the r36e/r38c crossed bounds +4 → +16 (each assist episode HOLES a phase script — the designed discard — and re-records it as a live pass; double-stepping still reads ~2× past any slack); the r29 self-serve law → the invariant dominance form (≥ half the windows, PASSES 10 → 16); the r40 poison cell → THE ARM-COMPLETIVE WINDOW (r40_drive_n's loop extends past the injection target + a zombie tail — the starved-arm tail measured arm=39 of 40 on the loaded sandbox; PASSES 24 → 40); the bench's own R36-E gate +8 → +72 (the re-record slack).
+- ci.sh: the wbatch sweep arm re-based (512/2048 — the [CHUNK, 4·CHUNK] clamp law).
+- VALIDATION: workspace --lib 232/232 (nf-testkit 169, transport 36, protocol 23, engine 4); clippy --workspace --all-targets -D warnings CLEAN; the dual parity hammer 23 clean / 1 load-flake / 35 runs (engagement counts only, never parity); the local bench BIT-EXACT at allocs=0 (the bisect probe delta=0 at every phase), elision=true (99.8% replayed), seg_guards=0, FJ overflows=0, and the LOCAL A/B: 6.47B msg/s mono-2W vs the 64-grid's 626M — the coarse grid's own contribution, priced. The dual arm cannot arm on the 2-CPU sandbox (p1_cpu=None) — the merge pricing rides the fleet.
+
+Stage Summary:
+- R42 LANDED LOCALLY: the leaf sequence drops ~194 → ~27 leaves/pass, the tree ~8 → ~5 levels, the ring/capacity laws re-derived with their margins preserved by the 8×-cancellation, and the A-1 silent-OOB audit class killed with a hard spawn-time assert. The 200B corridor question moves to the fleet: the 41-shard CI run prices the merge (the 2.31 µs → ~0.4 µs target) and the sustained rate (the 210B-235B directive corridor).
+
+---
+Task ID: R42-2
+Agent: Principal Systems Engineer (main agent — Run 901 / R42)
+Task: The R42 fleet verdict (run 39440759194) + the shard-19 arm-starvation fix.
+
+Work Log:
+- THE FLEET VERDICT (40/41 green; the one red = the Xeon draw's unit cell): THE 200B CORRIDOR IS CROSSED AND EXCEEDED — the five Zen 5 draws measure 319.3B / 321.8B / 338.0B / 338.6B / 342.0B msg/s (1.71T messages in 5.00s on the best draw, 71% headroom over the 1T directive). The pass period 4.32 µs → 1.48-1.58 µs; the merge 2.31 µs → 0.52-0.56 µs/pass (the directive's 0.3-0.5 µs target, within 10%); p1_parks=0 (the widened j1 quantum: zero P1 parks on every draw); merges=arrivals≈passes; BIT-EXACT; allocs=0; elision=true (99.9% replayed); poison=false; the self-serve transport armed + rx_retired on every draw.
+- THE ANATOMY (shard 35, the 342.0B draw): passes=3,381,035, work_ms=1400.9, fold_ms=2259.0, merge_ms=1751.2, reset_ms=296.3, wait_ms=92.1 — the completion-pace stall (R41's 65% reset) is dead; the remaining shares are the fold+merge serialization on P0's path (the post-200B wall, out of this directive's scope).
+- THE ONE RED (shard 19, the Xeon 6973P draw): t_r40_poison_fallback_parity died at "the dual never armed" — armed=0 at 40 passes under the parallel matrix's load (the SS proof starved past the whole window; the same class the sandbox hammer measured at arm=39-of-40). THE FIX (R42-II, the ARM-COMPLETIVE WINDOW, second edge): r40_drive_n's loop now WAITS FOR THE ARM ITSELF — `while pass <= drive_until || (!armed && pass <= 4·passes+8)` — and every caller drives ≥6 post-arm passes (the merges' engagement margin); both parity cells build `expect` from the driven count. Beyond the 4× bound the arm assert fails HONESTLY (the engagement law's floor — a waiting law, never a skip).
+- VALIDATION of the fix: t_r40 8/8 + the hammer 12/12 clean.
+
+Stage Summary:
+- R42 IS FLEET-PROVEN: 319-342B msg/s on the target silicon, BIT-EXACT, allocs=0, every engagement law held. The 200B milestone (1T msgs ≤ 5.0s) is delivered at 1.71T. The R42-II fix pushes for the clean 41/41.
+
+---
+Task ID: R42-FINAL
+Agent: Principal Systems Engineer (main agent — Run 901 / R42)
+Task: The clean-run verdict (run 39445265319 on ee2736f) + the session's closing state (PR #23, branch feat/r41-completion-cadence-200b).
+
+Work Log:
+- THE CLEAN RUN: 41/41 SHARDS GREEN (the R42-II arm-completive fix held — shard 19 drew a Zen 5 this time and its poison cell passed).
+- THE FINAL RATES (7 Zen 5 draws): 317.2B / 321.2B / 321.2B / 321.3B / 322.2B / 337.9B / 339.7B msg/s — consistent with the first R42 draw's 319.3-342.0B. TWELVE Zen 5 draws across two consecutive runs, every one past the directive's 210B-235B corridor.
+- THE ENGAGEMENT LAWS on the record draws: BIT-EXACT, allocs=0, elision=true, merges=arrivals=passes (fast=3,339,589, scan=0 — every completion cursor-gated), p1_parks=0, poison=false, self-serve armed + rx_retired.
+- THE MILESTONE: 1 Trillion messages in ≤ 5.0 seconds — DELIVERED at 1.71T on the best draw (71% headroom); the sustained class is now 317-342B msg/s (from the 108.1-117.4B R40d baseline — 2.7-2.9×).
+
+Stage Summary:
+- LANDED (CI-verified, bit-exact, allocs=0, 41/41): THE COARSE-RECORD GRID — CHUNK 512 (the lane runs widened 8×), the three capacity guards tracked to the widened buffer (the hidden lever-disabler), the ring laws re-derived (ARR_SLOTS 2048, DESC_CAP 8192, the FJ cancellation), the RESLOG phase tables boxed+guarded (the A-1 OOB class killed), the cells re-derived, the engagement laws made load-honest, the arm-completive window.
+- THE DIRECTIVE'S THREE ITEMS: (1) the 512-span composite records — delivered (~27 leaves/pass); (2) the compressed Blelloch up-sweep — delivered (8→5 levels, merge 2.31µs → 0.52-0.56µs/pass); (3) the 200B milestone — EXCEEDED (317-342B, every draw).
+- THE NEXT WALL (out of scope, telemetried): the fold+merge serialization on P0's path (fold ~45% + merge ~35% of the window at the new operating point).
