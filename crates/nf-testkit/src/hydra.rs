@@ -181,8 +181,15 @@ impl LaneMod {
     }
 }
 
-/// Result-ring capacity (power of two, multiple of CHUNK).
-const RES_CAP: usize = 4096;
+/// Result-ring capacity (power of two, multiple of CHUNK). R41b: 4096 →
+/// 16384 — the R41 fleet priced the drain-paced coupling: the workers'
+/// res-space wait (`rhead − res_tail + wbatch ≤ CAP − CHUNK`) throttled
+/// the production to the DRAIN pace (the completions' successor
+/// coupling after the arrival handshake died). The wide ring gives the
+/// workers ~188 passes of lead over their lane's drain — the quantum
+/// amortization's other half. 16384 × 16 B = 256 KB per lane — the
+/// same-physical-core pair (Wℓ → Pℓ) shares it in L2.
+const RES_CAP: usize = 16384;
 /// Descriptor-ring capacity (power of two, multiple of CHUNK, strictly <
 /// RES_CAP with margin for the ±1-chunk lane skew).
 const DESC_CAP: u64 = 2048;
@@ -4539,6 +4546,10 @@ pub struct HydraSpanSink<'a> {
     dual_passes: u64,
     dual_merges: u64,
     dual_poisoned: bool,
+    /// R41b: telemetry — the boundary merge's accumulated wall time (the
+    /// fleet's pricing instrument for P0's serial merge share; one
+    /// Instant pair per completion, ~25ns on a ~1µs op).
+    dual_merge_ns: u64,
     /// R41: THE COUNT LAW'S CONSTANT — the script's per-pass odd total
     /// (the frozen schedule's suppressed-batch count; cached at the arm,
     /// one script walk). The cursor-gated completions publish it as the
@@ -4697,6 +4708,7 @@ impl<'a> HydraSpanSink<'a> {
             dual_passes: 0,
             dual_merges: 0,
             dual_poisoned: false,
+            dual_merge_ns: 0,
             dual_c1_pass: 0,
             pass_counter: 0,
             z1_fold_pos: 0,
@@ -4932,6 +4944,13 @@ impl<'a> HydraSpanSink<'a> {
     /// source).
     pub fn dual_stats(&self) -> (bool, bool, u64, u64) {
         (self.dual.is_some(), self.dual_armed, self.dual_passes, self.dual_merges)
+    }
+
+    /// R41b telemetry: the boundary merge's engagement row —
+    /// `(merges, ns)` (P0's serial merge share; the DIAG line's
+    /// merge_ms source).
+    pub fn dual_merge_stats(&self) -> (u64, u64) {
+        (self.dual_merges, self.dual_merge_ns)
     }
 
     /// R40: the merged fold position (the pace gate's operand) — the
@@ -5316,6 +5335,12 @@ impl<'a> HydraSpanSink<'a> {
     /// the entry hash), so the SPAN_SEED reseed below re-bases them
     /// exactly.
     fn complete_boundaries(&mut self) {
+        // R41b: the Arc is cloned ONCE per complete_boundaries call (the
+        // per-completion clone was a locked RMW on the critical path —
+        // ~1.1M per sustained run). `None` short-circuits the dual
+        // dispatch to the mono path (the verbatim law).
+        let gate_arc = self.dual.clone();
+        let gate = gate_arc.as_deref();
         while self.pass_tail != self.pass_head {
             let rec = &self.passes[self.pass_tail];
             if rec.done || rec.end_span == u64::MAX {
@@ -5332,7 +5357,7 @@ impl<'a> HydraSpanSink<'a> {
             // deferred records complete through the SAME merge with a
             // zero count contribution (P1 dispatched nothing for
             // them — its pre-arm lane-1 tail rides j1 to the boundary).
-            if let Some(gate) = self.dual.clone() {
+            if let Some(gate) = gate {
                 let armed = gate.armed_pass();
                 if armed > 0 {
                     let poison = gate.poison_at();
@@ -5370,7 +5395,7 @@ impl<'a> HydraSpanSink<'a> {
                                 Some((c1, run_start, run_len)) => {
                                     gate.r41_fast.fetch_add(1, Ordering::Relaxed);
                                     self.dual_complete_one(
-                                        &gate,
+                                        gate,
                                         end_span,
                                         Some(c1),
                                         0,
@@ -5381,7 +5406,7 @@ impl<'a> HydraSpanSink<'a> {
                                 None => {
                                     gate.r41_scan.fetch_add(1, Ordering::Relaxed);
                                     self.dual_complete_one(
-                                        &gate,
+                                        gate,
                                         end_span,
                                         Some(self.dual_c1_pass),
                                         0,
@@ -5398,7 +5423,7 @@ impl<'a> HydraSpanSink<'a> {
                             if gate.p1_fold() < crate::dual::lane_end_at(end_span, 1) {
                                 break;
                             }
-                            self.dual_complete_one(&gate, end_span, None, 0, false, None);
+                            self.dual_complete_one(gate, end_span, None, 0, false, None);
                         }
                         continue;
                     } else {
@@ -5463,7 +5488,7 @@ impl<'a> HydraSpanSink<'a> {
                             }
                             None => (None, 0),
                         };
-                        self.dual_complete_one(&gate, end_span, c1, ov, true, None);
+                        self.dual_complete_one(gate, end_span, c1, ov, true, None);
                         continue;
                     }
                 }
@@ -5566,13 +5591,16 @@ impl<'a> HydraSpanSink<'a> {
     /// O(n²) pass is cold by construction).
     fn dual_complete_one(
         &mut self,
-        gate: &std::sync::Arc<crate::dual::DualGate>,
+        gate: &crate::dual::DualGate,
         end_span: u64,
         count_1: Option<u64>,
         overlap: u64,
         unsorted: bool,
         j1_run: Option<(u64, u64)>,
     ) {
+        // R41b: the merge's wall clock (the fleet's pricing instrument —
+        // P0's serial merge share on the DIAG line).
+        let merge_t0 = std::time::Instant::now();
         // R40d: THE ARRIVING-LAST ELECTION — the atomic swap. P1's
         // boundary step was its ARRIVAL (the run publication — it
         // proceeded into its next pass immediately, never waiting on
@@ -5808,6 +5836,7 @@ impl<'a> HydraSpanSink<'a> {
             );
         }
         self.dual_merges += 1;
+        self.dual_merge_ns += merge_t0.elapsed().as_nanos() as u64;
     }
 
     /// Harvest completed passes in order (oldest first). Returns the

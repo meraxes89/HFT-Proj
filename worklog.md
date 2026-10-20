@@ -379,3 +379,30 @@ Work Log:
 
 Stage Summary:
 - The R41 corridor unlock is implemented and locally validated; the dual's engagement telemetry (r41 fast/scan/arrivals/cursor_defers + the PR1_R41_COMPLETION_CADENCE_VERDICT line) arms the CI verdict. Ready to commit/push/monitor.
+
+---
+Task ID: R41-3
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: The R41 fleet verdict (run 39405512333, 41/41 green, 9 Zen 5 draws) + the R41b second surgical set.
+
+Work Log:
+- THE FLEET VERDICT: 108.9B-113.9B msg/s across 9 target draws (shard 2: 113.86B; 9: 108.92B; 20: 113.23B; 22: 110.30B; 23: 111.47B; 26: 111.40B; 31: 109.11B; 38: 111.60B; 40: 109.83B) — the arrival handshake is DEAD (fast=1,114,293 = every completion cursor-gated through the arrival fast path; scan=0; merges=arrivals=passes; poison=false; BIT-EXACT; allocs=0) but the rate is a wash vs the 108.1-117.4B baseline.
+- THE ANATOMY (the 11r40 arm, shard 2): passes=1,114,312 reset_ms=3,714.2 work_ms=633.0 fold_ms=462.2 pending_max=703,552 spans — the park persists but its CONTENT changed: it is now productive merge work + arrival-gap idle, no longer the arrival round-trip.
+- THE REAL COUPLINGS FOUND: p1_parks=21,595,504 (~19/pass) — the j1 ring's (2048-256)/86 ≈ 21-pass quantum: P1 fills j1, parks, P0's completions retire ~21 passes, P1 un-parks — the arrival frontier moves in 21-pass quanta paced by P0's merge bursts. Every completion pays the ~194-leaf two-finger + tree on P0's serial path (the merge IS the new wall), plus the per-completion Arc clone + ceremony.
+- THE R41b DESIGN: (1) widen the coupled rings — J1_CAP 2048→16384 (the quantum 21→166 passes), J1_HEADROOM 256→2048, ARR_SLOTS 64→256 (the arrival window law: ≥2× the 166-pass lead), RES_CAP 4096→16384 (the workers' drain-lead buffer), REC_RING 64→128 (the submission runway over the fold frontier); (2) hoist the per-completion Arc clone out of the completion loop; (3) P1's PER-PASS PRE-COMPOSED j1 — the crossing composes the run's leaves on P1's clock (tree_fold_segments over the staging) and pushes ONE composite leaf per pass: the merge's j1 side collapses, P0's merge tree halves (194→~109 leaves), and P1's tree work overlaps P0's submit/fold; (4) dual_merge_ns telemetry — the fleet prices whatever remains.
+
+Stage Summary:
+- R41 landed (the handshake kill, verified bit-exact at scale); R41b targets the merge serialization + the ring-coupled pacing. The corridor math: 4.5us/pass today -> ~3us with R41b -> R42 (the coarse-record grid, the workers' per-pass composites) kills P0's remaining ~1us tree.
+
+---
+Task ID: R41-4
+Agent: Principal Systems Engineer (main agent — Run 901 / R41)
+Task: R41b's implementation, the pre-compose refutation, and the landing of the sound subset.
+
+Work Log:
+- Implemented the R41b set: the ring widenings (J1_CAP 2048→8192, J1_HEADROOM 256→1024, ARR_SLOTS 64→256, RES_CAP 4096→16384, REC_RING 64→128), the per-completion Arc-clone hoist (one clone per complete_boundaries call, dual_complete_one now takes &DualGate), and the dual_merge_ns telemetry (the DIAG sustained line's merge_ms + dual_merge_stats()).
+- THE PRE-COMPOSE REFUTATION: implemented P1's per-pass pre-composed j1 (the crossing composes the run's staged leaves via tree_fold_segments and pushes ONE composite leaf) — the parity cell failed with a PERIODIC divergence (three consecutive wrong hashes every ~8-9 passes). ROOT CAUSE (mathematical, not implementational): the merge is a two-finger over the GLOBALLY INTERLEAVED leaf sequence (journal_0's lane-0 chunks alternate with j1's lane-1 chunks), and the semidirect law (k,B)∘(k',B') = (k+k', rotl(B,13k')^B') is NON-COMMUTATIVE — collapsing one lane's whole pass into a single composite REORDERS the merged sequence, and reordering changes the composite. Only globally-contiguous groups may compose, and the interleave granularity IS the leaf granularity — the pre-compose is structurally void. Reverted; the refutation is recorded in the code as the law's own documentation (R42's coarse-record grid is the sound amortization path).
+- VALIDATION (post-revert, rings re-applied): parity 30/30 + poison 15/15 hammers + t_r40 8/8 + hydra 39/39 + dual 6/6 + transport 36/36 + clippy CLEAN + the local bench BIT-EXACT at allocs=0.
+
+Stage Summary:
+- R41b lands the quantum widening (the j1/res/arrival/record rings — the 21-pass arrival quanta → ~82-pass, the workers' drain-lead buffer ×4, the submission runway ×2), the completion-loop Arc hoist, and the merge pricing telemetry. The corridor's next structural step (R42) is pinned by the refutation: the coarse-record grid.

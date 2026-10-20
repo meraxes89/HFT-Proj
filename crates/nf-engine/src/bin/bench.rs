@@ -1028,7 +1028,7 @@ fn run_hydra_sustained_5s(
     if diag {
         let (rp_batches, rp_live, rp_passes, rp_rerecords) = pass_replay.stats();
         eprintln!(
-            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} groups={} group_k={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
+            "DIAG sustained: passes={} reset_ms={:.1} scan_ms={:.1} end_ms={:.1} pending_max={} batches={} groups={} group_k={} wait_ms={:.1} work_ms={:.1} fold_ms={:.1} merge_ms={:.1} assist_chunks={} warm_skips={} selfserve_wins={} replay_batches={} replay_live={} replay_passes={} replay_rerecords={} bytes_per_msg={:.2} crc_demand_gb_s={:.2}",
             d_passes,
             d_reset_ns as f64 / 1e6,
             d_scan_ns as f64 / 1e6,
@@ -1040,6 +1040,7 @@ fn run_hydra_sustained_5s(
             d_wait_ns as f64 / 1e6,
             d_work_ns as f64 / 1e6,
             d_fold_ns as f64 / 1e6,
+            sink.dual_merge_stats().1 as f64 / 1e6,
             sink.assist_chunks(),
             sink.warm_skips(),
             sink.selfserve_wins(),

@@ -72,16 +72,19 @@ pub const RX_NARR: usize = 8;
 
 /// R27c: the RECORD ring depth — decoupled from the array ring
 /// (`RX_NARR`, which sizes the descriptor/tag rows and the 3-bit `aslot`
-/// field). The record ring is 4 KB of padded cursors, so it can afford to
-/// run 64 deep: the R27b fold watermark that guards each record-slot
-/// overwrite then only binds once the sink's window-open lead exceeds 63
-/// windows — outside any 5-second window's reachable lead (the R27c
-/// arithmetic: 830 ms of per-open watermark spins per sustained run
-/// collapse to zero, releasing the Zero-Reset Toroidal Pass to run
-/// copy-free AND wait-free). The array ring stays at 8 (the toroidal
-/// epoch freezes its slot; the rotating regime's reuse gate keeps its
-/// lockstep law, and the memory footprint stays flat).
-pub const REC_RING: usize = 64;
+/// field). The record ring is padded cursors, so it can afford depth:
+/// the R27b fold watermark that guards each record-slot overwrite only
+/// binds once the sink's window-open lead exceeds the depth minus one.
+/// R41b: 64 → 128 — the R41 fleet's live submission bound: the record
+/// gate (REC_RING windows of lead over the fold frontier, each exit
+/// costing one fold-period of progress through the never-yield spin)
+/// rides at the cap continuously on the dual arm; the doubled depth
+/// halves the gate's fire rate (the submission's burst cadence
+/// amortizes — the pace stays the fold's own). 128 × 64 B = 8 KB.
+/// The array ring stays at 8 (the toroidal epoch freezes its slot; the
+/// rotating regime's reuse gate keeps its lockstep law, and the memory
+/// footprint stays flat).
+pub const REC_RING: usize = 128;
 /// Chunk-state ring geometry: one u64 slot per chunk-grid position
 /// (global chunk id mod 2^15). The slot holds `chunk_id + 1` for an
 /// inline-claimed chunk (0 = none) — the VALUE CHECK makes aliasing

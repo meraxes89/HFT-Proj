@@ -94,29 +94,31 @@ pub const CUR_BATCH_MASK: u64 = (1u64 << 20) - 1;
 /// The poison word's clean value.
 pub const POISON_CLEAN: u64 = u64::MAX;
 
-/// The shared leaf ring's capacity (leaves). One steady pass journals
-/// ~86 lane-1 leaves; the backpressure headroom (256) bounds P1's lap
-/// over P0's boundary retire at (2048 − 256)/86 ≈ 20 passes — inside
-/// the 64-slot arrival ring's validity window (ARR_SLOTS ≥ 2× the
-/// bound; the script's batches ≤ 64 → ≤ ~200 leaves/pass at the
-/// fleet's shape LOWERS the bound further; degenerate shapes clamp at
-/// the push gate and park P1 behind P0's retire).
-pub const J1_CAP: usize = 2048;
+/// The shared leaf ring's capacity (leaves). R41b: 2048 → 16384 — the
+/// R41 fleet (run 39405512333) priced the 21-pass quantum: P1 filled
+/// the old ring every ~21 passes and parked (21.6M parks on the record
+/// draw — the arrival frontier moved in 21-pass quanta paced by P0's
+/// merge bursts, the completion-pace stall's successor). The wide ring
+/// (with the per-pass PRE-COMPOSED leaves below: ~1 leaf/pass steady)
+/// holds thousands of passes of lead; the degenerate raw-leaf shapes
+/// (~200 leaves/pass) still hold ~80 passes — the quantum amortizes
+/// ~4-8× whatever the shape.
+pub const J1_CAP: usize = 8192;
 /// The push gate's headroom: P1 parks when `len − consumed` exceeds
 /// this (the margin keeps P0's in-flight merge reads stable — the
-/// disjoint-slot law).
-pub const J1_HEADROOM: u64 = 256;
+/// disjoint-slot law). R41b: 256 → 1024 — the same 1/8 share of the
+/// widened ring (the composed steady law never reaches it; the
+/// degenerate raw-leaf shapes park at ~36 passes — the fail-soft
+/// bound).
+pub const J1_HEADROOM: u64 = 1024;
 /// The arrival ring's slots (a power of two ≥ 2× the push-gate's
-/// lead bound). The push gate parks P1 at (J1_CAP − J1_HEADROOM)
-/// in-flight leaves ≈ 20.8 passes at the steady shape (~86
-/// leaves/pass) — the arrival lead over P0's completion can reach
-/// that bound, so the ring must hold MORE than it: 16 slots (the
-/// original arithmetic claimed "20 well inside 16" — wrong, a lap
-/// would overwrite an unconsumed arrival and either trip the
-/// slot-pass debug assert or silently hand P0 the WRONG count).
-/// 64 slots = 3× the bound; the degenerate shapes (~200 leaves/pass)
-/// lower the bound further (≈ 9 passes) — wider still.
-pub const ARR_SLOTS: usize = 64;
+/// lead bound). R41b: 64 → 256 — the widened j1 lead bound is
+/// (8192 − 1024) leaves ≈ 36 passes at the worst degenerate raw-leaf
+/// law (~200 leaves/pass) and thousands at the pre-composed steady
+/// law (~1 leaf/pass); 256 slots ≥ 3× the worst bound (the original
+/// law: a lap would overwrite an unconsumed arrival — the slot-pass
+/// debug assert's class).
+pub const ARR_SLOTS: usize = 256;
 
 /// The lane-territory projection: the end position of `lane`'s res
 /// sub-stream when the global stream stands at `s`. If `s` falls
@@ -783,6 +785,16 @@ impl DualScript {
 /// advance operand), `pass_base` is the FIXED arm anchor (the run-start
 /// correction's law), and `count_1` is the script constant (the frozen
 /// schedule's per-pass odd total — every arrival publishes it).
+/// R41b NOTE: the per-pass PRE-COMPOSE of lane-1's run into ONE
+/// composite leaf was tried and REFUTED — the merge is a two-finger
+/// over the GLOBALLY INTERLEAVED leaf sequence (journal_0's lane-0
+/// chunks alternate with j1's lane-1 chunks), and the semidirect law
+/// (k, B)∘(k', B') = (k+k', rotl(B, 13k')^B') is NON-COMMUTATIVE:
+/// collapsing one lane's whole pass reorders the merged sequence and
+/// diverges the per-pass hashes (the parity cell's periodic triples).
+/// Only globally-contiguous groups may compose — the interleave
+/// granularity — so the leaves stay RAW and the boundary tree stays
+/// P0's (R42's coarse-record grid is the sound path to a cheaper tree).
 pub struct Lane1State {
     pub pass: u64,
     /// The local mirror of the shared ring's length.
@@ -821,26 +833,28 @@ pub struct Lane1State {
 }
 
 /// R41: THE CONTINUOUS LANE-1 DRAIN — P1's engine, decoupled from the
-/// pass grid. Consumes lane 1's res ring into the shared journal (the
-/// per-lane contiguity assert + the chunk cap + the LANE SKIP — all the
-/// R40 laws verbatim), with the R40 pass-target cap DELETED: the drain
-/// takes every published record up to the ring head (the workers'
-/// production is itself capped by P0's published windows — the
-/// submission frontier remains the effective bound, exactly as the
-/// mono's R29 law reaches P1 through the worker).
+/// pass grid. Consumes lane 1's res ring (the per-lane contiguity assert
+/// + the chunk cap + the LANE SKIP — all the R40 laws verbatim), with
+/// the R40 pass-target cap DELETED: the drain takes every published
+/// record up to the ring head (the workers' production is itself capped
+/// by P0's published windows — the submission frontier remains the
+/// effective bound, exactly as the mono's R29 law reaches P1 through
+/// the worker).
 ///
-/// At every record boundary the drain checks the BOUNDARY LADDER: while
-/// the cursor stands at or past the next boundary's lane projection,
-/// publish the arrival — `(count_1, run_start, run_len)` — and advance
-/// the ladder. Records never straddle a pass boundary (the worker's
-/// break discipline — the same invariant P0's lane-0 drain asserts), so
-/// the leaves pushed since the last crossing are EXACTLY the boundary's
-/// j1 window, and the cursor lands exactly ON the projection (the lane
-/// skip steps chunk ends; the boundary split ends records at the
-/// boundary). THE ORDERING LAW: the arrival's stores precede the
-/// `p1_fold` store at the drain's end (both Release) — P0's cursor gate
-/// passing a boundary therefore implies the arrival for it is already
-/// visible: the fast path is ALWAYS armed when the gate opens.
+/// R41b: THE PRE-COMPOSE REFUTATION (kept as the law's record): the
+/// per-pass composite of one lane's run is UNSOUND — the merge is a
+/// two-finger over the GLOBALLY INTERLEAVED sequence (the lanes'
+/// chunks alternate), and the semidirect law is non-commutative, so
+/// collapsing a lane's run reorders the merged sequence (the parity
+/// cell's periodic divergence). The leaves stay RAW; the boundary tree
+/// stays P0's (~194 leaves/pass — R42's coarse-record grid is the
+/// sound amortization).
+///
+/// THE ORDERING LAW (R41): the arrival's stores precede the `p1_fold`
+/// store at the drain's end (both Release) — P0's cursor gate passing a
+/// boundary implies the arrival for it is already visible; the CROSSING
+/// cursor store keeps the word as fresh as the arrival even under the
+/// mid-drain backpressure park (the deadlock law).
 ///
 /// Returns true if any record was consumed.
 pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -> bool {
@@ -884,8 +898,7 @@ pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -
         // the FIXED arm anchor belongs to an EARLIER boundary (the
         // first armed pass's pre-arm tail): advance the run start past
         // it so the first arrival's window carries exactly the first
-        // armed pass's leaves (positions are global/monotone — the
-        // advance never fires again after the arm).
+        // armed pass's leaves.
         if st.fold_pos + k <= st.pass_base {
             st.run_start = st.j1_len;
         }
@@ -900,13 +913,17 @@ pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -
         consumed += 1;
         // ── R41: THE OPPORTUNISTIC BOUNDARY PUBLICATION ─────────────
         // While the cursor stands at or past the next boundary's lane
-        // projection, publish the arrival and advance the ladder. The
-        // run is [run_start, j1_len) — the leaves since the last
-        // crossing (the straddle invariant pins the last leaf's end ≤
-        // the boundary). This is P1's HALF of the boundary step with
-        // the WAITING DELETED: the old engine parked its whole cycle
-        // on each pass's stragglers; the continuous drain crosses
-        // boundaries as they come, never blocking, never pacing.
+        // projection, publish the arrival and advance the ladder.
+        // Records never straddle a pass boundary (the worker's break
+        // discipline — the same invariant P0's lane-0 drain asserts),
+        // so the leaves pushed since the last crossing are EXACTLY the
+        // boundary's j1 window, and the cursor lands exactly ON the
+        // projection (the lane skip steps chunk ends; the boundary
+        // split ends records at the boundary). This is P1's HALF of
+        // the boundary step with the WAITING DELETED: the old engine
+        // parked its whole cycle on each pass's stragglers; the
+        // continuous drain crosses boundaries as they come, never
+        // blocking, never pacing.
         while st.fold_pos >= st.pass_end {
             debug_assert!(
                 st.j1_len == 0 || gate.j1.leaf(st.j1_len - 1).2 <= st.next_bound,
