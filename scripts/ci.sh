@@ -626,7 +626,9 @@ grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_vl.txt
 grep -q "allocs=0" /tmp/bench_vl.txt
 grep -q "PR1_R29_SELF_SERVE_VERDICT rate=" /tmp/bench_vl.txt
 grep "PR1_R29_SELF_SERVE_VERDICT" /tmp/bench_vl.txt | head -1
-grep "LADDER_DIAGNOSTIC" /tmp/bench_vl.txt | tail -1
+# R40d: the dead grep removed — LADDER_DIAGNOSTIC is hft_bench's line
+# (the F-3 arms), not the bench binary's; the `| tail -1` masked the
+# no-match pre-pipefail. The arm's law lives in its -q greps above.
 grep "R16B_RXDESC_VERDICT" /tmp/bench_vl.txt | tail -1
 
 echo "=== 11se. R31-A: the session-elision rollback (HFT_SESSION_ELISION=0 attribution) ==="
