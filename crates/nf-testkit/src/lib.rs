@@ -18,6 +18,7 @@ pub mod fakeserver;
 pub mod golden;
 pub mod hydra;
 pub mod lobstate;
+pub mod multivenue;
 pub mod passreplay;
 pub mod orderscan;
 pub mod sigfabric;
