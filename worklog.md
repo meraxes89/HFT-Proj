@@ -467,3 +467,19 @@ Work Log:
 
 Stage Summary:
 - R42 IS FLEET-PROVEN: 319-342B msg/s on the target silicon, BIT-EXACT, allocs=0, every engagement law held. The 200B milestone (1T msgs ≤ 5.0s) is delivered at 1.71T. The R42-II fix pushes for the clean 41/41.
+
+---
+Task ID: R42-FINAL
+Agent: Principal Systems Engineer (main agent — Run 901 / R42)
+Task: The clean-run verdict (run 39445265319 on ee2736f) + the session's closing state (PR #23, branch feat/r41-completion-cadence-200b).
+
+Work Log:
+- THE CLEAN RUN: 41/41 SHARDS GREEN (the R42-II arm-completive fix held — shard 19 drew a Zen 5 this time and its poison cell passed).
+- THE FINAL RATES (7 Zen 5 draws): 317.2B / 321.2B / 321.2B / 321.3B / 322.2B / 337.9B / 339.7B msg/s — consistent with the first R42 draw's 319.3-342.0B. TWELVE Zen 5 draws across two consecutive runs, every one past the directive's 210B-235B corridor.
+- THE ENGAGEMENT LAWS on the record draws: BIT-EXACT, allocs=0, elision=true, merges=arrivals=passes (fast=3,339,589, scan=0 — every completion cursor-gated), p1_parks=0, poison=false, self-serve armed + rx_retired.
+- THE MILESTONE: 1 Trillion messages in ≤ 5.0 seconds — DELIVERED at 1.71T on the best draw (71% headroom); the sustained class is now 317-342B msg/s (from the 108.1-117.4B R40d baseline — 2.7-2.9×).
+
+Stage Summary:
+- LANDED (CI-verified, bit-exact, allocs=0, 41/41): THE COARSE-RECORD GRID — CHUNK 512 (the lane runs widened 8×), the three capacity guards tracked to the widened buffer (the hidden lever-disabler), the ring laws re-derived (ARR_SLOTS 2048, DESC_CAP 8192, the FJ cancellation), the RESLOG phase tables boxed+guarded (the A-1 OOB class killed), the cells re-derived, the engagement laws made load-honest, the arm-completive window.
+- THE DIRECTIVE'S THREE ITEMS: (1) the 512-span composite records — delivered (~27 leaves/pass); (2) the compressed Blelloch up-sweep — delivered (8→5 levels, merge 2.31µs → 0.52-0.56µs/pass); (3) the 200B milestone — EXCEEDED (317-342B, every draw).
+- THE NEXT WALL (out of scope, telemetried): the fold+merge serialization on P0's path (fold ~45% + merge ~35% of the window at the new operating point).
