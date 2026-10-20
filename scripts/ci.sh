@@ -98,7 +98,10 @@ echo "=== 5. Unit & Conformance Tests ==="
 TRYBUILD=overwrite cargo test --workspace -- --include-ignored
 
 echo "=== 6. Full Day Audit & Histogram Diff ==="
-cargo run --release -p nf-engine --bin audit -- data/tests/sample-mini.itch 2>&1 | tee /tmp/h.txt
+# NOTE (R40d): NO 2>&1 here — the histogram DIFF below compares this
+# file against the golden byte-for-byte; cargo's stderr (Finished/
+# Running) would pollute it. The audit's verdict lines are stdout.
+cargo run --release -p nf-engine --bin audit -- data/tests/sample-mini.itch | tee /tmp/h.txt
 diff /tmp/h.txt data/tests/mini-histogram.txt
 
 echo "=== 7. Replay Conformance & Golden Hash Check ==="
