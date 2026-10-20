@@ -5308,10 +5308,18 @@ impl<'a> HydraSpanSink<'a> {
                             // law: a lagging P1 defers the completion;
                             // P0 never blocks — the tail folds during
                             // the next pass exactly as the mono's does).
-                            match gate.arrival(pass_id) {
-                                Some(c1) => {
-                                    self.dual_complete_one(&gate, end_span, Some(c1), 0, false)
-                                }
+                            // R40d: the FULL arrival — the count AND the
+                            // pre-staged j1 run window (P1's boundary
+                            // step; the compacted run-drain's operands).
+                            match gate.arrival_full(pass_id) {
+                                Some((c1, run_start, run_len)) => self.dual_complete_one(
+                                    &gate,
+                                    end_span,
+                                    Some(c1),
+                                    0,
+                                    false,
+                                    Some((run_start, run_len)),
+                                ),
                                 None => {
                                     gate.arrival_defers.fetch_add(1, Ordering::Relaxed);
                                     break;
@@ -5325,7 +5333,7 @@ impl<'a> HydraSpanSink<'a> {
                             if gate.p1_fold() < crate::dual::lane_end_at(end_span, 1) {
                                 break;
                             }
-                            self.dual_complete_one(&gate, end_span, None, 0, false);
+                            self.dual_complete_one(&gate, end_span, None, 0, false, None);
                         }
                         continue;
                     } else {
@@ -5390,7 +5398,7 @@ impl<'a> HydraSpanSink<'a> {
                             }
                             None => (None, 0),
                         };
-                        self.dual_complete_one(&gate, end_span, c1, ov, true);
+                        self.dual_complete_one(&gate, end_span, c1, ov, true, None);
                         continue;
                     }
                 }
@@ -5498,44 +5506,153 @@ impl<'a> HydraSpanSink<'a> {
         count_1: Option<u64>,
         overlap: u64,
         unsorted: bool,
+        j1_run: Option<(u64, u64)>,
     ) {
+        // R40d: THE ARRIVING-LAST ELECTION — the atomic swap. P1's
+        // boundary step was its ARRIVAL (the run publication — it
+        // proceeded into its next pass immediately, never waiting on
+        // P0); THIS completion is the arriving-last finalize (both
+        // lanes' cursors crossed + the arrival landed — the second
+        // event observed). `fetch_max` is the swap: a boundary already
+        // finalized (the deferred / recomposed edge) makes this
+        // attempt the loser — the merge runs EXACTLY ONCE per
+        // boundary, fail-loud on any protocol break that would run it
+        // twice.
+        if !gate.boundary_elect(end_span) {
+            debug_assert!(
+                false,
+                "R40d: boundary {end_span} finalized twice (the election's loser must not reach here)"
+            );
+            return;
+        }
         // The partitions: journal_0's leading leaves ≤ end_span …
         let p0 = self.journal.partition_len(end_span);
-        // … and j1's unconsumed leaves ≤ end_span (push-ordered by
-        // end — the lane-1 sub-stream's monotone positions).
+        // … and j1's window — R40d: THE COMPACTED RUN-DRAIN. The
+        // arrival's PRE-STAGED run bounds ARE the partition (P1's
+        // frontier cap parks any record ending beyond its pass target,
+        // so every leaf of the run [run_start, run_start+run_len) ends
+        // ≤ the lane projection ≤ end_span — the window IS the scan's
+        // result, computed on P1's clock instead of P0's per-record
+        // ring walk). The consistency law pins the protocol: the run's
+        // start must equal j1's retire cursor (the previous boundary's
+        // partition — P1's per-record run-start advance and the
+        // territory-gap law guarantee it; a divergence means the
+        // rendezvous broke and MUST fail loud). The fallback paths
+        // (pre-arm / zombie — no arrival) keep the record-by-record
+        // scan (cold by construction).
         let j1c = gate.j1.consumed();
         let j1s = gate.j1.snapshot();
-        let mut j1p = j1c;
-        while j1p < j1s && gate.j1.leaf(j1p).2 <= end_span {
-            j1p += 1;
-        }
+        let j1p = match j1_run {
+            Some((run_start, run_len)) => {
+                assert_eq!(
+                    run_start, j1c,
+                    "R40d: the arrival's run start {} != j1's retire cursor {} \
+                     (the boundary protocol broke — the run window is not the partition)",
+                    run_start, j1c
+                );
+                let jp = run_start + run_len;
+                assert!(
+                    jp <= j1s,
+                    "R40d: the arrival's run end {} > j1's published length {} \
+                     (the arrival lied — P1's sweep discipline broke)",
+                    jp, j1s
+                );
+                jp
+            }
+            None => {
+                let mut j1p = j1c;
+                while j1p < j1s && gate.j1.leaf(j1p).2 <= end_span {
+                    j1p += 1;
+                }
+                j1p
+            }
+        };
         debug_assert!(j1p - j1c <= crate::dual::J1_CAP as u64);
-        // THE MERGE into the staging (k, b, end).
+        // THE MERGE into the staging (k, b, end) — R40d: the COMPACTED
+        // RUN-DRAIN. The two-finger is RUN-BASED over a GLOBAL j1
+        // cursor (the window's two wrap segments are addressed through
+        // one `j1_head(g)` view — segment 1 then segment 2, ring order
+        // = the monotone end order, so the merge law is exactly the
+        // classic two-finger's): both sides are end-sorted, so the
+        // merge takes whole RUNS from each side (the LANE-INTERLEAVE
+        // law makes the runs chunk-groups — journal_0's lane-0 chunks
+        // alternate with j1's lane-1 chunks); each run is one (or two,
+        // at the wrap split) `copy_from_slice` per column — the
+        // vectorized block consume. The old per-record `leaf()` reads
+        // (three masked UnsafeCell derefs per leaf) are gone. Tie law:
+        // journal_0's leaf wins an end-position tie (the classic's
+        // `journal.end[i] <= j1_end` — bit-exactness with the mono
+        // drain's sequence).
         let mut m = 0usize;
         let mut sheaf_j1 = 0u64;
         if !unsorted {
-            let mut i = 0usize;
-            let mut j = j1c;
-            while i < p0 || j < j1p {
-                let take0 = if i < p0 {
-                    j >= j1p || self.journal.end[i] <= gate.j1.leaf(j).2
+            let [(k1, b1, e1), (k2, b2, e2)] = gate.j1.run_segments(j1c, j1p);
+            let seg1_len = k1.len();
+            let total = (j1p - j1c) as usize;
+            // The next unread j1 leaf's end at window position `g`
+            // (u64::MAX past the window — the sentinel that lets the
+            // journal run extend freely ONLY at the true end).
+            let j1_head = |g: usize| -> u64 {
+                if g < seg1_len {
+                    e1[g]
+                } else if g < total {
+                    e2[g - seg1_len]
                 } else {
-                    false
-                };
-                if take0 {
-                    self.dual_staging_k[m] = self.journal.k[i];
-                    self.dual_staging_b[m] = self.journal.b[i];
-                    self.dual_staging_e[m] = self.journal.end[i];
-                    i += 1;
-                } else {
-                    let (k, b, e) = gate.j1.leaf(j);
-                    self.dual_staging_k[m] = k;
-                    self.dual_staging_b[m] = b;
-                    self.dual_staging_e[m] = e;
-                    sheaf_j1 += k as u64;
-                    j += 1;
+                    u64::MAX
                 }
-                m += 1;
+            };
+            let mut i = 0usize; // journal_0's cursor
+            let mut g = 0usize; // the j1 window's global cursor
+            while i < p0 || g < total {
+                if i < p0 && self.journal.end[i] <= j1_head(g) {
+                    // journal_0's run: extend while its next end stays
+                    // at or below the j1 head.
+                    let start = i;
+                    while i < p0 && self.journal.end[i] <= j1_head(g) {
+                        i += 1;
+                    }
+                    let r = i - start;
+                    self.dual_staging_k[m..m + r].copy_from_slice(&self.journal.k[start..i]);
+                    self.dual_staging_b[m..m + r].copy_from_slice(&self.journal.b[start..i]);
+                    self.dual_staging_e[m..m + r].copy_from_slice(&self.journal.end[start..i]);
+                    m += r;
+                } else {
+                    // j1's run: extend while its next end stays
+                    // strictly below the journal head (the tie goes to
+                    // journal_0 — the loop's next iteration takes it).
+                    let jhead = if i < p0 {
+                        self.journal.end[i]
+                    } else {
+                        u64::MAX
+                    };
+                    let start = g;
+                    while g < total && j1_head(g) < jhead {
+                        g += 1;
+                    }
+                    // The run [start, g) — at most two segments (the
+                    // wrap split); the per-column block copies.
+                    let mid = g.min(seg1_len);
+                    if start < mid {
+                        let r = mid - start;
+                        self.dual_staging_k[m..m + r].copy_from_slice(&k1[start..mid]);
+                        self.dual_staging_b[m..m + r].copy_from_slice(&b1[start..mid]);
+                        self.dual_staging_e[m..m + r].copy_from_slice(&e1[start..mid]);
+                        sheaf_j1 += k1[start..mid].iter().map(|&k| k as u64).sum::<u64>();
+                        m += r;
+                    }
+                    if g > seg1_len {
+                        let s2 = start.max(seg1_len) - seg1_len;
+                        let e2i = g - seg1_len;
+                        let r = e2i - s2;
+                        if r > 0 {
+                            self.dual_staging_k[m..m + r].copy_from_slice(&k2[s2..e2i]);
+                            self.dual_staging_b[m..m + r].copy_from_slice(&b2[s2..e2i]);
+                            self.dual_staging_e[m..m + r].copy_from_slice(&e2[s2..e2i]);
+                            sheaf_j1 += k2[s2..e2i].iter().map(|&k| k as u64).sum::<u64>();
+                            m += r;
+                        }
+                    }
+                }
             }
         } else {
             // The sort path: copy both partitions, insertion-sort by
@@ -10303,6 +10420,7 @@ mod tests {
             true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
                   // identity guard is the replay's oracle (the champion shape).
             true, // R35-A: prearm mirrors the sched-replay arm (the champion shape)
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -10455,6 +10573,7 @@ mod tests {
             true, // R33-A: the schedule replay ON — the R32 ledger's (rx_start,len)
                   // identity guard is the replay's oracle (the champion shape).
             true, // R35-A: prearm mirrors the sched-replay arm (the champion shape)
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -10723,6 +10842,7 @@ mod tests {
             true,
             true,
             true,
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");
@@ -11136,6 +11256,7 @@ mod tests {
             true,
             true,
             true,
+            true, // R40d: the self-serve transport's arm request
         );
         if let Some(st) = fabric.rxdesc_state() {
             assert!(t.set_rxdesc(st), "set_rxdesc must attach once");

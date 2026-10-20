@@ -986,7 +986,19 @@ fn run_hydra_sustained_5s(
     // bare shutdown word would freeze P1's cursor mid-stream and hang
     // the finish on a lagging P1).
     probe("pre-finish", probe_base);
+    // R40d: THE EXIT LATCH — armed BEFORE the shutdown word (P1's
+    // terminal park engages at its p1_done instead of tearing down:
+    // the thread's TWO heap frees — the spawn closure + the Thread
+    // inner — must land OUTSIDE the allocation counter's window; the
+    // harness releases AFTER the closing snapshot below. This is the
+    // "2 in-window counter deltas" fix — the allocs=0 law's last edge
+    // (HFT_DUAL_EXIT_HOLD=0 disarms; the 250ms bounded park makes a
+    // missing release a non-hang).
+    let exit_hold = std::env::var("HFT_DUAL_EXIT_HOLD").as_deref() != Ok("0");
     if let Some(g) = &gate {
+        if exit_hold {
+            g.arm_exit_hold();
+        }
         g.initiate_shutdown(sink.submission_frontier());
     }
     sink.finish();
@@ -1001,6 +1013,11 @@ fn run_hydra_sustained_5s(
     let dt_ns = t_end_mono.saturating_sub(t_start_mono);
     let (a2, d2) = GLOBAL.snapshot();
     let alloc_delta = (a2 - a1) + (d2 - d1);
+    // R40d: THE EXIT LATCH's release — AFTER the closing snapshot: P1's
+    // teardown frees now land outside every measured window.
+    if let Some(g) = &gate {
+        g.release_exit();
+    }
 
     let sustained_rate = if dt_ns > 0 {
         ((total_msgs as f64) / (dt_ns as f64) * 1e9) as u64
@@ -1193,6 +1210,23 @@ fn run_hydra_sustained_5s(
             g.arrival_defers.load(std::sync::atomic::Ordering::Relaxed),
             g.p1_parks.load(std::sync::atomic::Ordering::Relaxed),
             poison
+        );
+    }
+    // R40d: THE ZERO-THREAD INGEST's verdict line — the self-serve
+    // transport's engagement row (armed=true on every frozen-regime
+    // run — construction-determined, never contention-dependent; the
+    // RX's own counters FREEZE at its retirement: rx_retired=true is
+    // the fifth-thread-gone signature; the folded sched law keeps its
+    // shape). HFT_SS_TRANSPORT=0 is the rollback (the mailbox path).
+    {
+        let (ss_armed, ss_passes, ss_rows) = transport.self_serve_stats();
+        println!(
+            "PR1_R40D_SELF_SERVE_VERDICT rate={} armed={} passes={} rows={} rx_retired={} (R40d: the zero-thread ingest — the frozen schedule walked by the consumer, the RX retired at the takeover: 4 threads on 4 vCPUs, no mailbox waits/frees/wakes on the steady path; HFT_SS_TRANSPORT=0 restores the mailbox)",
+            sustained_rate,
+            ss_armed,
+            ss_passes,
+            ss_rows,
+            transport.rx_retired()
         );
     }
     // R33: the producer-side elision's verdict line — the publication-

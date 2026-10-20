@@ -1060,6 +1060,11 @@ grep -q "allocs=0" /tmp/bench_r37.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r37.txt
 grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=true" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT rate=" /tmp/bench_r37.txt
+# R40d: the zero-thread ingest's engagement law (mono arms too — the
+# transport self-serve is shape-independent; rx_retired=true is the
+# fifth-thread-gone signature on every frozen-regime run).
+grep -q "PR1_R40D_SELF_SERVE_VERDICT.*armed=true" /tmp/bench_r37.txt
+grep -q "PR1_R40D_SELF_SERVE_VERDICT.*rx_retired=true" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*tree=true" /tmp/bench_r37.txt
 grep -q "PR1_R37_TREE_FOLD_VERDICT.*workers=2" /tmp/bench_r37.txt
 grep -q "FOLDTREE_DIAGNOSTIC sustained: tree=true" /tmp/bench_r37.txt
@@ -1174,6 +1179,12 @@ grep -q "allocs=0" /tmp/bench_r40.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40.txt
 grep -q "PR1_R36_EVAL_ELISION_VERDICT.*elision=true" /tmp/bench_r40.txt
 grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r40.txt
+# R40d: THE ZERO-THREAD INGEST's engagement law — the self-serve
+# transport arms on every frozen-regime run (construction-determined)
+# and the RX retires (rx_retired=true: the fifth thread is GONE; 4
+# threads on 4 vCPUs). The folded sched law keeps its shape.
+grep -q "PR1_R40D_SELF_SERVE_VERDICT.*armed=true" /tmp/bench_r40.txt
+grep -q "PR1_R40D_SELF_SERVE_VERDICT.*rx_retired=true" /tmp/bench_r40.txt
 grep -q "PR1_R40_DUAL_PRODUCER_VERDICT rate=" /tmp/bench_r40.txt
 grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*attached=true" /tmp/bench_r40.txt
 grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*armed_from=[1-9]" /tmp/bench_r40.txt
@@ -1181,6 +1192,7 @@ grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*merges=[1-9]" /tmp/bench_r40.txt
 grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*p1_records=[1-9]" /tmp/bench_r40.txt
 grep -q "PR1_R40_DUAL_PRODUCER_VERDICT.*poison=false" /tmp/bench_r40.txt
 grep "PR1_R40_DUAL_PRODUCER_VERDICT" /tmp/bench_r40.txt | head -1
+grep "PR1_R40D_SELF_SERVE_VERDICT" /tmp/bench_r40.txt | head -1
 grep "PR1_R39_GROUP_SWEEP_VERDICT" /tmp/bench_r40.txt | head -1
 grep "DIAG sustained: passes" /tmp/bench_r40.txt | tail -1
 
@@ -1196,6 +1208,11 @@ grep "DIAG sustained: passes" /tmp/bench_r40.txt | tail -1
 # both arms' numbers).
 HFT_RXDESC=1 HFT_RES_REPLAY=1 HFT_ORDER_SCAN=1 HFT_SUSTAINED_WORKERS=2 HFT_DUAL_PRODUCER=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r40r.txt
 grep -q "PR1_HYDRA_SUSTAINED_VERDICT" /tmp/bench_r40r.txt
+# R40d: the zero-thread ingest's engagement law (mono arms too — the
+# transport self-serve is shape-independent; rx_retired=true is the
+# fifth-thread-gone signature on every frozen-regime run).
+grep -q "PR1_R40D_SELF_SERVE_VERDICT.*armed=true" /tmp/bench_r40r.txt
+grep -q "PR1_R40D_SELF_SERVE_VERDICT.*rx_retired=true" /tmp/bench_r40r.txt
 grep -q "allocs=0" /tmp/bench_r40r.txt
 grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r40r.txt
 grep -q "PR1_R39_GROUP_SWEEP_VERDICT.*armed=true" /tmp/bench_r40r.txt

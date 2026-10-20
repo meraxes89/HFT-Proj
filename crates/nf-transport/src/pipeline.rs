@@ -584,6 +584,34 @@ struct Mailbox {
     /// clean boundary (no overshoot race) at ANY ring depth. HFT_PREARM=0
     /// is the rollback (the synchronous marker-free advance verbatim).
     prearm: bool,
+    /// R40d (THE ZERO-THREAD INGEST): the schedule-replay regime's
+    /// construction word — `sched_replay && elision_armed` (the exact
+    /// gate the RX's `RxSched::Play` arm computes). The consumer's
+    /// SELF-SERVE arm requires it: only under the frozen-master regime
+    /// is the publication stream a PURE FUNCTION of the construction
+    /// (docs/44's pass-invariance law), so the table the RX hands over
+    /// IS every later pass's publication stream verbatim.
+    sched_replay_armed: bool,
+    /// R40d: THE FROZEN SCHEDULE'S HANDOFF — the RX publishes its
+    /// recorded table at the freeze (`OnceLock::set` is the Release
+    /// barrier; the RX's own `RxSched::Play` holds the SAME `Arc`, so
+    /// producer and consumer walk one allocation). The consumer arms
+    /// the self-serve path at the next clean boundary and RETIRES the
+    /// RX: from that pass on, `next_group`/`entries`/`now_ns`/
+    /// `batch_bounds`/`reset_pass` walk the table + the immutable
+    /// master DIRECTLY (the R29 zero-thread-ingest law extended to the
+    /// transport plane) — no mailbox waits, no frees, no wakes, and the
+    /// 5th thread is gone (4 threads on 4 vCPUs).
+    #[allow(clippy::disallowed_types)] // Tier-F: construction/freeze-time set-once only
+    sched_table: OnceLock<Arc<Box<[PubRec]>>>,
+    /// R40d: the RX's retirement word — the consumer sets it (Release)
+    /// when the self-serve path arms. The RX exits at its loop top (or
+    /// the EOS park's check); the in-flight publications of the arming
+    /// pass are abandoned (the consumer never reads the mailbox again —
+    /// the table is the stream, the master is construction-frozen, and
+    /// nothing the RX owned is referenced by anyone). The `wake` bump
+    /// that accompanies the set releases any parked RX immediately.
+    rx_retire: AtomicBool,
 }
 
 // SAFETY: the mailbox is the SPSC handoff described in the module doc —
@@ -861,8 +889,12 @@ enum RxSched {
     Rec(Vec<PubRec>),
     /// Armed (from the first auto-advance on): publications re-emit the
     /// frozen table; the table's end IS the pass's EOS position.
+    /// R40d: the table is the SHARED `Arc` handed to the consumer
+    /// through `mb.sched_table` at the freeze — the RX's replay and the
+    /// consumer's self-serve walk the same allocation.
     Play {
-        s: Box<[PubRec]>,
+        #[allow(clippy::disallowed_types)] // Tier-F: the freeze-time Arc
+        s: Arc<Box<[PubRec]>>,
         i: usize,
     },
 }
@@ -1434,6 +1466,25 @@ fn rx_thread(
         if mb.shutdown.load(Ordering::Acquire) {
             return;
         }
+        // R40d: THE RETIREMENT — the consumer armed the self-serve path
+        // (the frozen schedule's handoff above) and set the word; this
+        // thread's remaining duties are structurally absent (the table
+        // is the stream, the master is construction-frozen, the advance
+        // under elision is a zero-write). Exit here — the fifth thread
+        // is gone (4 threads on 4 vCPUs, zero context switches on the
+        // steady path). In-flight publications of the arming pass are
+        // abandoned: nobody reads the mailbox from this point on.
+        if mb.rx_retire.load(Ordering::Acquire) {
+            // R40d: THE BLOB LIFETIME LAW — the consumer's self-serve
+            // path reads the master's entries (and the rxdesc affine
+            // ledger's body pointers) into this transport's BLOB, which
+            // this thread owns. The retirement must NOT free it: LEAK
+            // `inner` (the sustained arm's own law — a one-shot process;
+            // the exit reclaims — the same footprint the classic path
+            // holds until Drop anyway).
+            std::mem::forget(inner);
+            return;
+        }
         // R33-A: the replay position — (has-next, at-end-of-schedule).
         // `at-end` means THIS turn is the pass's EOS marker (the frozen
         // schedule's length IS the EOS position): no data publication,
@@ -1453,7 +1504,12 @@ fn rx_thread(
             // it and futex-wakes `wake`. Cleared when the buffer lands.
             let mut marked_parked = false;
             while mb.freed[i].load(Ordering::Acquire) < needed {
-                if mb.shutdown.load(Ordering::Acquire) {
+                if mb.shutdown.load(Ordering::Acquire)
+                    || mb.rx_retire.load(Ordering::Acquire)
+                {
+                    if mb.rx_retire.load(Ordering::Acquire) {
+                        std::mem::forget(inner); // R40d: the blob lifetime law
+                    }
                     return;
                 }
                 if mb.cmd.load(Ordering::Acquire) == CMD_RESET {
@@ -1782,7 +1838,12 @@ fn rx_thread(
                 let needed = turn >> nbuf_shift;
                 let mut backoff = 0u32;
                 while mb.freed[j].load(Ordering::Acquire) < needed {
-                    if mb.shutdown.load(Ordering::Acquire) {
+                    if mb.shutdown.load(Ordering::Acquire)
+                        || mb.rx_retire.load(Ordering::Acquire)
+                    {
+                        if mb.rx_retire.load(Ordering::Acquire) {
+                            std::mem::forget(inner); // R40d: the blob lifetime law
+                        }
                         return;
                     }
                     if backoff < 6 {
@@ -1791,6 +1852,7 @@ fn rx_thread(
                         let observed = mb.wake.load(Ordering::Acquire);
                         if mb.freed[j].load(Ordering::Acquire) < needed
                             && !mb.shutdown.load(Ordering::Acquire)
+                            && !mb.rx_retire.load(Ordering::Acquire)
                         {
                             futex_wait_timeout(&mb.wake, observed, BUF_PARK_NS);
                         }
@@ -1824,7 +1886,12 @@ fn rx_thread(
                 let mut backoff = 0u32;
                 let mut gated = false;
                 while mb.freed[g].load(Ordering::Acquire) < gneed {
-                    if mb.shutdown.load(Ordering::Acquire) {
+                    if mb.shutdown.load(Ordering::Acquire)
+                        || mb.rx_retire.load(Ordering::Acquire)
+                    {
+                        if mb.rx_retire.load(Ordering::Acquire) {
+                            std::mem::forget(inner); // R40d: the blob lifetime law
+                        }
                         return;
                     }
                     if mb.cmd.load(Ordering::Acquire) == CMD_RESET {
@@ -1849,6 +1916,7 @@ fn rx_thread(
                         if mb.freed[g].load(Ordering::Acquire) < gneed
                             && mb.cmd.load(Ordering::Acquire) != CMD_RESET
                             && !mb.shutdown.load(Ordering::Acquire)
+                            && !mb.rx_retire.load(Ordering::Acquire)
                         {
                             futex_wait_timeout(&mb.wake, observed, BUF_PARK_NS);
                         }
@@ -1872,10 +1940,22 @@ fn rx_thread(
             if matches!(sched, RxSched::Rec(_)) {
                 let taken = std::mem::replace(&mut sched, RxSched::Off);
                 sched = match taken {
-                    RxSched::Rec(v) if !v.is_empty() => RxSched::Play {
-                        s: v.into_boxed_slice(),
-                        i: 0,
-                    },
+                    RxSched::Rec(v) if !v.is_empty() => {
+                        // R40d: THE HANDOFF — the frozen schedule is
+                        // published to the Mailbox (the OnceLock's set is
+                        // the Release barrier; the RX keeps the same Arc,
+                        // so there is no second allocation — the allocs=0
+                        // law). The consumer's `reset_pass` arms the
+                        // self-serve path at the next clean boundary and
+                        // retires this thread: the table IS every later
+                        // pass's publication stream (the pass-invariance
+                        // law above — the pure function of the
+                        // construction).
+                        #[allow(clippy::disallowed_types)] // the freeze-time Arc
+                        let table: Arc<Box<[PubRec]>> = Arc::new(v.into_boxed_slice());
+                        let _ = mb.sched_table.set(Arc::clone(&table));
+                        RxSched::Play { s: table, i: 0 }
+                    }
                     _ => RxSched::Off,
                 };
                 // R35-A: the degenerate-empty-recording disarm's twin — a
@@ -1959,7 +2039,12 @@ fn rx_thread(
                     let need = ((turn - 1) >> nbuf_shift) + 1;
                     let mut backoff = 0u32;
                     loop {
-                        if mb.shutdown.load(Ordering::Acquire) {
+                        if mb.shutdown.load(Ordering::Acquire)
+                            || mb.rx_retire.load(Ordering::Acquire)
+                        {
+                            if mb.rx_retire.load(Ordering::Acquire) {
+                                std::mem::forget(inner); // R40d: the blob lifetime law
+                            }
                             return;
                         }
                         if mb.freed[j].load(Ordering::Acquire) >= need {
@@ -2006,6 +2091,7 @@ fn rx_thread(
                             let observed = mb.wake.load(Ordering::Acquire);
                             if mb.freed[j].load(Ordering::Acquire) < need
                                 && !mb.shutdown.load(Ordering::Acquire)
+                                && !mb.rx_retire.load(Ordering::Acquire)
                             {
                                 futex_wait_timeout(&mb.wake, observed, BUF_PARK_NS);
                             }
@@ -2209,6 +2295,13 @@ fn rx_thread(
                 if mb.shutdown.load(Ordering::Acquire) {
                     return;
                 }
+                // R40d: the retirement word releases an EOS-parked RX
+                // too (the wake bump that accompanies the set breaks
+                // this futex wait; the word check exits here).
+                if mb.rx_retire.load(Ordering::Acquire) {
+                    std::mem::forget(inner); // R40d: the blob lifetime law
+                    return;
+                }
                 let observed = mb.wake.load(Ordering::Acquire);
                 if mb.cmd.load(Ordering::Acquire) == CMD_RUN {
                     futex_wait(&mb.wake, observed);
@@ -2254,6 +2347,45 @@ pub struct PipelinedReplayTransport {
     group_lo: u64,
     /// R39: the current group's batch count (0 outside a group).
     group_n: usize,
+    /// R40d: THE SELF-SERVE TRANSPORT — the frozen schedule the RX
+    /// handed over at the freeze plus this consumer's row cursor.
+    /// Armed at the first clean boundary under the frozen-master
+    /// regime: `next_group`/`next_batch`/`select_group_batch`/
+    /// `entries`/`now_ns`/`batch_bounds`/`reset_pass` walk the table +
+    /// the construction-frozen master DIRECTLY (the R29 zero-thread-
+    /// ingest law extended to the transport plane) — no mailbox
+    /// waits, no `filled[]` peeks, no `freed[]` returns, no producer
+    /// wakes — and the RX thread is retired. The table rows ARE the
+    /// publication records the RX would have re-published (the
+    /// pass-invariance law, docs/44), so every downstream guard (the
+    /// R32 ledger's per-batch `(rx_start, len)` identity, the clocks)
+    /// observes the identical values.
+    ss: Option<SsState>,
+    /// R40d: the self-serve arm's REQUEST (the env/forced constructor's
+    /// decision; the arm itself still requires the frozen regime + the
+    /// handed-over table — the RX must run its one live pass to freeze
+    /// the schedule before it can retire).
+    ss_wanted: bool,
+    /// R40d telemetry: table rows served from the self-serve path
+    /// (folded into `rx_sched_stats`' `sched_replays` — the engagement
+    /// law's counter keeps its meaning: publications served from the
+    /// frozen table, by whichever side served them).
+    ss_rows: u64,
+    /// R40d telemetry: passes served through the table rewind (folds
+    /// into `sched_passes`).
+    ss_passes: u64,
+}
+
+/// R40d: the self-serve transport's cursor state (see `PipelinedReplay
+/// Transport::ss`).
+struct SsState {
+    /// The frozen schedule (shared with the RX's `RxSched::Play` — one
+    /// allocation).
+    #[allow(clippy::disallowed_types)] // the freeze-time Arc handoff
+    table: Arc<Box<[PubRec]>>,
+    /// The next table row to serve (the pass-local publication cursor;
+    /// `reset_pass` rewinds it to 0 — the pass-invariance law).
+    i: usize,
 }
 
 impl PipelinedReplayTransport {
@@ -2362,6 +2494,15 @@ impl PipelinedReplayTransport {
         // thread). HFT_PREARM=0 is the rollback (the synchronous
         // marker-free advance verbatim).
         let prearm = std::env::var("HFT_PREARM").as_deref() != Ok("0");
+        // R40d (THE ZERO-THREAD INGEST): the self-serve transport —
+        // DEFAULT ON. Under the frozen-master regime (rxbuild + session
+        // elision + the schedule replay, all default ON) the consumer
+        // walks the RX's handed-over schedule table itself from the
+        // first clean boundary and the RX thread RETIRES: 4 threads on
+        // 4 vCPUs, zero mailbox ceremony, zero context switches on the
+        // steady path. HFT_SS_TRANSPORT=0 is the rollback (the mailbox
+        // protocol verbatim — the attribution arm's shape).
+        let ss_transport = std::env::var("HFT_SS_TRANSPORT").as_deref() != Ok("0");
         // F-4 (HFT_NBUF) / R33-C: the mailbox-depth ladder — 16 (the R8
         // phase-3 measured shape, the default), 32 (the F-4 arm), and
         // R33-C's 64/128/256 (the producer-starvation runway pricing:
@@ -2391,6 +2532,7 @@ impl PipelinedReplayTransport {
             elision,
             sched_replay,
             prearm,
+            ss_transport,
         )
     }
 
@@ -2399,6 +2541,9 @@ impl PipelinedReplayTransport {
     /// session-elision arm, and the R33-A schedule-replay arm FORCED —
     /// the tests' and local A/B's explicit path (the envs would be
     /// process-global and racy across parallel test transports).
+    /// R40d: `ss_transport` forces the self-serve transport's arm
+    /// decision (the frozen-regime gate still applies inside — the
+    /// table handoff only exists under it).
     #[allow(clippy::too_many_arguments)]
     pub fn with_coalesce_cpu_auto_forced(
         gt: &[u8],
@@ -2413,6 +2558,7 @@ impl PipelinedReplayTransport {
         elision: bool,
         sched_replay: bool,
         prearm: bool,
+        ss_transport: bool,
     ) -> Self {
         debug_assert!(
             nbuf.is_power_of_two() && (16..=NBUF_MAX).contains(&nbuf),
@@ -2511,6 +2657,9 @@ impl PipelinedReplayTransport {
             rxdesc: OnceLock::new(),
             master_version: AtomicU64::new(0),
             prearm,
+            sched_replay_armed,
+            sched_table: OnceLock::new(),
+            rx_retire: AtomicBool::new(false),
         });
         let rx = std::thread::Builder::new()
             .stack_size(512 * 1024)
@@ -2540,6 +2689,10 @@ impl PipelinedReplayTransport {
             pending_len: 0,
             group_lo: 0,
             group_n: 0,
+            ss: None,
+            ss_wanted: ss_transport && sched_replay_armed,
+            ss_rows: 0,
+            ss_passes: 0,
         }
     }
 
@@ -2646,6 +2799,34 @@ impl PipelinedReplayTransport {
             self.mb.auto_fn.is_some(),
             "reset_pass on an unarmed transport: use reset(session)"
         );
+        // R40d: THE SELF-SERVE ADVANCE — the elided boundary. Once the
+        // frozen schedule is handed over, the per-pass reset is a pure
+        // cursor rewind: the master is construction-frozen (zero writes
+        // to bake — the session-elision law), the table replays from
+        // row 0 (the pass-invariance law), and the session contract is
+        // verified LOCALLY against the program (the same fail-stop the
+        // RX's baked-session check enforced; nobody bakes anything —
+        // there is nothing to bake). No mailbox stores, no unstick, no
+        // wake: the boundary ceremony is gone with the thread that
+        // served it.
+        if let Some(ss) = &mut self.ss {
+            if let Some(f) = self.mb.auto_fn {
+                assert_eq!(
+                    f(pass), session,
+                    "auto-advance session divergence (self-serve): the program's pass-{pass} \
+                     session is {:?}, reset requested {:?} — the session contract is load-bearing",
+                    f(pass), session
+                );
+            }
+            ss.i = 0;
+            self.at_eos = false;
+            self.cur = None;
+            self.group_n = 0;
+            self.pending_len = 0;
+            self.resets += 1;
+            self.ss_passes += 1;
+            return;
+        }
         // R39: the deferred-free cluster drains at the boundary (the
         // clean-end shape arrives empty — the EOS-fetching call drained
         // everything through the marker; the mid-pass abandon shape
@@ -2764,12 +2945,78 @@ impl PipelinedReplayTransport {
             }
             spin(&mut backoff);
         }
+        // R40d: THE SELF-SERVE ARM — the zero-thread ingest's takeover.
+        // The RX froze the publication schedule at the recording pass's
+        // EOS and handed the table over (`sched_table`); under the
+        // frozen-master regime the stream is a PURE FUNCTION of the
+        // construction (docs/44's pass-invariance law — the exact word
+        // the RX's own `RxSched::Play` arm and the R32 ledger gate on),
+        // so THIS consumer can serve every later pass itself: the table
+        // rows are the publication records, the entries live in the
+        // construction-frozen master, and the clocks repeat verbatim.
+        // The arm lands at a CLEAN boundary (the advance wait above
+        // proved the RX baked THIS pass — the one handoff handshake
+        // this transport ever needs), and the takeover retires the RX:
+        // the fifth thread exits (4 threads on 4 vCPUs), the in-flight
+        // publications of this pass are abandoned, and from here on
+        // there is no mailbox on the consumer's path at all.
+        if self.ss.is_none()
+            && self.ss_wanted
+            && self.mb.sched_replay_armed
+            && self.mb.session_elision
+            && self.mb.rxbuild_enabled
+        {
+            if let Some(table) = self.mb.sched_table.get() {
+                #[allow(clippy::disallowed_types)] // the freeze-time Arc handoff
+                let table: Arc<Box<[PubRec]>> = Arc::clone(table);
+                self.ss = Some(SsState { table, i: 0 });
+                // THE RETIREMENT: Release the word, then wake any
+                // parked RX (the buffer/prearm/advance waits and the
+                // EOS park all check the word). The thread exits within
+                // one publication's time; nothing it owns is
+                // referenced by anyone anymore.
+                self.mb.rx_retire.store(true, Ordering::Release);
+                self.mb.wake.fetch_add(1, Ordering::Release);
+                futex_wake(&self.mb.wake);
+                // NOTE: the arming pass's `sched_passes` count comes from
+                // the RX's own advance counter (it baked THIS pass — the
+                // one handoff handshake); the ss counter starts with the
+                // NEXT rewind, so the folded engagement law keeps its
+                // exact shape (sched_passes ≈ resets − 1, no transition
+                // double-count).
+            }
+        }
     }
 
     /// Advance to the next batch. Returns false at end of stream (the
     /// harness's poll()==0 equivalent). The entry slice + clock stay valid
     /// until the next call.
     pub fn next_batch(&mut self) -> bool {
+        // R40d: THE SELF-SERVE PATH — the frozen table's next row IS the
+        // publication (the pass-invariance law): no wait, no free, no
+        // wake. The table's end is the pass's EOS (an implicit rewind
+        // mirrors the mailbox path's post-EOS straddle — see below).
+        if let Some(ss) = &mut self.ss {
+            if ss.i >= ss.table.len() {
+                // THE EOS + THE IMPLICIT REWIND: the table's end IS the
+                // pass's EOS (the RX's own `play_pos` law), and the next
+                // call after it serves the NEXT pass's first row — the
+                // mailbox path's post-EOS straddle (the RX's prearm
+                // runahead served pass k+1's head the same way; the
+                // pass-invariance law makes the rewind the identical
+                // stream). `at_eos` discriminates exactly one call.
+                ss.i = 0;
+                self.at_eos = true;
+                self.group_n = 0;
+                return false;
+            }
+            self.cur = Some(ss.i as u64);
+            ss.i += 1;
+            self.ss_rows += 1;
+            self.at_eos = false;
+            self.group_n = 1;
+            return true;
+        }
         // R39: the deferred-free cluster rides the same entry (the FIFO
         // is empty on the pure per-batch path — zero behavior change;
         // mixed next_batch/next_group callers cannot leak a deferred
@@ -2832,6 +3079,34 @@ impl PipelinedReplayTransport {
     /// the guards' explicit select.
     pub fn next_group(&mut self, k: usize) -> usize {
         let k = k.clamp(1, MAX_GROUP);
+        // R40d: THE SELF-SERVE GROUP — the frozen table's rows ARE the
+        // already-published turns (the whole pass was "published" when
+        // the schedule froze): the group forms from k consecutive rows
+        // with NO wait, NO filled[] peek, NO deferred-free cluster, and
+        // NO producer wake. The table's end is the EOS position (the
+        // RX's own replay law — `play_pos`'s at-end). The engagement
+        // telemetry (the group sweep's groups/batches/mean_width)
+        // counts identically — the R39 verdict's law is unchanged.
+        if let Some(ss) = &mut self.ss {
+            let rem = ss.table.len() - ss.i;
+            if rem == 0 {
+                // THE EOS + THE IMPLICIT REWIND (next_batch's twin —
+                // the next group after the EOS serves the next pass's
+                // rows from 0, the mailbox path's straddle semantics).
+                ss.i = 0;
+                self.at_eos = true;
+                self.group_n = 0;
+                return 0;
+            }
+            let n = k.min(rem);
+            self.group_lo = ss.i as u64;
+            self.group_n = n;
+            self.cur = Some(ss.i as u64);
+            ss.i += n;
+            self.ss_rows += n as u64;
+            self.at_eos = false;
+            return n;
+        }
         self.free_pending();
         self.wait_filled_turn();
         let t = self.turn;
@@ -3001,7 +3276,28 @@ impl PipelinedReplayTransport {
     #[inline]
     pub fn entries(&self) -> &[FrameEntry<'_>] {
         let t = self.cur.expect("r8 pipeline: no current batch");
-        if self.mb.rxbuild_enabled {
+        // R40d: THE SELF-SERVE VIEW — `cur` is the frozen table's row
+        // index; the row IS the publication record the RX would have
+        // re-published (the pass-invariance law), and the entries are
+        // the construction-frozen master's slice — identical bytes to
+        // the mailbox path by construction (the R32 ledger's identity
+        // guards observe the same (rx_start, len) triples).
+        if let Some(ss) = &self.ss {
+            let rec = ss.table[t as usize];
+            // SAFETY: the master is construction-frozen under the
+            // session elision (the regime the arm gated on); the slice
+            // bounds are the recorded schedule's own (the recording
+            // walk validated them against the master at freeze time).
+            unsafe {
+                let master = (*self.mb.master.get())
+                    .as_ref()
+                    .expect("rxbuild: master not built");
+                let start = rec.rx_start as usize;
+                let n = rec.len as usize;
+                debug_assert!(start + n <= master.len());
+                &master[start..start + n]
+            }
+        } else if self.mb.rxbuild_enabled {
             // SAFETY: consumer-owned view for this turn; the master's
             // contents for this slice were ordered by the filled[]
             // Release/Acquire pair (the patch frontier guarantees no
@@ -3037,6 +3333,13 @@ impl PipelinedReplayTransport {
     #[inline]
     pub fn now_ns(&self) -> u64 {
         let t = self.cur.expect("r8 pipeline: no current batch");
+        // R40d: the self-serve row's recorded clock — the pass-invariant
+        // value the RX would have re-published (reset_cursors re-anchors
+        // the virtual clock to the schedule's first vt every pass; the
+        // recorded clocks repeat verbatim).
+        if let Some(ss) = &self.ss {
+            return ss.table[t as usize].clock;
+        }
         // SAFETY: same ownership + publication ordering as `entries`
         // (the R33-C pubs record's clock field).
         unsafe { (*self.mb.pubs[(t & self.mb.nbuf_mask) as usize].get()).clock }
@@ -3088,6 +3391,13 @@ impl PipelinedReplayTransport {
     #[inline]
     pub fn batch_bounds(&self) -> (u32, u32) {
         let t = self.cur.expect("r32 pipeline: no current batch");
+        // R40d: the self-serve row's recorded bounds — the identity the
+        // R32 ledger's Guard 3 asserts against (identical values to the
+        // mailbox path's pubs record).
+        if let Some(ss) = &self.ss {
+            let rec = ss.table[t as usize];
+            return (rec.rx_start, rec.len);
+        }
         // SAFETY: consumer-owned view for this turn; the fields were
         // published by the RX's Release store (ordered by the filled[]
         // Acquire in next_batch). R33-C: the pubs record.
@@ -3157,12 +3467,34 @@ impl PipelinedReplayTransport {
     /// count), sched_passes ≈ resets − 1, polls stops growing after the
     /// recording pass, and wakes_saved ≈ publications when the consumer
     /// never parks (the post-R33-A equilibrium).
+    /// R40d: the self-serve rows/passes FOLD IN — the counter's meaning
+    /// is "publications served from the frozen table", and under the
+    /// zero-thread ingest the consumer is the server (the RX's own
+    /// counts freeze at its retirement; the law's shape is unchanged:
+    /// every consumed pass's rows are counted exactly once, by
+    /// whichever side served them).
     pub fn rx_sched_stats(&self) -> (u64, u64, u64) {
         (
-            self.mb.rx_stats.sched_replays.load(Ordering::Relaxed),
-            self.mb.rx_stats.sched_passes.load(Ordering::Relaxed),
+            self.mb.rx_stats.sched_replays.load(Ordering::Relaxed) + self.ss_rows,
+            self.mb.rx_stats.sched_passes.load(Ordering::Relaxed) + self.ss_passes,
             self.mb.rx_stats.wakes_saved.load(Ordering::Relaxed),
         )
+    }
+
+    /// R40d: THE ZERO-THREAD INGEST's engagement telemetry — (armed,
+    /// passes served from the frozen table, rows served). `armed=true`
+    /// on every frozen-regime run (the arm is construction-determined,
+    /// never contention-dependent: the RX's one live pass freezes the
+    /// schedule, the consumer takes over, the fifth thread exits).
+    pub fn self_serve_stats(&self) -> (bool, u64, u64) {
+        (self.ss.is_some(), self.ss_passes, self.ss_rows)
+    }
+
+    /// R40d: whether the RX thread has been retired (the zero-thread
+    /// ingest's structural fact — the placement verifier's
+    /// post-retirement view).
+    pub fn rx_retired(&self) -> bool {
+        self.mb.rx_retire.load(Ordering::Acquire)
     }
 
     /// R35-A: the marker-decoupled advance's engagement telemetry —
@@ -3287,6 +3619,18 @@ impl PipelinedReplayTransport {
         eprintln!(
             "ELISION_DIAGNOSTIC {label}: armed={} (R31-A session elision — the 22K-site per-pass session bake is OFF; HFT_SESSION_ELISION=0 restores the patch law)",
             self.mb.session_elision,
+        );
+        // R40d: the zero-thread ingest's telemetry line (always printed
+        // — the 11r40 arm greps it; armed=true with the RX's counters
+        // frozen is the retirement's signature: the fifth thread exits
+        // at the takeover, the consumer serves every later pass from
+        // the frozen table itself).
+        eprintln!(
+            "SELF_SERVE_TRANSPORT_DIAGNOSTIC {label}: armed={} passes={} rows={} rx_retired={} (R40d: the zero-thread ingest — the frozen schedule walked by the consumer, the RX retired; HFT_SS_TRANSPORT=0 restores the mailbox)",
+            self.ss.is_some(),
+            self.ss_passes,
+            self.ss_rows,
+            self.mb.rx_retire.load(Ordering::Acquire),
         );
         eprintln!(
             "DIAG cons {label}: parks={} park_ms={:.1} slow_waits={} slow_ms={:.1}",
@@ -3606,6 +3950,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         for pass in 1..=4u64 {
             let sess = i7_sess(pass);
@@ -3672,6 +4017,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3686,6 +4032,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3755,6 +4102,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         let mut warm = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
@@ -3769,6 +4117,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         // Drain pass 1 fully (the fill), then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut warm] {
@@ -3827,6 +4176,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
@@ -3877,6 +4227,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3891,6 +4242,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -3970,6 +4322,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             let mut d32 = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3984,6 +4337,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             let mut d32r = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -3998,6 +4352,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -4085,6 +4440,7 @@ mod tests {
                 true, // elision — the frozen-master regime
                 replay,
                 replay, // R35-A: prearm mirrors the sched-replay arm
+                true, // R40d: the self-serve transport's arm request
             )
         };
         let mut live = mk(false);
@@ -4143,6 +4499,151 @@ mod tests {
         assert_eq!(master_frames, 60, "master frame count");
     }
 
+    // ─── R40d: the zero-thread ingest — the self-serve transport ──────
+
+    /// R40d: THE SELF-SERVE TRANSPORT PARITY — the frozen-regime
+    /// champion shape (rxbuild + elision + sched replay + prearm), one
+    /// transport on the MAILBOX path (`ss=false`) and one on the
+    /// SELF-SERVE path (`ss=true` — the consumer walks the handed-over
+    /// schedule table itself and the RX retires). The per-batch
+    /// observable streams must be IDENTICAL: (rx_start, len) bounds,
+    /// clocks, entry CONTENT, EOS alignment, per-pass frame counts —
+    /// the table rows are the publication records the RX would have
+    /// re-published (the pass-invariance law). The structural laws: the
+    /// ss transport reports `rx_retired()`, its frozen-table engagement
+    /// counters fold into the sched law (sched_passes ≈ resets − 1),
+    /// a MID-PASS ABANDON under ss rewinds cleanly (the next pass's
+    /// stream is the identity oracle), and the GROUPED consume (k=3)
+    /// over the table matches the per-batch walk member-for-member.
+    #[test]
+    fn t_r40d_self_serve_parity_vs_mailbox() {
+        let gt = mini_gt(1200);
+        let sched = mini_sched(1200);
+        let mk = |ss: bool| {
+            PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
+                &gt,
+                sched.clone(),
+                *b"PIPETEST01",
+                8,
+                None,
+                Some(sess_program),
+                false,
+                true, // rxbuild
+                16,   // nbuf — the champion depth
+                true, // elision — the frozen-master regime
+                true, // sched replay
+                true, // prearm
+                ss,   // R40d: the self-serve arm request
+            )
+        };
+        let mut mb = mk(false);
+        let mut ss = mk(true);
+        // THE RETIREMENT LAW: the ss transport's takeover lands at the
+        // FIRST reset_pass (the advance wait proves the pass-1 bake; the
+        // RX hands the table over and exits) — before any consumption.
+        ss.reset_pass(1, sess_program(1));
+        assert!(ss.rx_retired(), "the RX must be retired at the first boundary");
+        let (ss_armed, _, _) = ss.self_serve_stats();
+        assert!(ss_armed, "the self-serve path must be armed");
+        let (mb_armed, _, _) = mb.self_serve_stats();
+        assert!(!mb_armed, "the mailbox rollback must stay disarmed");
+        // The observable-stream parity across 6 passes.
+        for p in 1..=6u64 {
+            let sess = sess_program(p);
+            mb.reset_pass(p, sess);
+            ss.reset_pass(p, sess);
+            let mut frames = 0usize;
+            loop {
+                let a_ok = mb.next_batch();
+                let b_ok = ss.next_batch();
+                assert_eq!(a_ok, b_ok, "pass {p}: mailbox/self-serve EOS mismatch");
+                if !a_ok {
+                    break;
+                }
+                let (a_bounds, a_clock) = (mb.batch_bounds(), mb.now_ns());
+                let (b_bounds, b_clock) = (ss.batch_bounds(), ss.now_ns());
+                assert_eq!(
+                    a_bounds, b_bounds,
+                    "pass {p}: (rx_start, len) diverged — the R32 ledger would fail-stop"
+                );
+                assert_eq!(a_clock, b_clock, "pass {p}: clock diverged");
+                let ae = mb.entries();
+                let be = ss.entries();
+                assert_eq!(ae.len(), be.len(), "pass {p}: batch length mismatch");
+                for (a, b) in ae.iter().zip(be.iter()) {
+                    assert!(
+                        !entry_content_neq(a, b),
+                        "pass {p}: self-serve entry diverged from the mailbox path"
+                    );
+                }
+                frames += ae.len();
+            }
+            assert_eq!(frames, 240, "pass {p}: frame count");
+        }
+        // The folded engagement law: sched_passes ≈ resets − 1 on BOTH
+        // transports (the ss counter picks up where the RX's frozen
+        // counter left off — no transition double-count).
+        let (_, mb_passes, _) = mb.rx_sched_stats();
+        let (_, ss_passes, _) = ss.rx_sched_stats();
+        assert!((6..=7).contains(&mb_passes), "mailbox sched_passes={mb_passes}");
+        assert!(
+            (6..=8).contains(&ss_passes),
+            "self-serve folded sched_passes={ss_passes} (the RX's racy tail advance)"
+        );
+        // THE GROUPED CONSUME over the table: a fresh ss transport, the
+        // k=3 sweep vs the per-batch walk — member-for-member identity.
+        let mut g = mk(true);
+        let mut b = mk(true);
+        for p in 1..=3u64 {
+            let sess = sess_program(p);
+            g.reset_pass(p, sess);
+            b.reset_pass(p, sess);
+            let mut gi = 0usize;
+            let mut gframes = 0usize;
+            'outer: loop {
+                let n = g.next_group(3);
+                if n == 0 {
+                    // EOS alignment: the per-batch twin must also be at
+                    // the end right now.
+                    assert!(!b.next_batch(), "pass {p}: group EOS early");
+                    break 'outer;
+                }
+                for j in 0..n {
+                    g.select_group_batch(j);
+                    assert!(b.next_batch(), "pass {p}: per-batch twin ended early");
+                    assert_eq!(
+                        g.batch_bounds(),
+                        b.batch_bounds(),
+                        "pass {p} member {gi}: bounds diverged"
+                    );
+                    assert_eq!(g.now_ns(), b.now_ns(), "pass {p} member {gi}: clock diverged");
+                    assert_eq!(
+                        g.entries().len(),
+                        b.entries().len(),
+                        "pass {p} member {gi}: length diverged"
+                    );
+                    gframes += g.entries().len();
+                    gi += 1;
+                }
+            }
+            assert_eq!(gframes, 240, "pass {p}: the grouped sweep's frame count");
+            assert!(gi >= 1, "pass {p}: the group count");
+        }
+        // THE MID-PASS ABANDON under ss: consume part of a pass, reset
+        // to the next — the rewind must reproduce the identity stream.
+        let mut a = mk(true);
+        a.reset_pass(1, sess_program(1));
+        // The mini schedule publishes the whole pass as one batch (the
+        // r33 cell's law) — consuming it IS the mid-pass abandon shape
+        // when the reset lands before the EOS-fetching call.
+        assert!(a.next_batch());
+        a.reset_pass(2, sess_program(2)); // the abandon
+        let frames = run_pass(&mut a);
+        assert_eq!(frames, 240, "the post-abandon pass must be the exact stream");
+        a.reset_pass(3, sess_program(3));
+        assert_eq!(run_pass(&mut a), 240, "the steady pass after the abandon");
+    }
+
     // ─── R39: the producer pivot — the coarse-grained sweep ────────────
 
     /// R39: THE GROUPED-CONSUME parity pin — the SAME armed frozen-master
@@ -4178,6 +4679,7 @@ mod tests {
                 true, // elision — the frozen-master regime
                 true, // sched replay
                 true, // prearm — the champion's advance shape
+                true, // R40d: the self-serve transport's arm request
             )
         };
         let mut batched = mk();
@@ -4358,6 +4860,7 @@ mod tests {
                 true,
                 true,
                 true, // R35-A: prearm mirrors the sched-replay arm
+                true, // R40d: the self-serve transport's arm request
             )
         };
         let mut d16 = mk(16);
@@ -4430,6 +4933,7 @@ mod tests {
             true,
             true,
             true, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         for p in 1..=3u64 {
             t.reset_pass(p, sess_program(p));
@@ -4475,6 +4979,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         let mut rxbuild = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
             &gt,
@@ -4489,6 +4994,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         // Drain pass 1 fully, then abandon pass 2 mid-flight.
         for t in [&mut classic, &mut rxbuild] {
@@ -4548,6 +5054,7 @@ mod tests {
             false,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         for p in 0..4u64 {
             classic.reset(*b"PIPETEST01");
@@ -4618,6 +5125,7 @@ mod tests {
                 false,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             let mut elided = PipelinedReplayTransport::with_coalesce_cpu_auto_forced(
                 &gt,
@@ -4632,6 +5140,7 @@ mod tests {
                 true,
             false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
             for p in 1..=4u64 {
                 let sess = sess_program(p);
@@ -4727,6 +5236,7 @@ mod tests {
             true,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         // A session the program will NOT bake for pass 1 — must fail-stop
         // exactly like the patched shape.
@@ -4762,6 +5272,7 @@ mod tests {
             true,
         false, // R33-A: sched replay off — the pre-R33 pinned shape
             false, // R35-A: prearm mirrors the sched-replay arm
+            false, // R40d: the self-serve transport's arm request
             );
         // Drain pass 1 fully, abandon pass 2 mid-flight, target pass 3.
         t.reset_pass(1, sess_program(1));
@@ -4814,6 +5325,7 @@ mod tests {
                 true, // elision — the frozen-master regime
                 true, // sched replay (the pre-arm's regime word)
                 prearm,
+                false, // R40d: the self-serve transport's arm request
             )
         };
         let mut sync = mk(false);
@@ -4900,6 +5412,7 @@ mod tests {
                 true, // elision
                 true, // sched replay
                 true, // prearm
+                false, // R40d: the self-serve transport's arm request
             );
             // Clean pass 1, then abandon pass 2 after N batches.
             t.reset_pass(1, sess_program(1));
@@ -4957,6 +5470,7 @@ mod tests {
                 true, // elision
                 true, // sched replay
                 prearm,
+                false, // R40d: the self-serve transport's arm request
             )
         };
         let mut d16 = mk(16, true);

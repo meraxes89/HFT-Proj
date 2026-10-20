@@ -232,12 +232,58 @@ impl SharedLeafRing {
             (kk[idx], bb[idx], ee[idx])
         }
     }
+
+    /// R40d: P0's RUN VIEW — the compacted run-drain's operand. The
+    /// leaf window `[lo, hi)` (the caller proves `lo ≤ hi ≤ snapshot`
+    /// and `hi − lo ≤ J1_CAP − HEADROOM` — the push gate's bound, so
+    /// the window spans less than one lap) as at most TWO contiguous
+    /// array segments `(k, b, end)` — the ring's wrap splits the
+    /// window where it crosses the array end. The merge consumes the
+    /// segments IN ORDER (ring order = push order = the monotone end
+    /// order, so the two-finger continues across the split); the
+    /// per-record masked `leaf()` reads (three UnsafeCell derefs per
+    /// leaf — the old merge's dominant cost) are gone.
+    pub fn run_segments(&self, lo: u64, hi: u64) -> [(&[u32], &[u64], &[u64]); 2] {
+        debug_assert!(lo <= hi);
+        let n = (hi - lo) as usize;
+        // SAFETY: the caller's disjoint-slot proof — the window is
+        // inside P0's read range [consumed, snapshot); read-only for
+        // the merge's lifetime.
+        unsafe {
+            let kk = &*self.k.get();
+            let bb = &*self.b.get();
+            let ee = &*self.end.get();
+            let start = (lo as usize) & (J1_CAP - 1);
+            let first = (J1_CAP - start).min(n);
+            let second = n - first;
+            [
+                (
+                    &kk[start..start + first],
+                    &bb[start..start + first],
+                    &ee[start..start + first],
+                ),
+                (&kk[..second], &bb[..second], &ee[..second]),
+            ]
+        }
+    }
 }
 
 /// R40: one arrival slot — P1's per-pass completion publication.
+/// R40d: the slot carries the boundary's FULL half of the merge
+/// operands — the count AND j1's run bounds (the compacted
+/// run-drain's window: P1's cumulative leaf total at the pass top and
+/// the pass's pushes). P1 publishes them at its arrival (it knows both
+/// — `j1_len` is its local mirror); P0's merge consumes the window
+/// directly from the slot (NO per-record ring scan — the arriving-
+/// last election's operand handoff).
 struct Arrival {
     pass: AtomicU64,
     count: AtomicU64,
+    /// R40d: the run's first leaf index (j1's cumulative length at the
+    /// pass top — P1's local mirror snapshot).
+    run_start: AtomicU64,
+    /// R40d: the run's leaf count (this pass's pushes into j1).
+    run_len: AtomicU64,
 }
 
 impl Arrival {
@@ -245,6 +291,8 @@ impl Arrival {
         Self {
             pass: AtomicU64::new(u64::MAX),
             count: AtomicU64::new(0),
+            run_start: AtomicU64::new(0),
+            run_len: AtomicU64::new(0),
         }
     }
 }
@@ -317,6 +365,33 @@ pub struct DualGate {
     pub p1_parks: AtomicU64,
     /// Telemetry: boundaries deferred on P1's lag.
     pub arrival_defers: AtomicU64,
+    /// R40d: THE ARRIVING-LAST ELECTION WORD — the end position of the
+    /// LAST finalized boundary (monotone; `fetch_max` at the
+    /// completion's top is the atomic swap). P1's boundary step is its
+    /// ARRIVAL (the run publication — it proceeds immediately, never
+    /// waiting on P0); P0's completion is the arriving-last finalize
+    /// (both lanes' cursors crossed + the arrival landed — the second
+    /// event observed). The swap guarantees EXACTLY-ONCE per boundary:
+    /// an attempt whose boundary was already finalized (the deferred /
+    /// recomposed edge) is the election's loser and skips — the merge
+    /// never runs twice for one boundary.
+    boundary_taken: AtomicU64,
+    /// R40d: THE EXIT LATCH (the allocs=0 law's last edge) — P1's
+    /// thread teardown frees exactly TWO heap blocks (the spawn's
+    /// closure box + the `Thread` inner), and without the latch those
+    /// frees land INSIDE the measurement window (the finish completes
+    /// at `p1_done` while the exit path races on — the "2 in-window
+    /// counter deltas" the bisect probe was armed for). The harness
+    /// arms `exit_hold` BEFORE the final finish and stores
+    /// `exit_release` AFTER the closing ALLOC snapshot; P1 parks
+    /// between (a PAUSE-spin bounded at 250ms — the retired producer's
+    /// cpu is idle; a harness that never releases is already a red
+    /// run, and the process exit reaps the thread regardless).
+    exit_hold: AtomicBool,
+    /// R40d: the latch's release word (0 = hold; non-zero = the thread
+    /// may tear down — written AFTER the harness's final allocation
+    /// counter snapshot).
+    exit_release: AtomicU64,
 }
 
 // SAFETY: see the struct-level contract.
@@ -346,6 +421,9 @@ impl DualGate {
             p1_batches: AtomicU64::new(0),
             p1_parks: AtomicU64::new(0),
             arrival_defers: AtomicU64::new(0),
+            boundary_taken: AtomicU64::new(0),
+            exit_hold: AtomicBool::new(false),
+            exit_release: AtomicU64::new(0),
         })
     }
 
@@ -435,10 +513,21 @@ impl DualGate {
         self.shutdown_end.load(Ordering::Acquire)
     }
 
-    /// P1's arrival publication (its pass close).
-    pub fn publish_arrival(&self, pass: u64, count_1: u64) {
+    /// P1's arrival publication (its pass close) — R40d: with the
+    /// boundary's run bounds (the compacted run-drain's operands: the
+    /// leaves [run_start, run_start+run_len) are EXACTLY this pass's
+    /// j1 window — P1's frontier cap parks any record ending beyond
+    /// the pass target, so every pushed leaf ends at or below the lane
+    /// projection ≤ the boundary; the window IS the merge partition,
+    /// pre-computed on P1's clock). This is P1's HALF of the boundary
+    /// step: after the publication P1 proceeds into its next pass
+    /// immediately (it never waits on P0 — the arriving-last law's
+    /// other side).
+    pub fn publish_arrival(&self, pass: u64, count_1: u64, run_start: u64, run_len: u64) {
         let a = &self.arrivals[(pass & (ARR_SLOTS as u64 - 1)) as usize];
         a.pass.store(pass, Ordering::Relaxed);
+        a.run_start.store(run_start, Ordering::Relaxed);
+        a.run_len.store(run_len, Ordering::Relaxed);
         a.count.store(count_1, Ordering::Release);
         self.arrival_seq.store(pass, Ordering::Release);
     }
@@ -451,6 +540,23 @@ impl DualGate {
         let a = &self.arrivals[(pass & (ARR_SLOTS as u64 - 1)) as usize];
         debug_assert_eq!(a.pass.load(Ordering::Relaxed), pass);
         Some(a.count.load(Ordering::Acquire))
+    }
+
+    /// R40d: P0's FULL arrival read — `(count_1, run_start, run_len)`
+    /// from the same slot, under the same seq gate (the run bounds are
+    /// the merge's pre-staged operands: the compacted run-drain's
+    /// window, no ring scan).
+    pub fn arrival_full(&self, pass: u64) -> Option<(u64, u64, u64)> {
+        if self.arrival_seq.load(Ordering::Acquire) < pass {
+            return None;
+        }
+        let a = &self.arrivals[(pass & (ARR_SLOTS as u64 - 1)) as usize];
+        debug_assert_eq!(a.pass.load(Ordering::Relaxed), pass);
+        Some((
+            a.count.load(Ordering::Acquire),
+            a.run_start.load(Ordering::Acquire),
+            a.run_len.load(Ordering::Acquire),
+        ))
     }
 
     /// P0's poison-path count read (P1's final publication).
@@ -517,6 +623,46 @@ impl DualGate {
         self.arrival_seq
             .load(Ordering::Relaxed)
             .saturating_sub(armed.wrapping_sub(1))
+    }
+
+    /// R40d: THE ARRIVING-LAST ELECTION — the completion's atomic swap.
+    /// Returns TRUE iff this attempt WINS the boundary `end_span` (the
+    /// word's old value is strictly below it — nobody finalized this
+    /// boundary yet); a FALSE return means the merge already ran (the
+    /// loser skips — exactly-once per boundary).
+    pub fn boundary_elect(&self, end_span: u64) -> bool {
+        self.boundary_taken.fetch_max(end_span, Ordering::AcqRel) < end_span
+    }
+
+    /// R40d: THE EXIT LATCH — the harness arms the hold BEFORE the
+    /// final finish (so P1's post-`p1_done` park is guaranteed to
+    /// engage before any teardown could race); see the field's law.
+    pub fn arm_exit_hold(&self) {
+        self.exit_hold.store(true, Ordering::Release);
+    }
+
+    /// R40d: THE EXIT LATCH — the release, AFTER the closing allocation
+    /// counter snapshot (P1's two teardown frees land outside every
+    /// measured window; the allocs=0 gate reads clean).
+    pub fn release_exit(&self) {
+        self.exit_release.store(1, Ordering::Release);
+    }
+
+    /// R40d: P1's park on the latch (the thread's LAST act before its
+    /// teardown — see the field's law: the two frees must postdate the
+    /// harness's final snapshot). Bounded at 250ms (a missing release
+    /// is a dead harness — already red; the exit reaps us regardless).
+    fn exit_latch_park(&self) {
+        if !self.exit_hold.load(Ordering::Acquire) {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let mut sb = 0u32;
+        while self.exit_release.load(Ordering::Acquire) == 0
+            && t0.elapsed() < std::time::Duration::from_millis(250)
+        {
+            crate::affinity::polite_spin(&mut sb);
+        }
     }
 }
 
@@ -597,6 +743,15 @@ pub struct Lane1State {
     /// This pass's drain target (the script's pass end, global).
     pub pass_end: u64,
     pub done: bool,
+    /// R40d: THE COMPACTED RUN-DRAIN's window — the current pass's
+    /// base (the PREVIOUS boundary; the run is the leaves with end in
+    /// (base, this pass's boundary]) and the run's first leaf index
+    /// (maintained per-record: every leaf ending ≤ the base advances
+    /// it — the pre-arm tail of the FIRST armed pass drains below the
+    /// base and must stay OUTSIDE the run; later passes have no such
+    /// leaves by the territory-gap law, so the pass-top init stands).
+    pub pass_base: u64,
+    pub run_start: u64,
 }
 
 /// R40: P1's lane-1 drain — the per-lane twin of the sink's composite
@@ -655,6 +810,14 @@ pub fn drain_lane1(gate: &DualGate, fabric: &HydraFabric, st: &mut Lane1State) -
             gate.p1_parks.fetch_add(1, Ordering::Relaxed);
         }
         gate.j1.push(&mut st.j1_len, k as u32, r.value, st.fold_pos + k);
+        // R40d: the run window's per-record law — a leaf ending at or
+        // below the pass base belongs to an EARLIER boundary (the
+        // first armed pass's pre-arm tail): advance the run start past
+        // it so the arrival's window carries exactly this pass's
+        // leaves (the merge's partition, pre-staged).
+        if st.fold_pos + k <= st.pass_base {
+            st.run_start = st.j1_len;
+        }
         st.fold_pos += k;
         st.fold_rem -= k;
         if st.fold_rem == 0 {
@@ -691,6 +854,7 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
         }
         if gate.shutdown.load(Ordering::Acquire) {
             gate.p1_done.store(true, Ordering::Release);
+            gate.exit_latch_park(); // R40d: the teardown frees stay outside the window
             return;
         }
         crate::affinity::polite_spin(&mut sb);
@@ -704,6 +868,8 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
         count_1: 0,
         pass_end: 0,
         done: false,
+        pass_base: 0,
+        run_start: 0,
     };
     // R40: THE PASS-GRID ANCHOR — the TRUE boundary at the arm (the
     // sink's next_span), NOT the fold projection (which may sit inside
@@ -743,6 +909,13 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
         // final publication must carry the POISON pass's dispatched
         // count — zero when nothing was dispatched).
         st.count_1 = 0;
+        // R40d: the compacted run-drain's window init — the pass base
+        // (the previous boundary) and the run start (every leaf pushed
+        // so far ends ≤ the base by the cap + territory-gap laws; the
+        // per-record advance in drain_lane1 corrects it for the first
+        // armed pass's pre-arm tail).
+        st.pass_base = pass_base;
+        st.run_start = st.j1_len;
         // The pre-pass poison: a break at an earlier pass (or this
         // pass's batch 0) — P1 contributes nothing more.
         if let Some((pp, _pb)) = gate.poison_at() {
@@ -865,13 +1038,29 @@ pub fn lane1_run(gate: &DualGate, fabric: &HydraFabric, p1_cpu: Option<usize>) {
             }
         }
         // ── the arrival ──
-        gate.publish_arrival(st.pass, st.count_1);
+        // R40d: the run bounds ride the publication (P1's HALF of the
+        // boundary step — the merge's j1 partition pre-staged on P1's
+        // clock; P0's completion consumes the window with NO ring
+        // scan). After the publication P1 proceeds into its next pass
+        // immediately (the arriving-last law: it never waits on P0).
+        gate.publish_arrival(
+            st.pass,
+            st.count_1,
+            st.run_start,
+            st.j1_len - st.run_start,
+        );
         pass_base = st.pass_end;
         st.pass += 1;
     }
     // Every exit path posts the terminal state (the finish's wait and
-    // the poison's count read depend on it).
+    // the poison's count read depend on it). R40d: THE EXIT LATCH —
+    // the park keeps this thread's TWO teardown frees (the spawn
+    // closure + the Thread inner) OUTSIDE the harness's measurement
+    // window (see `exit_hold`'s law): the finish completes at
+    // `p1_done`, the harness snapshots the allocation counters, and
+    // only then releases the latch.
     gate.p1_done.store(true, Ordering::Release);
+    gate.exit_latch_park();
 }
 
 impl DualGate {
@@ -989,21 +1178,77 @@ mod tests {
     }
 
     /// The arrival ring: publish/read across a lap-safe window.
+    /// R40d: the run bounds ride the same slots (the full read returns
+    /// the (count, run_start, run_len) triple; the old 2-field read
+    /// keeps its shape for the count-only callers).
     #[test]
     fn t_r40_arrival_ring() {
         let gate = DualGate::new();
         assert!(gate.arrival(5).is_none());
         for p in 0..8u64 {
-            gate.publish_arrival(p, p * 100);
+            gate.publish_arrival(p, p * 100, p * 3, p * 5);
         }
         assert_eq!(gate.arrival(7), Some(700));
+        assert_eq!(gate.arrival_full(7), Some((700, 21, 35)));
         assert_eq!(gate.arrival(8), None);
+        assert!(gate.arrival_full(8).is_none());
         // A later arrival makes earlier ones addressable (the seq gate
         // is the monotone cursor; the slot reuse is lap-bounded).
-        gate.publish_arrival(8, 800);
+        gate.publish_arrival(8, 800, 24, 40);
         assert_eq!(gate.arrival(5), Some(500));
+        assert_eq!(gate.arrival_full(5), Some((500, 15, 25)));
         assert_eq!(gate.arrival(8), Some(800));
+        assert_eq!(gate.arrival_full(8), Some((800, 24, 40)));
         assert_eq!(gate.arrival(9), None);
+    }
+
+    /// R40d: the run view's segment law — the window [lo, hi) maps to at
+    /// most two contiguous array segments whose concatenation IS the
+    /// window's leaf sequence (the wrap split at the array end); the
+    /// empty window and the no-wrap window are the degenerate shapes.
+    #[test]
+    fn t_r40d_run_segments_law() {
+        let ring = SharedLeafRing::new();
+        let mut len = 0u64;
+        // Push 40 leaves with end = 10*idx (monotone — the push order).
+        for i in 0..40u64 {
+            ring.push(&mut len, (i % 7) as u32 + 1, i * 1000, (i + 1) * 10);
+        }
+        // The no-wrap window [5, 12): one segment, twelve-less-five
+        // leaves, exact (k, b, e) triples.
+        let [(k1, b1, e1), (k2, b2, e2)] = ring.run_segments(5, 12);
+        assert_eq!(k1.len(), 7);
+        assert!(k2.is_empty() && b2.is_empty() && e2.is_empty());
+        for j in 0..7 {
+            assert_eq!(k1[j], ((5 + j as u64) % 7) as u32 + 1);
+            assert_eq!(b1[j], (5 + j as u64) * 1000);
+            assert_eq!(e1[j], (6 + j as u64) * 10);
+        }
+        // The full window [0, 40): one segment (no wrap at 40 < CAP).
+        let [(k1, _, _), (k2, _, _)] = ring.run_segments(0, 40);
+        assert_eq!(k1.len(), 40);
+        assert!(k2.is_empty());
+        // The empty window.
+        let [(k1, _, _), (k2, _, _)] = ring.run_segments(9, 9);
+        assert!(k1.is_empty() && k2.is_empty());
+        // THE WRAP: push past J1_CAP and read a window that straddles
+        // the array end — two segments whose concatenation is the
+        // window (the later writes at the wrapped indices own the
+        // slots; the ring's own lap discipline).
+        for i in 40..(J1_CAP as u64 + 20) {
+            ring.push(&mut len, (i % 7) as u32 + 1, i * 1000, (i + 1) * 10);
+        }
+        let [(k1, _, _), (k2, _, _)] = ring.run_segments(J1_CAP as u64 - 8, J1_CAP as u64 + 10);
+        assert_eq!(k1.len(), 8, "the pre-wrap segment");
+        assert_eq!(k2.len(), 10, "the post-wrap segment");
+        // The concatenated (k, b, e) triples are the window's leaves.
+        let lo = J1_CAP as u64 - 8;
+        for j in 0..8u64 {
+            assert_eq!(k1[j as usize], ((lo + j) % 7) as u32 + 1);
+        }
+        for j in 0..10u64 {
+            assert_eq!(k2[j as usize], ((J1_CAP as u64 + j) % 7) as u32 + 1);
+        }
     }
 
     /// The script's odd-overlap arithmetic (the poison correction).
