@@ -1318,6 +1318,55 @@ grep "PR1_R43_FLEET_VERDICT" /tmp/bench_r43.txt | head -1
 grep "R43_DIAG" /tmp/bench_r43.txt | head -1
 grep "R43_CONSTRUCTION" /tmp/bench_r43.txt | head -1
 
+# ── 11r44. R44: THE 1.0T-1.5T SUB-PICOSECOND CORRIDOR (PR #25). ──────
+# The three R44 layers armed TOGETHER on the fleet driver (a fresh
+# HFT_MULTI_VENUE=8 draw — the same driver as 11r43, the corridor's
+# own verdict line): Theorem 43's closed-form frontier jump 𝒥_w (the
+# 22-batch walked ceremony — 296 ns of P0's 464 ns window period —
+# collapses to ≤ 30 ns of stores; the DATA-SIDE CERTIFICATE arms it at
+# window 0's first bit-exact tuple, Corollary 43.1's zero-walk law),
+# Theorem 44's 1024-span super-chunk grid (the owners' chunk-event
+# stream HALVED — 241M → ~120M composites, the fold capacity
+# 1.136T → 2.27T msg/s-equivalent), Theorem 45's vector digest planes
+# (the close's per-slot scalar digest loop → 2 ZMM loads + 4 VPXORD +
+# 4 VPADDQ, the 168 ns close → ≤ 50 ns). THE CONTRACT
+# (docs/solution4.md): BIT-EXACT (the dual-path law asserted at every
+# window close — both the walked and the jumped tuple), ALLOC_DELTA ==
+# 0, the jump engagement (jump_dial=true + the jumped-window
+# telemetry), merged == windows, the regime tag REPLAY (the honesty
+# law). The verdict's target: the 1.0T-1.5T corridor (the rate is the
+# fleet's read; the HARD gates are the laws above — a corridor miss
+# fails the claim, never the correctness laws).
+HFT_MULTI_VENUE=8 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r44.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r44.txt
+grep -q "allocs=0 slots=8" /tmp/bench_r44.txt
+grep -q "PR1_R44_1T_VERDICT.*jump_dial=true" /tmp/bench_r44.txt
+grep -q "PR1_R44_1T_VERDICT.*superchunk=true" /tmp/bench_r44.txt
+grep -q "PR1_R44_1T_VERDICT.*vecdigest=true" /tmp/bench_r44.txt
+grep -q "PR1_R44_1T_VERDICT.*bitexact=true" /tmp/bench_r44.txt
+grep -q "PR1_R44_1T_VERDICT.*allocs=0" /tmp/bench_r44.txt
+grep -q "PR1_R44_1T_VERDICT.*regime=replay" /tmp/bench_r44.txt
+grep "PR1_R44_1T_VERDICT" /tmp/bench_r44.txt | head -1
+grep "R43_DIAG" /tmp/bench_r44.txt | head -1
+
+# ── 11r44r. R44: THE WALK ROLLBACK (the attribution arm). ────────────
+# HFT_JUMP=0 restores the verbatim 22-batch walk (the pre-R43 shape —
+# the 296 ns ceremony): the same-draw delta 11r44 − 11r44r prices
+# Theorem 43's jump on the fleet's own silicon (the walk's share of
+# the window period). The super-chunk and vector-digest layers stay
+# armed on both arms; their rollbacks (HFT_SUPERCHUNK=0 /
+# HFT_VECDIGEST=0) are cell-pinned (+62..+68) and driver-smoked
+# locally — priced on the fleet when the directive asks.
+HFT_MULTI_VENUE=8 HFT_JUMP=0 cargo run --release -p nf-engine --bin bench -- --hydra-only 2>&1 | tee /tmp/bench_r44r.txt
+grep -q "HYDRA_BITPARITY.*-> BIT-EXACT" /tmp/bench_r44r.txt
+grep -q "allocs=0 slots=8" /tmp/bench_r44r.txt
+grep -q "PR1_R44_1T_VERDICT.*jumped=0" /tmp/bench_r44r.txt
+grep -q "PR1_R44_1T_VERDICT.*jump_dial=false" /tmp/bench_r44r.txt
+grep -q "PR1_R44_1T_VERDICT.*bitexact=true" /tmp/bench_r44r.txt
+grep -q "PR1_R44_1T_VERDICT.*allocs=0" /tmp/bench_r44r.txt
+grep "PR1_R44_1T_VERDICT" /tmp/bench_r44r.txt | head -1
+grep "R43_DIAG" /tmp/bench_r44r.txt | head -1
+
 # ── 11rs. PHASE 2: THE PRODUCTION LIVE RANDOM STREAM (the mission's ────
 # --random-stream directive). A seedable splitmix64 ITCH 5.0 synthesizer
 # (nf_testkit::randomstream) generates an unseen, non-repeating tape
