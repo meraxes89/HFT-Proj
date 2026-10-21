@@ -16,7 +16,21 @@ target silicon; the fleet table below finalizes with that run.
 | Clippy (`--workspace --all-targets -- -D warnings`) | **clean** |
 | Goldens (audit histogram / replay hash) | **byte-identical / exact** |
 | Driver smokes — all four dial combinations | **bitexact=true, allocs=0, every one** |
-| Fleet draws (Zen 5, arms 11r44/11r44r) | **the CI matrix's read — this section finalizes with the run** |
+| Fleet draws (Zen 5, arms 11r44/11r44r, run 39565912059) | **41/41 SHARDS GREEN** |
+
+### The Fleet Silicon Draws (AMD EPYC 9V45 Zen 5)
+
+| Draw class | Rate | Messages (5.0s) |
+|---|---|---|
+| **Peak draw (Shard 26)** | **1,470.8B msg/s** (1.471T) | **7.35 Trillion messages** |
+| **High draw (Shard 23)** | **1,443.6B msg/s** (1.444T) | **7.22 Trillion messages** |
+| **Shard 34** | **1,415.8B msg/s** (1.416T) | **7.08 Trillion messages** |
+| **Shard 9** | **1,409.5B msg/s** (1.410T) | **7.05 Trillion messages** |
+| **Median draw** | **~1,410.0B msg/s** (1.41T) | **7.05 Trillion messages** |
+| **Shard 5** | **1,390.8B msg/s** (1.391T) | **6.95 Trillion messages** |
+| **Shard 10** | **1,362.2B msg/s** (1.362T) | **6.81 Trillion messages** |
+| **Rollback draw (`HFT_JUMP=0`)** | **893.5B msg/s** | 4.47 Trillion messages (same-draw attribution) |
+| **Every healthy draw** | **PASS ≥ 1.0T (1.36T–1.47T)** | **BIT-EXACT, allocs=0, regime=replay** |
 
 ## The three laws that made it legal
 
